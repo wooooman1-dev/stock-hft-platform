@@ -58,7 +58,7 @@ export function calculateMicrostructureMetrics({
 
   const spreadPenalty = clamp((spreadTicks - 1) * 12, 0, 36);
   const activityBoost = clamp((tradesPerSecond - 1.5) * 4, 0, 12);
-  const direction = Math.sign(traeFlow || weightedImbalance);
+  const direction = Math.sign(tradeFlow || weightedImbalance);
   const rawScore =
     weightedImbalance * 36 +
     tradeFlow * 34 +
@@ -71,10 +71,10 @@ export function calculateMicrostructureMetrics({
 
   const reasons = [];
   if (Math.abs(weightedImbalance) >= 0.18) {
-    reasons.push(weightedImbalance > 0 ? "매수 1~3호가 잔량 우세" : "매믄 1~3호가 작력 우세");
+    reasons.push(weightedImbalance > 0 ? "매수 1~3호가 잔량 우세" : "매도 1~3호가 잔량 우세");
   }
   if (Math.abs(tradeFlow) >= 0.18) {
-    reasons.push(tradeFlow > 0 ? "최근 공결 섰 매수 체결 우세" : "최근 공격적 매도 체결 우세");
+    reasons.push(tradeFlow > 0 ? "최근 공격적 매수 체결 우세" : "최근 공격적 매도 체결 우세");
   }
   if (Math.abs(momentumBps) >= 1.5) {
     reasons.push(momentumBps > 0 ? "초단기 가격 모멘텀 상승" : "초단기 가격 모멘텀 하락");
