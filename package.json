@@ -1,0 +1,16 @@
+{
+  "name": "stock-hft-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dependency-free real-time microstructure analysis and paper-trading dashboard.",
+  "scripts": {
+    "dev": "node --watch server/app.js",
+    "start": "node server/app.js",
+    "test": "node --test server/test/*.test.js",
+    "check": "node --check server/app.js && node --check public/app.js && npm test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
