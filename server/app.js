@@ -104,6 +104,16 @@ function getKisStatus() {
     };
 }
 
+function getKisHealthStatus() {
+  const publicConfig = publicKisConfiguration(kisConfiguration);
+  return {
+    enabled: publicConfig.enabled,
+    mode: publicConfig.mode,
+    quoteApiAvailable: Boolean(kisClient),
+    orderApiAvailable: false,
+  };
+}
+
 function rejectNonLoopbackKisRequest(request, response) {
   if (isLoopbackAddress(request.socket.remoteAddress)) return false;
   json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
@@ -118,7 +128,7 @@ const server = createServer(async (request, response) => {
         status: "ok",
         mode: "SIMULATION",
         clients: eventClients.size,
-        kis: getKisStatus(),
+        kis: getKisHealthStatus(),
       });
     }
     if (request.method === "GET" && url.pathname === "/api/snapshot") {
@@ -153,7 +163,7 @@ const server = createServer(async (request, response) => {
         market: url.searchParams.get("market") ?? "UN",
       }));
     }
-    if (url.pathname.startsWith("/api/kis/")) {
+    if (url.pathname === "/api/kis" || url.pathname.startsWith("/api/kis/")) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       return json(response, 404, {
         error: "PROD_READ_ONLY 모드에는 요청한 한국투자 API 경로가 없습니다.",
