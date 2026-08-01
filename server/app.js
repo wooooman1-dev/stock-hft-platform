@@ -20,13 +20,8 @@ const symbol = process.env.DEFAULT_SYMBOL ?? "005930";
 const symbolName = process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자";
 const initialPrice = Number(process.env.DEFAULT_PRICE ?? 70_000);
 const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
+const strategySettings = strategySettingsStore.load();
 const executionJournal = new ExecutionJournal(join(dataDir, "execution-journal.jsonl"));
-executionJournal.append("SESSION_STARTED", {
-  mode: "SIMULATION",
-  symbol,
-  symbolName,
-  processId: process.pid,
-});
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 const runtime = new MarketRuntime(
@@ -34,11 +29,17 @@ const runtime = new MarketRuntime(
   symbolName,
   initialPrice,
   {
-    strategySettings: strategySettingsStore.load(),
+    strategySettings,
     strategySettingsStore,
     executionJournal,
   },
 );
+executionJournal.append("SESSION_STARTED", {
+  mode: "SIMULATION",
+  symbol,
+  symbolName,
+  processId: process.pid,
+});
 const eventClients = new Set();
 runtime.start();
 
