@@ -78,3 +78,26 @@ export function createVerificationMarketTick(
     candles: structuredClone(Array.isArray(candles) ? candles : []),
   };
 }
+
+export function applyVerificationMarketTick(runtime, input) {
+  if (!runtime?.simulator || !runtime?.trader || typeof runtime.makeSnapshot !== "function") {
+    throw new TypeError("검증용 시장 틱을 적용할 유효한 런타임이 필요합니다.");
+  }
+
+  const tick = createVerificationMarketTick(input, {
+    tickSize: runtime.simulator.tickSize,
+    now: runtime.now,
+    candles: runtime.snapshotValue?.candles,
+  });
+
+  runtime.simulator.price = tick.lastPrice;
+  runtime.snapshotValue = runtime.makeSnapshot(tick, 0);
+  runtime.trader.processOpenOrders({ book: tick.book, timestamp: tick.timestamp });
+  runtime.snapshotValue.account = runtime.trader.snapshot(tick.lastPrice);
+  runtime.syncPositionRisk(tick.lastPrice, tick.timestamp);
+  runtime.maybeRunStrategy(tick.timestamp);
+  runtime.snapshotValue.account = runtime.trader.snapshot(tick.lastPrice);
+  runtime.syncPositionRisk(tick.lastPrice, tick.timestamp);
+  runtime.emitSnapshot();
+  return runtime.snapshot();
+}
