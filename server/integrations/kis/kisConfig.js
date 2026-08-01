@@ -5,6 +5,11 @@ export const KIS_MODE_PROD_READ_ONLY = "PROD_READ_ONLY";
 export const KIS_PROD_BASE_URL = "https://openapi.koreainvestment.com:9443";
 
 const ALLOWED_CREDENTIAL_FIELDS = new Set(["appKey", "appSecret"]);
+const FORBIDDEN_ENV_FIELDS = [
+  "PULSEHFT_KIS_ACCOUNT_NUMBER",
+  "PULSEHFT_KIS_ACCOUNT_PRODUCT_CODE",
+  "PULSEHFT_KIS_HTS_ID",
+];
 
 export class KisConfigurationError extends Error {
   constructor(message, code = "KIS_CONFIGURATION_ERROR") {
@@ -24,6 +29,7 @@ export function loadKisConfiguration(filePath, { env = process.env } = {}) {
       mode: KIS_MODE_DISABLED,
       environment: null,
       baseUrl: null,
+      credentialSource: null,
       credentialsPath: filePath,
     });
   }
@@ -35,9 +41,34 @@ export function loadKisConfiguration(filePath, { env = process.env } = {}) {
     );
   }
 
+  const forbiddenFields = FORBIDDEN_ENV_FIELDS.filter((field) => hasText(env[field]));
+  if (forbiddenFields.length > 0) {
+    throw new KisConfigurationError(
+      `한국투자 실전 시세 전용 모드에 허용되지 않은 환경변수가 있습니다: ${forbiddenFields.join(", ")}`,
+      "KIS_CREDENTIALS_INVALID",
+    );
+  }
+
+  const envAppKey = optionalSecret(env.PULSEHFT_KIS_APP_KEY);
+  const envAppSecret = optionalSecret(env.PULSEHFT_KIS_APP_SECRET);
+  if (envAppKey || envAppSecret) {
+    if (!envAppKey || !envAppSecret) {
+      throw new KisConfigurationError(
+        "PULSEHFT_KIS_APP_KEY와 PULSEHFT_KIS_APP_SECRET을 모두 설정해야 합니다.",
+        "KIS_CREDENTIALS_INVALID",
+      );
+    }
+    return createEnabledConfiguration({
+      appKey: envAppKey,
+      appSecret: envAppSecret,
+      credentialSource: "ENV",
+      credentialsPath: null,
+    });
+  }
+
   if (!filePath || !existsSync(filePath)) {
     throw new KisConfigurationError(
-      "한국투자 실전 시세 전용 자격정보 파일이 없습니다.",
+      "한국투자 실전 시세 전용 자격정보가 없습니다. .env 또는 로컬 자격정보 파일을 설정하세요.",
       "KIS_CREDENTIALS_MISSING",
     );
   }
@@ -67,18 +98,11 @@ export function loadKisConfiguration(filePath, { env = process.env } = {}) {
     );
   }
 
-  const appKey = requireSecret(payload.appKey, "appKey");
-  const appSecret = requireSecret(payload.appSecret, "appSecret");
-
-  return Object.freeze({
-    enabled: true,
-    configured: true,
-    mode: KIS_MODE_PROD_READ_ONLY,
-    environment: "PROD",
-    baseUrl: KIS_PROD_BASE_URL,
+  return createEnabledConfiguration({
+    appKey: requireSecret(payload.appKey, "appKey"),
+    appSecret: requireSecret(payload.appSecret, "appSecret"),
+    credentialSource: "FILE",
     credentialsPath: filePath,
-    appKey,
-    appSecret,
   });
 }
 
@@ -89,19 +113,45 @@ export function publicKisConfiguration(config) {
     mode: config?.mode ?? KIS_MODE_DISABLED,
     environment: config?.environment ?? null,
     baseUrlHost: config?.baseUrl ? new URL(config.baseUrl).host : null,
+    credentialSource: config?.credentialSource ?? null,
     accountConfigured: false,
     orderApiAvailable: false,
   };
 }
 
+function createEnabledConfiguration({ appKey, appSecret, credentialSource, credentialsPath }) {
+  return Object.freeze({
+    enabled: true,
+    configured: true,
+    mode: KIS_MODE_PROD_READ_ONLY,
+    environment: "PROD",
+    baseUrl: KIS_PROD_BASE_URL,
+    credentialSource,
+    credentialsPath,
+    appKey,
+    appSecret,
+  });
+}
+
 function requireSecret(value, field) {
-  if (typeof value !== "string" || value.trim().length === 0) {
+  const secret = optionalSecret(value);
+  if (!secret) {
     throw new KisConfigurationError(
       `한국투자 자격정보 ${field}가 비어 있습니다.`,
       "KIS_CREDENTIALS_INVALID",
     );
   }
-  return value.trim();
+  return secret;
+}
+
+function optionalSecret(value) {
+  if (typeof value !== "string") return null;
+  const secret = value.trim();
+  return secret.length > 0 ? secret : null;
+}
+
+function hasText(value) {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isRecord(value) {
