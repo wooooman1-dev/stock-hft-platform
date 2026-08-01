@@ -10,19 +10,40 @@ import {
   normalizeStrategySettings,
 } from "./strategySettings.js";
 
+export class InstrumentSwitchError extends Error {
+  constructor(message, code, statusCode = 409) {
+    super(message);
+    this.name = "InstrumentSwitchError";
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
 export class MarketRuntime extends EventEmitter {
   constructor(symbol, symbolName, initialPrice, {
     now = Date.now,
     strategySettings = DEFAULT_STRATEGY_SETTINGS,
     strategySettingsStore = null,
     executionJournal = null,
+    previousClose = initialPrice,
+    instrumentMarket = null,
+    instrumentSecurityType = null,
+    instrumentTickSize = 100,
+    instrumentPriceSource = "ENV_DEFAULT",
+    instrumentQuoteFetchedAt = null,
+    instrumentSelectedAt = null,
   } = {}) {
     super();
     this.symbol = symbol;
     this.symbolName = symbolName;
-    this.previousClose = initialPrice;
+    this.previousClose = positiveNumber(previousClose, "previousClose");
+    this.instrumentMarket = optionalText(instrumentMarket);
+    this.instrumentSecurityType = optionalText(instrumentSecurityType);
+    this.instrumentPriceSource = String(instrumentPriceSource ?? "ENV_DEFAULT");
+    this.instrumentQuoteFetchedAt = nullableTimestamp(instrumentQuoteFetchedAt);
+    this.instrumentSelectedAt = nullableTimestamp(instrumentSelectedAt);
     this.now = now;
-    this.simulator = new MarketSimulator(initialPrice);
+    this.simulator = new MarketSimulator(initialPrice, { tickSize: instrumentTickSize });
     this.trader = new PaperTrader(10_000_000, { now });
     this.executionJournalRecorder = new ExecutionJournalRecorder(executionJournal);
     this.positionRiskTracker = new PositionRiskTracker();
@@ -76,6 +97,60 @@ export class MarketRuntime extends EventEmitter {
     this.snapshotValue.strategy.settings = this.getStrategySettings();
     this.emitSnapshot();
     return this.getStrategySettings();
+  }
+
+  switchInstrument(input, { persist = null } = {}) {
+    const selection = normalizeRuntimeInstrument(input, this.now());
+    if (selection.symbol === this.symbol) {
+      return { changed: false, snapshot: this.snapshot() };
+    }
+    const account = this.trader.snapshot(this.snapshotValue.lastPrice);
+    if (this.autoPaperTrading) {
+      throw new InstrumentSwitchError(
+        "모의 자동전략을 끈 뒤 종목을 변경하세요.",
+        "INSTRUMENT_SWITCH_AUTO_ACTIVE",
+      );
+    }
+    if (account.position.quantity !== 0) {
+      throw new InstrumentSwitchError(
+        "내부 모의계좌의 보유수량을 먼저 0주로 만든 뒤 종목을 변경하세요.",
+        "INSTRUMENT_SWITCH_POSITION_OPEN",
+      );
+    }
+    if (account.openOrderCount !== 0) {
+      throw new InstrumentSwitchError(
+        "내부 모의계좌의 대기 주문을 모두 취소한 뒤 종목을 변경하세요.",
+        "INSTRUMENT_SWITCH_ORDER_OPEN",
+      );
+    }
+    if (account.orders.length !== 0) {
+      throw new InstrumentSwitchError(
+        "다른 종목의 주문 내역이 섞이지 않도록 내부 모의계좌를 초기화한 뒤 종목을 변경하세요.",
+        "INSTRUMENT_SWITCH_ACCOUNT_NOT_RESET",
+      );
+    }
+    if (persist !== null && typeof persist !== "function") {
+      throw new TypeError("persist는 함수여야 합니다.");
+    }
+    if (persist) persist(selection);
+
+    this.symbol = selection.symbol;
+    this.symbolName = selection.symbolName;
+    this.previousClose = selection.previousClose;
+    this.instrumentMarket = selection.market;
+    this.instrumentSecurityType = selection.securityType;
+    this.instrumentPriceSource = selection.priceSource;
+    this.instrumentQuoteFetchedAt = selection.quoteFetchedAt;
+    this.instrumentSelectedAt = selection.selectedAt;
+    this.simulator = new MarketSimulator(selection.initialPrice, { tickSize: selection.tickSize });
+    this.positionRiskTracker.reset();
+    this.lastAutoOrderAt = 0;
+    const tick = this.simulator.next(this.now());
+    this.snapshotValue = this.makeSnapshot(tick, 0);
+    this.snapshotValue.account = this.trader.snapshot(tick.lastPrice);
+    this.syncPositionRisk(tick.lastPrice, tick.timestamp);
+    this.emitSnapshot();
+    return { changed: true, snapshot: this.snapshot() };
   }
 
   submitOrder(sideOrInput, quantity, source = "MANUAL", emit = true) {
@@ -160,6 +235,14 @@ export class MarketRuntime extends EventEmitter {
     return {
       symbol: this.symbol,
       symbolName: this.symbolName,
+      instrument: {
+        market: this.instrumentMarket,
+        securityType: this.instrumentSecurityType,
+        priceSource: this.instrumentPriceSource,
+        quoteFetchedAt: this.instrumentQuoteFetchedAt,
+        selectedAt: this.instrumentSelectedAt,
+        simulation: true,
+      },
       timestamp: tick.timestamp,
       lastPrice: tick.lastPrice,
       previousClose: this.previousClose,
@@ -268,4 +351,59 @@ export class MarketRuntime extends EventEmitter {
   }
 
   emitSnapshot() { this.emit("snapshot", this.snapshot()); }
+}
+
+function normalizeRuntimeInstrument(input, selectedAt) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new InstrumentSwitchError(
+      "선택 종목 정보가 올바르지 않습니다.",
+      "INSTRUMENT_SWITCH_INVALID",
+      400,
+    );
+  }
+  const symbol = String(input.symbol ?? "").trim().toUpperCase();
+  const symbolName = String(input.symbolName ?? "").trim();
+  if (!/^(?:\d{6}|Q\d{6})$/.test(symbol) || !symbolName) {
+    throw new InstrumentSwitchError(
+      "선택 종목 코드와 이름이 올바르지 않습니다.",
+      "INSTRUMENT_SWITCH_INVALID",
+      400,
+    );
+  }
+  return {
+    symbol,
+    symbolName,
+    market: optionalText(input.market),
+    securityType: optionalText(input.securityType),
+    initialPrice: positiveNumber(input.initialPrice, "initialPrice"),
+    previousClose: positiveNumber(input.previousClose, "previousClose"),
+    tickSize: positiveNumber(input.tickSize, "tickSize"),
+    priceSource: String(input.priceSource ?? "KIS_PROD_READ_ONLY"),
+    quoteFetchedAt: nullableTimestamp(input.quoteFetchedAt),
+    selectedAt,
+  };
+}
+
+function positiveNumber(value, field) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    throw new InstrumentSwitchError(
+      `${field}는 양수여야 합니다.`,
+      "INSTRUMENT_SWITCH_INVALID",
+      400,
+    );
+  }
+  return number;
+}
+
+function optionalText(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const text = String(value).trim();
+  return text || null;
+}
+
+function nullableTimestamp(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
