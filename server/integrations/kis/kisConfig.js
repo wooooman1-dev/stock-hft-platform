@@ -113,7 +113,6 @@ export function publicKisConfiguration(config) {
     mode: config?.mode ?? KIS_MODE_DISABLED,
     environment: config?.environment ?? null,
     baseUrlHost: config?.baseUrl ? new URL(config.baseUrl).host : null,
-    credentialSource: config?.credentialSource ?? null,
     accountConfigured: false,
     orderApiAvailable: false,
   };
