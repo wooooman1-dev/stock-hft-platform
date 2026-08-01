@@ -10,6 +10,12 @@ import {
   publicKisConfiguration,
 } from "./integrations/kis/kisConfig.js";
 import { KisProdReadOnlyClient } from "./integrations/kis/kisProdReadOnlyClient.js";
+import {
+  loadKisPaperConfiguration,
+  publicKisPaperConfiguration,
+} from "./integrations/kis/kisPaperConfig.js";
+import { KisPaperOrderService } from "./integrations/kis/kisPaperOrderService.js";
+import { KisPaperTradingClient } from "./integrations/kis/kisPaperTradingClient.js";
 import { KisTokenStore } from "./integrations/kis/kisTokenStore.js";
 import {
   applyVerificationMarketTick,
@@ -28,6 +34,7 @@ const initialPrice = Number(process.env.DEFAULT_PRICE ?? 70_000);
 const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
 const strategySettings = strategySettingsStore.load();
 const executionJournal = new ExecutionJournal(join(dataDir, "execution-journal.jsonl"));
+
 const kisConfiguration = loadKisConfiguration(join(dataDir, "kis-prod-read-only.json"));
 const kisTokenStore = kisConfiguration.enabled
   ? new KisTokenStore(join(dataDir, "kis-prod-token.json"))
@@ -36,6 +43,16 @@ const kisClient = kisConfiguration.enabled
   ? new KisProdReadOnlyClient({ config: kisConfiguration, tokenStore: kisTokenStore })
   : null;
 if (kisClient) kisClient.status();
+
+const kisPaperConfiguration = loadKisPaperConfiguration(join(dataDir, "kis-paper.json"));
+const kisPaperTokenStore = kisPaperConfiguration.enabled
+  ? new KisTokenStore(join(dataDir, "kis-paper-token.json"))
+  : null;
+const kisPaperClient = kisPaperConfiguration.enabled
+  ? new KisPaperTradingClient({ config: kisPaperConfiguration, tokenStore: kisPaperTokenStore })
+  : null;
+if (kisPaperClient) kisPaperClient.status();
+
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 const runtime = new MarketRuntime(
@@ -48,6 +65,15 @@ const runtime = new MarketRuntime(
     executionJournal,
   },
 );
+const kisPaperOrderService = kisPaperClient
+  ? new KisPaperOrderService({
+    client: kisPaperClient,
+    journal: executionJournal,
+    limits: kisPaperConfiguration.limits,
+    onUnknownResult: () => runtime.setKillSwitch(true),
+  })
+  : null;
+
 executionJournal.append("SESSION_STARTED", {
   mode: "SIMULATION",
   symbol,
@@ -55,6 +81,10 @@ executionJournal.append("SESSION_STARTED", {
   processId: process.pid,
   kisMode: kisConfiguration.mode,
   kisQuoteEnabled: kisConfiguration.enabled,
+  kisPaperMode: kisPaperConfiguration.mode,
+  kisPaperBalanceEnabled: Boolean(kisPaperClient),
+  kisPaperOrderEnabled: Boolean(kisPaperOrderService),
+  kisPaperAutomaticStrategyConnected: false,
 });
 const eventClients = new Set();
 runtime.start();
@@ -114,10 +144,55 @@ function getKisHealthStatus() {
   };
 }
 
+function getKisPaperStatus() {
+  const publicConfig = publicKisPaperConfiguration(kisPaperConfiguration);
+  return {
+    ...(kisPaperClient
+      ? kisPaperClient.status()
+      : {
+        ...publicConfig,
+        token: { state: "MISSING", expiresAt: null },
+      }),
+    service: kisPaperOrderService
+      ? kisPaperOrderService.status()
+      : {
+        killSwitch: false,
+        unknownResult: false,
+        commandCount: 0,
+        todayCommandCount: 0,
+        limits: publicConfig.limits,
+        dailyRiskBaseline: null,
+        automaticStrategyConnected: false,
+      },
+  };
+}
+
+function getKisPaperHealthStatus() {
+  const publicConfig = publicKisPaperConfiguration(kisPaperConfiguration);
+  return {
+    enabled: publicConfig.enabled,
+    mode: publicConfig.mode,
+    balanceApiAvailable: Boolean(kisPaperClient),
+    orderApiAvailable: Boolean(kisPaperOrderService),
+    automaticStrategyConnected: false,
+    killSwitch: kisPaperOrderService?.status().killSwitch ?? false,
+    unknownResult: kisPaperOrderService?.status().unknownResult ?? false,
+  };
+}
+
 function rejectNonLoopbackKisRequest(request, response) {
   if (isLoopbackAddress(request.socket.remoteAddress)) return false;
   json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
   return true;
+}
+
+function requireKisPaperService(response) {
+  if (kisPaperOrderService) return kisPaperOrderService;
+  json(response, 503, {
+    error: "한국투자 모의투자 주문 모드가 비활성화되어 있습니다.",
+    code: "KIS_PAPER_DISABLED",
+  });
+  return null;
 }
 
 const server = createServer(async (request, response) => {
@@ -129,6 +204,7 @@ const server = createServer(async (request, response) => {
         mode: "SIMULATION",
         clients: eventClients.size,
         kis: getKisHealthStatus(),
+        kisPaper: getKisPaperHealthStatus(),
       });
     }
     if (request.method === "GET" && url.pathname === "/api/snapshot") {
@@ -163,11 +239,50 @@ const server = createServer(async (request, response) => {
         market: url.searchParams.get("market") ?? "UN",
       }));
     }
+    if (request.method === "GET" && url.pathname === "/api/kis/paper/status") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, getKisPaperStatus());
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/paper/balance") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, await service.getBalance());
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, await service.submitOrder(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders/revise") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, await service.reviseOrder(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders/cancel") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, await service.cancelOrder(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/kill-switch") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      const body = await readJson(request);
+      if (typeof body.enabled !== "boolean") {
+        return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
+      }
+      if (body.enabled) runtime.setKillSwitch(true);
+      return json(response, 200, service.setKillSwitch(body.enabled));
+    }
     if (url.pathname === "/api/kis" || url.pathname.startsWith("/api/kis/")) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       return json(response, 404, {
-        error: "PROD_READ_ONLY 모드에는 요청한 한국투자 API 경로가 없습니다.",
-        code: "KIS_READ_ONLY_ROUTE_NOT_FOUND",
+        error: "요청한 한국투자 API 경로가 없습니다.",
+        code: "KIS_ROUTE_NOT_FOUND",
       });
     }
     if (request.method === "GET" && url.pathname === "/api/strategy/settings") {
@@ -225,6 +340,7 @@ const server = createServer(async (request, response) => {
     return json(response, status, {
       error: error instanceof Error ? error.message : "서버 오류",
       code: error?.code ?? "SERVER_ERROR",
+      ambiguous: Boolean(error?.ambiguous),
     });
   }
 });

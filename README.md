@@ -1,108 +1,111 @@
 # PulseHFT
 
-실시간 호가·체결 기반 시장 미세구조 분석과 **호가 기반 모의주문**을 하나의 서버 중심 구조로 구현한 개발 버전입니다.
+실시간 호가·체결 기반 시장 미세구조 분석, 내부 모의체결, 선택형 한국투자증권 연동을 서버 중심 구조로 구현한 개발 버전입니다.
 
-> 기본 실행은 **SIMULATION / INTERNAL PAPER ONLY**입니다. 선택적으로 한국투자증권 실전 App Key를 사용한 `PROD_READ_ONLY` 현재가 조회만 활성화할 수 있으며, 실제 계좌·잔고·주문은 연결되어 있지 않습니다.
+> 기본 실행은 `SIMULATION / INTERNAL PAPER ONLY`입니다. 선택적으로 한국투자 실전 현재가 조회 전용 `PROD_READ_ONLY` 또는 별도 모의투자 자격정보를 사용하는 `PAPER_TRADING`을 활성화할 수 있습니다. 실전 주문 기능은 구현되어 있지 않습니다.
 
 ## 포함 기능
 
-- 10단계 호가와 실시간 체결 시뮬레이션
-- 1초봉 가격 차트
-- 가중 호가 불균형, 체결 흐름, 거래 속도, 스프레드, 모멘텀, 변동성
-- 매수·매도·관망 신호 점수와 판단 근거
-- 시장가 IOC와 지정가 GTC 모의주문
-- 표시된 호가 잔량을 순서대로 소비하는 다단계 체결
-- 부분 체결, 미체결 잔량 취소, 지정가 대기·취소
-- `clientOrderId` 기반 중복 주문 방지
-- 미체결 매수금액과 매도수량 예약
-- 포지션·평균단가·평가손익·실현손익
-- 주문별 상태 이벤트와 체결 기록
-- 주문·체결·취소·계좌 초기화 append-only JSONL 영구 저널
-- 모의 자동전략과 킬 스위치
-- 자동전략 설정 화면과 로컬 영구 저장
-- 선택형 손절·익절·트레일링 스톱·최대 보유시간
-- 포지션 최초 진입시각과 보유 중 최고가격 추적
-- 전략 청산 전 열린 주문 취소와 전체 포지션 시장가 IOC 청산
-- 최대 주문·최대 포지션·손실 한도
-- 한국투자증권 실전 REST 현재가 조회 전용 `PROD_READ_ONLY`
+- 10단계 호가·체결 시뮬레이션과 1초봉 차트
+- 호가 불균형, 체결 흐름, 속도, 스프레드, 모멘텀, 변동성 분석
+- 시장가 IOC, 지정가 GTC, 다단계·부분 체결, 잔량 취소
+- `clientOrderId` 멱등성, 현금·매도수량 예약, 포지션·손익
+- 모의 자동전략, 킬 스위치, 손절·익절·트레일링 스톱·최대 보유시간
+- 전략 설정 영구 저장과 결정적 검증 시장 틱
+- 주문·체결·계좌 초기화 append-only JSONL 실행 저널
+- 한국투자 실전 REST 현재가 조회 전용 `PROD_READ_ONLY`
+- 한국투자 모의계좌 잔고·매수·매도·정정·취소 `PAPER_TRADING`
+- 모의계좌 주문 명령 선기록, 재시작 멱등 복원, `UNKNOWN_RESULT` 차단
+- 주문수량·주문금액·일일 주문횟수·일일 손실 한도
 - SSE 기반 실시간 대시보드
 - 외부 패키지 의존성 없음
 
-위험청산 네 항목은 기본값이 모두 `OFF`이며, 사용자가 값을 입력하고 저장한 항목만 작동합니다. 자동전략 활성화 상태는 저장하지 않으므로 서버 재시작 후 항상 `OFF`로 시작합니다.
+한국투자 모의주문은 기존 `MarketRuntime`과 자동전략에 연결되지 않았습니다. 현재 한국투자 주문은 로컬 API를 통한 명시적 수동 요청만 가능합니다.
 
-## 모의체결 범위
+## 내부 모의체결
 
-현재 모의체결은 화면에 표시된 10단계 호가만 사용합니다.
+- 시장가: 반대편 표시호가를 최우선 가격부터 소비하는 IOC
+- 지정가: 가격이 교차하면 체결하고 잔량은 GTC 대기
+- 전략 청산: 열린 주문을 먼저 취소한 뒤 전체 보유수량 시장가 IOC 제출
+- 수수료·세금, 실제 주문 큐 순서, 숨은 유동성은 아직 미반영
 
-- 시장가: 반대편 호가를 최우선 가격부터 소비하는 `IOC`
-- 지정가: 가격이 교차하면 체결하고 잔량은 `GTC` 대기
-- 수수료·세금: 아직 미반영
-- 실제 주문 큐 순서·숨은 유동성: 미반영
-- 지정가 대기 주문: 반대편 표시호가가 지정가격과 교차할 때 체결
-- 전략 청산: 열린 주문을 먼저 취소한 뒤 전체 보유수량을 시장가 IOC로 제출
+세부 규칙은 `docs/PAPER_EXECUTION_MODEL.md`와 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
 
-세부 규칙과 한계는 `docs/PAPER_EXECUTION_MODEL.md`와 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
+## 한국투자 실전 시세 전용
 
-## 한국투자 실전 시세 전용 모드
-
-한국투자 연동은 기본적으로 꺼져 있습니다. 프로젝트 루트의 `.env`에는 실전 App Key와 App Secret만 저장하며 계좌번호는 저장하지 않습니다. `.env`는 Git에서 제외됩니다.
+실전 연동은 계좌번호 없이 현재가만 조회합니다.
 
 ```dotenv
 PULSEHFT_KIS_MODE=PROD_READ_ONLY
-PULSEHFT_KIS_APP_KEY=발급받은_실전_APP_KEY
-PULSEHFT_KIS_APP_SECRET=발급받은_실전_APP_SECRET
+PULSEHFT_KIS_APP_KEY="실전 APP KEY"
+PULSEHFT_KIS_APP_SECRET="실전 APP SECRET"
 ```
-
-실행:
 
 ```powershell
 npm run start:kis:prod-read-only
 ```
-
-활성화 후 로컬 컴퓨터에서만 다음 경로를 사용할 수 있습니다.
 
 ```text
 GET /api/kis/status
 GET /api/kis/quote?symbol=005930&market=UN
 ```
 
-`/api/kis/status`와 `/api/kis/quote` 이외의 한국투자 경로는 존재하지 않습니다. 주문·정정·취소·잔고 API와 실전 주문 모드는 구현하지 않았습니다. 자세한 보안 경계와 설정 방법은 `docs/KIS_PROD_READ_ONLY.md`를 확인하세요.
+자세한 내용은 `docs/KIS_PROD_READ_ONLY.md`를 확인하세요.
+
+## 한국투자 모의투자 주문
+
+모의투자는 실전 키와 다른 App Key·App Secret, 모의계좌가 필요합니다. 권장 설정 방식은 비밀값을 `.env`에 직접 편집하지 않고 보안 입력 스크립트를 사용하는 것입니다.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\configure-kis-paper-trading.ps1
+& .\.pulsehft\start-kis-paper-trading.ps1
+```
+
+로컬 전용 API:
+
+```text
+GET  /api/kis/paper/status
+GET  /api/kis/paper/balance
+POST /api/kis/paper/orders
+POST /api/kis/paper/orders/revise
+POST /api/kis/paper/orders/cancel
+POST /api/kis/paper/kill-switch
+```
+
+실전 주문은 존재하지 않으며 한국투자 모의주문은 자동전략에 연결되지 않습니다. 상세 설정, 요청 형식, 수동 검증 절차는 `docs/KIS_PAPER_TRADING.md`를 확인하세요.
 
 ## 실행 저널
-
-서버가 시작되면 다음 로컬 파일에 모의주문 생명주기를 append-only JSONL로 기록합니다.
 
 ```text
 .pulsehft/execution-journal.jsonl
 ```
 
-기록 대상은 세션 시작, 주문 생성, 주문 상태 변경, 체결, 모의계좌 초기화입니다. 기존 파일의 JSON이나 연속 순번이 손상된 경우 조용히 새 파일로 대체하지 않고 서버 시작을 중단합니다. 실행 중 기록 실패가 발생하면 킬 스위치를 켜고 자동전략을 끕니다.
+파일은 JSONL append-only이며 시작 시 전체 JSON·스키마·연속 sequence를 검사합니다. 각 append 뒤 `fsync`합니다. 손상 파일은 자동 덮어쓰지 않습니다.
 
-API Key, App Secret, 접근 토큰, 실제 계좌번호와 환경변수 원문은 기록하지 않습니다. 상세 스키마와 오류 정책은 `docs/EXECUTION_JOURNAL.md`를 확인하세요.
+내부 모의체결 이벤트 외에 한국투자 모의투자에서는 다음 이벤트를 기록합니다.
 
-## 실행
+```text
+BROKER_RISK_BASELINE
+BROKER_ORDER_COMMAND
+BROKER_ORDER_RESULT
+BROKER_ORDER_UNKNOWN
+```
 
-Node.js 22 이상만 있으면 됩니다. `npm install`은 필요하지 않습니다.
+주문 명령 기록에 실패하면 증권사 요청을 보내지 않습니다. 증권사 요청 후 결과를 확정할 수 없거나 결과 저널 기록에 실패하면 `UNKNOWN_RESULT`와 킬 스위치로 전환하고 자동 재시도하지 않습니다. API 키·시크릿·토큰·계좌번호 원문은 저널과 API 응답에 기록하지 않습니다.
+
+## 실행과 검증
+
+Node.js 22 이상만 필요하며 `npm install`은 필요하지 않습니다.
 
 ```powershell
 npm start
-```
-
-브라우저에서 `http://localhost:8787`을 엽니다.
-
-개발 중 파일 변경 자동 재시작:
-
-```powershell
 npm run dev
-```
-
-검증:
-
-```powershell
 npm run check
 ```
 
-## API
+브라우저: `http://localhost:8787`
+
+## 전체 API
 
 ```text
 GET  /health
@@ -110,6 +113,12 @@ GET  /api/snapshot
 GET  /api/events
 GET  /api/kis/status
 GET  /api/kis/quote?symbol=005930&market=UN
+GET  /api/kis/paper/status
+GET  /api/kis/paper/balance
+POST /api/kis/paper/orders
+POST /api/kis/paper/orders/revise
+POST /api/kis/paper/orders/cancel
+POST /api/kis/paper/kill-switch
 GET  /api/strategy/settings
 PUT  /api/strategy/settings
 POST /api/strategy/settings/reset
@@ -120,66 +129,25 @@ POST /api/strategy/auto
 POST /api/system/kill-switch
 ```
 
-시장가 주문 예시:
+## 검증 전용 시장 틱
 
-```json
-{
-  "side": "BUY",
-  "type": "MARKET",
-  "quantity": 10,
-  "clientOrderId": "my-order-0001"
-}
-```
-
-지정가 주문 예시:
-
-```json
-{
-  "side": "BUY",
-  "type": "LIMIT",
-  "quantity": 10,
-  "limitPrice": 70000,
-  "clientOrderId": "my-order-0002"
-}
-```
-
-## 검증 전용 시장 틱 API
-
-손절·익절·트레일링 스톱을 무작위 가격 변동 없이 재현하기 위한 개발 검증 전용 경로입니다.
-
-```text
-POST /api/verification/market-tick
-```
-
-일반 실행에서는 경로가 존재하지 않는 것처럼 HTTP 404를 반환합니다. 서버 시작 전에 `PULSEHFT_ENABLE_VERIFICATION_API=true`를 명시하고 로컬 루프백 주소로 요청한 경우에만 사용할 수 있습니다.
-
-검증 틱이 실제 적용되면 무작위 시장 타이머를 서버 재시작까지 정지하고, 해당 스냅샷의 `system.verificationMode`와 `system.marketTimerPaused`를 `true`로 표시합니다. 일반 모드 스냅샷에는 이 두 검증 전용 속성을 포함하지 않습니다.
+`POST /api/verification/market-tick`은 `PULSEHFT_ENABLE_VERIFICATION_API=true`이고 로컬 루프백 요청일 때만 존재합니다.
 
 ```powershell
 $env:PULSEHFT_ENABLE_VERIFICATION_API = "true"
 npm start
-```
-
-결정적 위험청산 검증:
-
-```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-risk-exits.ps1
 ```
 
-검증이 끝나면 서버를 종료하고 환경변수를 제거한 뒤 일반 모드로 재시작합니다.
-
-```powershell
-Remove-Item Env:PULSEHFT_ENABLE_VERIFICATION_API -ErrorAction SilentlyContinue
-npm start
-```
+검증 후 환경변수를 제거하고 일반 모드로 재시작합니다.
 
 ## 디렉터리
 
 ```text
 public/                   브라우저 대시보드
-server/domain/            분석·주문상태·모의체결·전략·리스크 엔진
-server/integrations/kis/  한국투자 실전 시세 전용 인증·조회 경계
+server/domain/            분석·내부 모의체결·전략·리스크·실행 저널
+server/integrations/kis/  실전 시세 읽기 전용·모의투자 주문 경계
 server/test/              단위·런타임 테스트
 scripts/                  로컬 설정·결정적 검증 스크립트
-docs/                     아키텍처·체결모델·전략설정·실행저널·KIS·로드맵
+docs/                     아키텍처·체결모델·KIS·로드맵
 ```

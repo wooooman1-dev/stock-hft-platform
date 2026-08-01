@@ -18,6 +18,10 @@ const EVENT_TYPES = new Set([
   "ORDER_EVENT",
   "FILL",
   "ACCOUNT_RESET",
+  "BROKER_ORDER_COMMAND",
+  "BROKER_ORDER_RESULT",
+  "BROKER_ORDER_UNKNOWN",
+  "BROKER_RISK_BASELINE",
 ]);
 
 export class ExecutionJournalError extends Error {
