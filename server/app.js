@@ -2,6 +2,7 @@ import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ExecutionJournal } from "./domain/executionJournal.js";
 import { MarketRuntime } from "./domain/runtime.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
 import {
@@ -15,16 +16,27 @@ const publicDir = join(root, "public");
 const dataDir = process.env.PULSEHFT_DATA_DIR
   ? resolve(process.env.PULSEHFT_DATA_DIR)
   : join(root, ".pulsehft");
+const symbol = process.env.DEFAULT_SYMBOL ?? "005930";
+const symbolName = process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자";
+const initialPrice = Number(process.env.DEFAULT_PRICE ?? 70_000);
 const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
+const executionJournal = new ExecutionJournal(join(dataDir, "execution-journal.jsonl"));
+executionJournal.append("SESSION_STARTED", {
+  mode: "SIMULATION",
+  symbol,
+  symbolName,
+  processId: process.pid,
+});
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 const runtime = new MarketRuntime(
-  process.env.DEFAULT_SYMBOL ?? "005930",
-  process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자",
-  Number(process.env.DEFAULT_PRICE ?? 70_000),
+  symbol,
+  symbolName,
+  initialPrice,
   {
     strategySettings: strategySettingsStore.load(),
     strategySettingsStore,
+    executionJournal,
   },
 );
 const eventClients = new Set();
