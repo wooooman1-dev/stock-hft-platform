@@ -52,9 +52,11 @@ export function evaluateAutoStrategy({
     && confidence >= normalized.exitMinimumConfidence
     && positionQuantity > 0
   ) {
+    const sellableQuantity = resolveSellableQuantity(account, positionQuantity);
+    if (sellableQuantity <= 0) return null;
     return {
       side: "SELL",
-      quantity: positionQuantity,
+      quantity: sellableQuantity,
       reason: "EXIT_SIGNAL",
     };
   }
@@ -70,7 +72,10 @@ export function evaluatePositionRiskExit({
   positionRiskState,
 }) {
   const normalized = normalizeStrategySettings(settings);
-  const quantity = Number(account?.position?.quantity ?? 0);
+  const positionQuantity = Number(account?.position?.quantity ?? 0);
+  if (positionQuantity <= 0) return null;
+
+  const quantity = resolveSellableQuantity(account, positionQuantity);
   if (quantity <= 0) return null;
 
   const enabled = normalized.stopLossBps !== null
@@ -124,6 +129,14 @@ export function evaluatePositionRiskExit({
   }
 
   return null;
+}
+
+function resolveSellableQuantity(account, positionQuantity) {
+  const sellable = Number(account?.sellableQuantity);
+  if (Number.isInteger(sellable) && sellable >= 0) {
+    return Math.min(positionQuantity, sellable);
+  }
+  return positionQuantity;
 }
 
 function riskExitIntent(quantity, reason, diagnostics) {
