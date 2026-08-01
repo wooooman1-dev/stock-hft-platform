@@ -18,9 +18,15 @@
 - 포지션·평균단가·평가손익·실현손익
 - 주문별 상태 이벤트와 체결 기록
 - 모의 자동전략과 킬 스위치
+- 자동전략 설정 화면과 로컬 영구 저장
+- 선택형 손절·익절·트레일링 스톱·최대 보유시간
+- 포지션 최초 진입시각과 보유 중 최고가격 추적
+- 전략 청산 전 열린 주문 취소와 전체 포지션 시장가 IOC 청산
 - 최대 주문·최대 포지션·손실 한도
 - SSE 기반 실시간 대시보드
 - 외부 패키지 의존성 없음
+
+위험청산 네 항목은 기본값이 모두 `OFF`이며, 사용자가 값을 입력하고 저장한 항목만 작동합니다. 자동전략 활성화 상태는 저장하지 않으므로 서버 재시작 후 항상 `OFF`로 시작합니다.
 
 ## 모의체결 범위
 
@@ -31,8 +37,9 @@
 - 수수료·세금: 아직 미반영
 - 실제 주문 큐 순서·숨은 유동성: 미반영
 - 지정가 대기 주문: 반대편 표시호가가 지정가격과 교차할 때 체결
+- 전략 청산: 열린 주문을 먼저 취소한 뒤 전체 보유수량을 시장가 IOC로 제출
 
-세부 규칙과 한계는 `docs/PAPER_EXECUTION_MODEL.md`를 확인하세요.
+세부 규칙과 한계는 `docs/PAPER_EXECUTION_MODEL.md`와 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
 
 ## 실행
 
@@ -62,6 +69,9 @@ npm run check
 GET  /health
 GET  /api/snapshot
 GET  /api/events
+GET  /api/strategy/settings
+PUT  /api/strategy/settings
+POST /api/strategy/settings/reset
 POST /api/paper/orders
 POST /api/paper/orders/:orderId/cancel
 POST /api/paper/reset
@@ -96,7 +106,7 @@ POST /api/system/kill-switch
 
 ```text
 public/          브라우저 대시보드
-server/domain/   분석·주문상태·모의체결·리스크 엔진
+server/domain/   분석·주문상태·모의체결·전략·리스크 엔진
 server/test/     단위·런타임 테스트
-docs/            아키텍처·체결모델·로드맵
+docs/            아키텍처·체결모델·전략설정·로드맵
 ```
