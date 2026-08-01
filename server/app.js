@@ -6,6 +6,12 @@ import { ExecutionJournal } from "./domain/executionJournal.js";
 import { MarketRuntime } from "./domain/runtime.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
 import {
+  loadKisConfiguration,
+  publicKisConfiguration,
+} from "./integrations/kis/kisConfig.js";
+import { KisProdReadOnlyClient } from "./integrations/kis/kisProdReadOnlyClient.js";
+import { KisTokenStore } from "./integrations/kis/kisTokenStore.js";
+import {
   applyVerificationMarketTick,
   isLoopbackAddress,
   isVerificationApiEnabled,
@@ -22,6 +28,14 @@ const initialPrice = Number(process.env.DEFAULT_PRICE ?? 70_000);
 const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
 const strategySettings = strategySettingsStore.load();
 const executionJournal = new ExecutionJournal(join(dataDir, "execution-journal.jsonl"));
+const kisConfiguration = loadKisConfiguration(join(dataDir, "kis-prod-read-only.json"));
+const kisTokenStore = kisConfiguration.enabled
+  ? new KisTokenStore(join(dataDir, "kis-prod-token.json"))
+  : null;
+const kisClient = kisConfiguration.enabled
+  ? new KisProdReadOnlyClient({ config: kisConfiguration, tokenStore: kisTokenStore })
+  : null;
+if (kisClient) kisClient.status();
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 const runtime = new MarketRuntime(
@@ -39,6 +53,8 @@ executionJournal.append("SESSION_STARTED", {
   symbol,
   symbolName,
   processId: process.pid,
+  kisMode: kisConfiguration.mode,
+  kisQuoteEnabled: kisConfiguration.enabled,
 });
 const eventClients = new Set();
 runtime.start();
@@ -78,11 +94,42 @@ function serveStatic(pathname, response) {
   createReadStream(filePath).pipe(response);
 }
 
+function getKisStatus() {
+  return kisClient
+    ? kisClient.status()
+    : {
+      ...publicKisConfiguration(kisConfiguration),
+      token: { state: "MISSING", expiresAt: null },
+      quoteApiAvailable: false,
+    };
+}
+
+function getKisHealthStatus() {
+  const publicConfig = publicKisConfiguration(kisConfiguration);
+  return {
+    enabled: publicConfig.enabled,
+    mode: publicConfig.mode,
+    quoteApiAvailable: Boolean(kisClient),
+    orderApiAvailable: false,
+  };
+}
+
+function rejectNonLoopbackKisRequest(request, response) {
+  if (isLoopbackAddress(request.socket.remoteAddress)) return false;
+  json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
+  return true;
+}
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   try {
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(response, 200, { status: "ok", mode: "SIMULATION", clients: eventClients.size });
+      return json(response, 200, {
+        status: "ok",
+        mode: "SIMULATION",
+        clients: eventClients.size,
+        kis: getKisHealthStatus(),
+      });
     }
     if (request.method === "GET" && url.pathname === "/api/snapshot") {
       return json(response, 200, runtime.snapshot());
@@ -98,6 +145,30 @@ const server = createServer(async (request, response) => {
       eventClients.add(response);
       request.on("close", () => eventClients.delete(response));
       return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/status") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, getKisStatus());
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/quote") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      if (!kisClient) {
+        return json(response, 503, {
+          error: "한국투자 실전 시세 전용 모드가 비활성화되어 있습니다.",
+          code: "KIS_DISABLED",
+        });
+      }
+      return json(response, 200, await kisClient.getCurrentPrice({
+        symbol: url.searchParams.get("symbol"),
+        market: url.searchParams.get("market") ?? "UN",
+      }));
+    }
+    if (url.pathname === "/api/kis" || url.pathname.startsWith("/api/kis/")) {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 404, {
+        error: "PROD_READ_ONLY 모드에는 요청한 한국투자 API 경로가 없습니다.",
+        code: "KIS_READ_ONLY_ROUTE_NOT_FOUND",
+      });
     }
     if (request.method === "GET" && url.pathname === "/api/strategy/settings") {
       return json(response, 200, runtime.getStrategySettings());

@@ -23,9 +23,55 @@ MarketSimulator
        └─ append-only JSONL + fsync
   -> Node HTTP REST + Server-Sent Events
   -> Browser dashboard
+
+KisProdReadOnlyClient (optional, separate read-only boundary)
+  -> local App Key / App Secret
+  -> persistent expiring OAuth token
+  -> KIS production REST current-price query
+  -> loopback-only /api/kis/quote
+  -X-> MarketRuntime
+  -X-> OrderAdapter
+  -X-> account / balance / order APIs
 ```
 
 브라우저는 표시와 제어만 담당합니다. 분석·전략 설정·포지션 위험 추적·주문 상태·체결·계좌 상태는 서버가 소유합니다.
+
+한국투자 실전 시세 조회는 현재 기존 분석 런타임과 분리되어 있습니다. 실제 현재가를 조회할 수 있지만 자동전략·모의체결·주문 판단에 주입하지 않습니다.
+
+## 한국투자 실전 시세 전용 경계
+
+기본 모드는 `DISABLED`입니다. 다음 환경변수를 명시한 경우에만 활성화됩니다.
+
+```text
+PULSEHFT_KIS_MODE=PROD_READ_ONLY
+```
+
+구성 요소:
+
+```text
+KisConfiguration
+  -> appKey와 appSecret만 허용
+  -> 계좌번호·HTS ID·상품코드·추가 필드 거절
+
+KisTokenStore
+  -> 만료 전 토큰 재사용
+  -> 만료 1분 안전 여유
+  -> 손상 파일 시작 실패
+
+KisProdReadOnlyClient
+  -> POST /oauth2/tokenP
+  -> GET /uapi/domestic-stock/v1/quotations/inquire-price
+  -> TR ID FHKST01010100
+```
+
+서버에 노출되는 한국투자 경로는 두 개뿐입니다.
+
+```text
+GET /api/kis/status
+GET /api/kis/quote
+```
+
+두 경로는 루프백 요청만 허용합니다. 그 외 `/api/kis` 경로는 모두 `404`이며 주문·정정·취소·계좌·잔고 메서드는 구현하지 않습니다.
 
 ## 전략 위험청산 경계
 
@@ -58,7 +104,7 @@ class OrderAdapter {
 }
 ```
 
-내부 모의체결은 `PaperTrader`가 담당합니다. 한국투자증권 연결 시 같은 상위 주문 명령을 실제 모의투자 주문 어댑터로 전달하되, 증권사 응답 상태를 내부 공통 상태로 정규화합니다.
+내부 모의체결은 `PaperTrader`가 담당합니다. 한국투자증권 모의투자 주문 연결 시 같은 상위 주문 명령을 별도 어댑터로 전달하되, 현재 `KisProdReadOnlyClient`와는 다른 모듈과 승인 절차로 구현합니다.
 
 ## 실행 저널 경계
 
@@ -98,12 +144,25 @@ ORDER_EVENT(FILLED 또는 PARTIALLY_FILLED)
 10. 실시간 연결 단절·시세 지연·주문 결과 불명 상태에서는 향후 신규 주문을 차단합니다.
 11. 실행 저널 sequence는 1부터 파일 행 수까지 끊김 없이 증가합니다.
 12. 멱등 재생 주문은 실행 저널 이벤트를 중복 생성하지 않습니다.
+13. 한국투자 연동은 명시적 `PROD_READ_ONLY` 설정 없이는 비활성화됩니다.
+14. 한국투자 자격정보에는 App Key와 App Secret 외 필드를 저장하지 않습니다.
+15. 한국투자 읽기 전용 모듈은 계좌번호와 주문 메서드를 소유하지 않습니다.
+16. 한국투자 토큰·키·시크릿은 API 응답, 실행 저널, 오류 메시지에 포함하지 않습니다.
 
 ## 저장 경계
 
 전략 설정은 `.pulsehft/strategy-settings.json`에 저장합니다.
 
 주문 생명주기 이력은 `.pulsehft/execution-journal.jsonl`에 append-only로 저장합니다.
+
+선택적 한국투자 읽기 전용 자격정보와 토큰은 다음 로컬 파일에 저장합니다.
+
+```text
+.pulsehft/kis-prod-read-only.json
+.pulsehft/kis-prod-token.json
+```
+
+`.pulsehft/`는 Git에서 제외됩니다. 자격정보 파일에는 계좌번호를 저장하지 않으며 설정 스크립트가 Windows ACL을 현재 사용자로 제한합니다.
 
 다음 항목은 현재 상태 복원 대상으로 저장하지 않습니다.
 

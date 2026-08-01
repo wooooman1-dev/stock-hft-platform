@@ -2,7 +2,7 @@
 
 실시간 호가·체결 기반 시장 미세구조 분석과 **호가 기반 모의주문**을 하나의 서버 중심 구조로 구현한 개발 버전입니다.
 
-> 현재는 **SIMULATION / INTERNAL PAPER ONLY**입니다. 실제 증권사 시세·계좌·주문은 연결되어 있지 않습니다.
+> 기본 실행은 **SIMULATION / INTERNAL PAPER ONLY**입니다. 선택적으로 한국투자증권 실전 App Key를 사용한 `PROD_READ_ONLY` 현재가 조회만 활성화할 수 있으며, 실제 계좌·잔고·주문은 연결되어 있지 않습니다.
 
 ## 포함 기능
 
@@ -24,6 +24,7 @@
 - 포지션 최초 진입시각과 보유 중 최고가격 추적
 - 전략 청산 전 열린 주문 취소와 전체 포지션 시장가 IOC 청산
 - 최대 주문·최대 포지션·손실 한도
+- 한국투자증권 실전 REST 현재가 조회 전용 `PROD_READ_ONLY`
 - SSE 기반 실시간 대시보드
 - 외부 패키지 의존성 없음
 
@@ -41,6 +42,31 @@
 - 전략 청산: 열린 주문을 먼저 취소한 뒤 전체 보유수량을 시장가 IOC로 제출
 
 세부 규칙과 한계는 `docs/PAPER_EXECUTION_MODEL.md`와 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
+
+## 한국투자 실전 시세 전용 모드
+
+한국투자 연동은 기본적으로 꺼져 있습니다. 프로젝트 루트의 `.env`에는 실전 App Key와 App Secret만 저장하며 계좌번호는 저장하지 않습니다. `.env`는 Git에서 제외됩니다.
+
+```dotenv
+PULSEHFT_KIS_MODE=PROD_READ_ONLY
+PULSEHFT_KIS_APP_KEY=발급받은_실전_APP_KEY
+PULSEHFT_KIS_APP_SECRET=발급받은_실전_APP_SECRET
+```
+
+실행:
+
+```powershell
+npm run start:kis:prod-read-only
+```
+
+활성화 후 로컬 컴퓨터에서만 다음 경로를 사용할 수 있습니다.
+
+```text
+GET /api/kis/status
+GET /api/kis/quote?symbol=005930&market=UN
+```
+
+`/api/kis/status`와 `/api/kis/quote` 이외의 한국투자 경로는 존재하지 않습니다. 주문·정정·취소·잔고 API와 실전 주문 모드는 구현하지 않았습니다. 자세한 보안 경계와 설정 방법은 `docs/KIS_PROD_READ_ONLY.md`를 확인하세요.
 
 ## 실행 저널
 
@@ -82,6 +108,8 @@ npm run check
 GET  /health
 GET  /api/snapshot
 GET  /api/events
+GET  /api/kis/status
+GET  /api/kis/quote?symbol=005930&market=UN
 GET  /api/strategy/settings
 PUT  /api/strategy/settings
 POST /api/strategy/settings/reset
@@ -148,9 +176,10 @@ npm start
 ## 디렉터리
 
 ```text
-public/          브라우저 대시보드
-server/domain/   분석·주문상태·모의체결·전략·리스크 엔진
-server/test/     단위·런타임 테스트
-scripts/         로컬 결정적 검증 스크립트
-docs/            아키텍처·체결모델·전략설정·실행저널·로드맵
+public/                   브라우저 대시보드
+server/domain/            분석·주문상태·모의체결·전략·리스크 엔진
+server/integrations/kis/  한국투자 실전 시세 전용 인증·조회 경계
+server/test/              단위·런타임 테스트
+scripts/                  로컬 설정·결정적 검증 스크립트
+docs/                     아키텍처·체결모델·전략설정·실행저널·KIS·로드맵
 ```
