@@ -59,6 +59,62 @@ test("runtime tracks entry time and executes a stop loss through the paper order
   runtime.stop();
 });
 
+test("protective exit cancels every resting order before flattening the full position", () => {
+  let now = 30_000;
+  const runtime = new MarketRuntime("005930", "삼성전자", 70_000, { now: () => now });
+  runtime.submitOrder({
+    side: "BUY",
+    type: "MARKET",
+    quantity: 10,
+    clientOrderId: "risk-reservation-entry",
+    timestamp: now,
+  });
+
+  let snapshot = runtime.snapshot();
+  const bestBid = snapshot.book.bids[0].price;
+  const openSell = runtime.submitOrder({
+    side: "SELL",
+    type: "LIMIT",
+    quantity: 4,
+    limitPrice: bestBid + runtime.simulator.tickSize * 10,
+    clientOrderId: "risk-open-sell",
+    timestamp: now + 1,
+  });
+  const openBuy = runtime.submitOrder({
+    side: "BUY",
+    type: "LIMIT",
+    quantity: 2,
+    limitPrice: bestBid - runtime.simulator.tickSize,
+    clientOrderId: "risk-open-buy",
+    timestamp: now + 2,
+  });
+  assert.equal(openSell.status, "ACCEPTED");
+  assert.equal(openBuy.status, "ACCEPTED");
+  snapshot = runtime.snapshot();
+  assert.equal(snapshot.account.openOrderCount, 2);
+  assert.equal(snapshot.account.sellableQuantity, 6);
+
+  const averagePrice = snapshot.account.position.averagePrice;
+  runtime.setStrategySettings({ stopLossBps: 1 });
+  runtime.setAutoPaperTrading(true);
+  now += 1_000;
+  setRuntimeMarket(runtime, averagePrice - runtime.simulator.tickSize, now);
+  runtime.maybeRunStrategy(now);
+
+  snapshot = runtime.snapshot();
+  assert.equal(snapshot.account.position.quantity, 0);
+  assert.equal(snapshot.account.openOrderCount, 0);
+  const ordersByClientId = Object.fromEntries(
+    snapshot.account.orders.map((order) => [order.clientOrderId, order]),
+  );
+  assert.equal(ordersByClientId["risk-open-sell"].status, "CANCELLED");
+  assert.equal(ordersByClientId["risk-open-buy"].status, "CANCELLED");
+  assert.match(ordersByClientId["risk-open-sell"].reason, /전략 청산/);
+  assert.equal(snapshot.account.orders[0].source, "STRATEGY");
+  assert.match(snapshot.account.orders[0].clientOrderId, /stop-loss/);
+  runtime.stop();
+});
+
 test("runtime does not execute protective exits while auto strategy is off", () => {
   let now = 20_000;
   const runtime = new MarketRuntime("005930", "삼성전자", 70_000, { now: () => now });
