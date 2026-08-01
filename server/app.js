@@ -73,10 +73,20 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "POST" && url.pathname === "/api/paper/orders") {
       const body = await readJson(request);
-      if (!["BUY", "SELL"].includes(body.side) || typeof body.quantity !== "number") {
-        return json(response, 400, { error: "side(BUY|SELL)와 quantity(number)가 필요합니다." });
-      }
-      return json(response, 200, runtime.submitOrder(body.side, body.quantity));
+      return json(response, 200, runtime.submitOrder({
+        side: body.side,
+        type: body.type ?? "MARKET",
+        quantity: body.quantity,
+        limitPrice: body.limitPrice,
+        clientOrderId: body.clientOrderId,
+        source: "MANUAL",
+      }));
+    }
+    const cancelMatch = request.method === "POST"
+      ? url.pathname.match(/^\/api\/paper\/orders\/([^/]+)\/cancel$/)
+      : null;
+    if (cancelMatch) {
+      return json(response, 200, runtime.cancelOrder(decodeURIComponent(cancelMatch[1])));
     }
     if (request.method === "POST" && url.pathname === "/api/system/kill-switch") {
       const body = await readJson(request);
@@ -97,7 +107,11 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET") return serveStatic(url.pathname, response);
     return json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
   } catch (error) {
-    return json(response, 500, { error: error instanceof Error ? error.message : "서버 오류" });
+    const status = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    return json(response, status, {
+      error: error instanceof Error ? error.message : "서버 오류",
+      code: error?.code ?? "SERVER_ERROR",
+    });
   }
 });
 
