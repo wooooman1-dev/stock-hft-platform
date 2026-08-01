@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "node --watch server/app.js",
     "start": "node server/app.js",
+    "start:kis:prod-read-only": "node --env-file=.env server/app.js",
     "test": "node --test server/test/*.test.js",
     "check": "node --check server/app.js && node --check server/domain/runtime.js && node --check server/domain/strategyPolicy.js && node --check server/domain/strategySettings.js && node --check server/domain/positionRiskTracker.js && node --check server/domain/executionJournal.js && node --check server/domain/verificationMarket.js && node --check server/integrations/kis/kisConfig.js && node --check server/integrations/kis/kisTokenStore.js && node --check server/integrations/kis/kisProdReadOnlyClient.js && node --check public/app.js && node --check public/snapshotInteractionGuard.js && node --check public/strategySettingsPanel.js && npm test"
   },
