@@ -79,8 +79,6 @@ POST /api/strategy/auto
 POST /api/system/kill-switch
 ```
 
-결정적 위험청산 검증이 필요한 경우에만 서버 시작 전에 `PULSEHFT_ENABLE_VERIFICATION_API=true`를 설정할 수 있습니다. 이때도 로컬 루프백 요청만 `POST /api/verification/market-tick`에 접근할 수 있으며 일반 실행에서는 HTTP 404를 반환합니다. 세부 사용법은 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
-
 시장가 주문 예시:
 
 ```json
@@ -104,11 +102,42 @@ POST /api/system/kill-switch
 }
 ```
 
+## 검증 전용 시장 틱 API
+
+손절·익절·트레일링 스톱을 무작위 가격 변동 없이 재현하기 위한 개발 검증 전용 경로입니다.
+
+```text
+POST /api/verification/market-tick
+```
+
+일반 실행에서는 경로가 존재하지 않는 것처럼 HTTP 404를 반환합니다. 서버 시작 전에 `PULSEHFT_ENABLE_VERIFICATION_API=true`를 명시하고 로컬 루프백 주소로 요청한 경우에만 사용할 수 있습니다.
+
+검증 틱이 실제 적용되면 무작위 시장 타이머를 서버 재시작까지 정지하고, 해당 스냅샷의 `system.verificationMode`와 `system.marketTimerPaused`를 `true`로 표시합니다. 일반 모드 스냅샷에는 이 두 검증 전용 속성을 포함하지 않습니다.
+
+```powershell
+$env:PULSEHFT_ENABLE_VERIFICATION_API = "true"
+npm start
+```
+
+결정적 위험청산 검증:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-risk-exits.ps1
+```
+
+검증이 끝나면 서버를 종료하고 환경변수를 제거한 뒤 일반 모드로 재시작합니다.
+
+```powershell
+Remove-Item Env:PULSEHFT_ENABLE_VERIFICATION_API -ErrorAction SilentlyContinue
+npm start
+```
+
 ## 디렉터리
 
 ```text
 public/          브라우저 대시보드
 server/domain/   분석·주문상태·모의체결·전략·리스크 엔진
 server/test/     단위·런타임 테스트
+scripts/         로컬 결정적 검증 스크립트
 docs/            아키텍처·체결모델·전략설정·로드맵
 ```
