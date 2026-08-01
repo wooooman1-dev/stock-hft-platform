@@ -73,11 +73,12 @@ export class KisProdReadOnlyClient {
       },
     });
     const payload = await parseJson(response, "현재가 조회");
+    const secrets = [this.config.appKey, this.config.appSecret, accessToken];
     if (!response.ok) {
-      throw apiFailure("현재가 조회", response.status, payload, "KIS_QUOTE_HTTP_ERROR");
+      throw apiFailure("현재가 조회", response.status, payload, "KIS_QUOTE_HTTP_ERROR", secrets);
     }
     if (String(payload?.rt_cd ?? "") !== "0") {
-      throw apiFailure("현재가 조회", 502, payload, "KIS_QUOTE_REJECTED");
+      throw apiFailure("현재가 조회", 502, payload, "KIS_QUOTE_REJECTED", secrets);
     }
     if (!isRecord(payload.output)) {
       throw new KisApiError(
@@ -120,7 +121,13 @@ export class KisProdReadOnlyClient {
     });
     const payload = await parseJson(response, "접근토큰 발급");
     if (!response.ok) {
-      throw apiFailure("접근토큰 발급", response.status, payload, "KIS_TOKEN_HTTP_ERROR");
+      throw apiFailure(
+        "접근토큰 발급",
+        response.status,
+        payload,
+        "KIS_TOKEN_HTTP_ERROR",
+        [this.config.appKey, this.config.appSecret],
+      );
     }
 
     const accessToken = typeof payload?.access_token === "string" ? payload.access_token : "";
@@ -151,10 +158,11 @@ export class KisProdReadOnlyClient {
       return await this.fetchImpl(url, { ...options, signal: controller.signal });
     } catch (error) {
       const timeoutFailure = error?.name === "AbortError";
+      const safeDetail = redactText(formatError(error), [this.config.appKey, this.config.appSecret]);
       throw new KisApiError(
         timeoutFailure
           ? "한국투자 API 요청 시간이 초과되었습니다."
-          : `한국투자 API 네트워크 요청에 실패했습니다: ${formatError(error)}`,
+          : `한국투자 API 네트워크 요청에 실패했습니다: ${safeDetail}`,
         timeoutFailure ? "KIS_REQUEST_TIMEOUT" : "KIS_NETWORK_ERROR",
         502,
       );
@@ -226,13 +234,25 @@ async function parseJson(response, operation) {
   }
 }
 
-function apiFailure(operation, status, payload, code) {
-  const message = firstText(payload?.msg1, payload?.error_description, payload?.message);
+function apiFailure(operation, status, payload, code, secrets = []) {
+  const detail = firstText(payload?.msg1, payload?.error_description, payload?.message);
+  const message = redactText(detail, secrets);
   return new KisApiError(
     `한국투자 ${operation} 실패${message ? `: ${message}` : ""}`,
     code,
     Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502,
   );
+}
+
+function redactText(value, secrets) {
+  let text = textOrNull(value);
+  if (!text) return text;
+  for (const secret of secrets) {
+    if (typeof secret === "string" && secret.length > 0) {
+      text = text.replaceAll(secret, "[REDACTED]");
+    }
+  }
+  return text;
 }
 
 function numberOrNull(value) {
