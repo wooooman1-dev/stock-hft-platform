@@ -45,11 +45,18 @@
 
 ## 한국투자 실전 시세 전용 모드
 
-한국투자 연동은 기본적으로 꺼져 있습니다. 실전 App Key와 App Secret만 로컬에 저장하며 계좌번호는 저장하지 않습니다.
+한국투자 연동은 기본적으로 꺼져 있습니다. 프로젝트 루트의 `.env`에는 실전 App Key와 App Secret만 저장하며 계좌번호는 저장하지 않습니다. `.env`는 Git에서 제외됩니다.
+
+```dotenv
+PULSEHFT_KIS_MODE=PROD_READ_ONLY
+PULSEHFT_KIS_APP_KEY=발급받은_실전_APP_KEY
+PULSEHFT_KIS_APP_SECRET=발급받은_실전_APP_SECRET
+```
+
+실행:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\configure-kis-prod-read-only.ps1
-& .\.pulsehft\start-kis-prod-read-only.ps1
+npm run start:kis:prod-read-only
 ```
 
 활성화 후 로컬 컴퓨터에서만 다음 경로를 사용할 수 있습니다.
