@@ -63,10 +63,12 @@ async function loadGuard() {
   FakeNativeEventSource.instances = [];
   const document = createDocument();
   const timers = new Map();
+  const microtasks = [];
   let timerSequence = 0;
   const context = vm.createContext({
     EventSource: FakeNativeEventSource,
     document,
+    queueMicrotask: (callback) => microtasks.push(callback),
     setTimeout: (callback, delay = 0) => {
       const id = ++timerSequence;
       timers.set(id, { callback, delay });
@@ -76,6 +78,11 @@ async function loadGuard() {
   });
   const source = await readFile(new URL("../../public/snapshotInteractionGuard.js", import.meta.url), "utf8");
   vm.runInContext(source, context);
+
+  function flushMicrotasks() {
+    while (microtasks.length > 0) microtasks.shift()();
+  }
+
   return {
     GuardedEventSource: context.EventSource,
     document,
@@ -85,6 +92,7 @@ async function loadGuard() {
         timers.delete(id);
         timer.callback();
       }
+      flushMicrotasks();
     },
   };
 }
