@@ -3,7 +3,9 @@ import { createServer } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ExecutionJournal } from "./domain/executionJournal.js";
+import { InstrumentCatalog } from "./domain/instrumentCatalog.js";
 import { MarketRuntime } from "./domain/runtime.js";
+import { SelectedInstrumentStore } from "./domain/selectedInstrumentStore.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
 import {
   loadKisConfiguration,
@@ -28,12 +30,24 @@ const publicDir = join(root, "public");
 const dataDir = process.env.PULSEHFT_DATA_DIR
   ? resolve(process.env.PULSEHFT_DATA_DIR)
   : join(root, ".pulsehft");
-const symbol = process.env.DEFAULT_SYMBOL ?? "005930";
-const symbolName = process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자";
-const initialPrice = Number(process.env.DEFAULT_PRICE ?? 70_000);
+const defaultInstrument = {
+  symbol: process.env.DEFAULT_SYMBOL ?? "005930",
+  symbolName: process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자",
+  market: null,
+  securityType: null,
+  initialPrice: Number(process.env.DEFAULT_PRICE ?? 70_000),
+  previousClose: Number(process.env.DEFAULT_PRICE ?? 70_000),
+  tickSize: 100,
+  priceSource: "ENV_DEFAULT",
+  quoteFetchedAt: null,
+  selectedAt: null,
+};
 const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
 const strategySettings = strategySettingsStore.load();
 const executionJournal = new ExecutionJournal(join(dataDir, "execution-journal.jsonl"));
+const instrumentCatalog = new InstrumentCatalog(join(dataDir, "instrument-catalog.json"));
+const selectedInstrumentStore = new SelectedInstrumentStore(join(dataDir, "selected-instrument.json"));
+const selectedInstrument = selectedInstrumentStore.load() ?? defaultInstrument;
 
 const kisConfiguration = loadKisConfiguration(join(dataDir, "kis-prod-read-only.json"));
 const kisTokenStore = kisConfiguration.enabled
@@ -56,13 +70,20 @@ if (kisPaperClient) kisPaperClient.status();
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 const runtime = new MarketRuntime(
-  symbol,
-  symbolName,
-  initialPrice,
+  selectedInstrument.symbol,
+  selectedInstrument.symbolName,
+  selectedInstrument.initialPrice,
   {
     strategySettings,
     strategySettingsStore,
     executionJournal,
+    previousClose: selectedInstrument.previousClose,
+    instrumentMarket: selectedInstrument.market,
+    instrumentSecurityType: selectedInstrument.securityType,
+    instrumentTickSize: selectedInstrument.tickSize,
+    instrumentPriceSource: selectedInstrument.priceSource,
+    instrumentQuoteFetchedAt: selectedInstrument.quoteFetchedAt,
+    instrumentSelectedAt: selectedInstrument.selectedAt,
   },
 );
 const kisPaperOrderService = kisPaperClient
@@ -74,10 +95,11 @@ const kisPaperOrderService = kisPaperClient
   })
   : null;
 
+const startupSnapshot = runtime.snapshot();
 executionJournal.append("SESSION_STARTED", {
   mode: "SIMULATION",
-  symbol,
-  symbolName,
+  symbol: startupSnapshot.symbol,
+  symbolName: startupSnapshot.symbolName,
   processId: process.pid,
   kisMode: kisConfiguration.mode,
   kisQuoteEnabled: kisConfiguration.enabled,
@@ -85,6 +107,7 @@ executionJournal.append("SESSION_STARTED", {
   kisPaperBalanceEnabled: Boolean(kisPaperClient),
   kisPaperOrderEnabled: Boolean(kisPaperOrderService),
   kisPaperAutomaticStrategyConnected: false,
+  instrumentSearchEnabled: true,
 });
 const eventClients = new Set();
 runtime.start();
@@ -205,6 +228,7 @@ const server = createServer(async (request, response) => {
         clients: eventClients.size,
         kis: getKisHealthStatus(),
         kisPaper: getKisPaperHealthStatus(),
+        instruments: instrumentCatalog.status(),
       });
     }
     if (request.method === "GET" && url.pathname === "/api/snapshot") {
@@ -221,6 +245,90 @@ const server = createServer(async (request, response) => {
       eventClients.add(response);
       request.on("close", () => eventClients.delete(response));
       return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/instruments/search") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, await instrumentCatalog.search(
+        url.searchParams.get("q"),
+        { limit: url.searchParams.get("limit") ?? 20 },
+      ));
+    }
+    if (request.method === "GET" && url.pathname === "/api/instruments/status") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const selected = runtime.snapshot();
+      return json(response, 200, {
+        ...instrumentCatalog.status(),
+        selected: {
+          symbol: selected.symbol,
+          symbolName: selected.symbolName,
+          ...selected.instrument,
+        },
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/api/instruments/select") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      if (!kisClient) {
+        return json(response, 503, {
+          error: "종목 전환에는 한국투자 실전 시세 읽기 전용 연결이 필요합니다.",
+          code: "KIS_DISABLED",
+        });
+      }
+      const body = await readJson(request);
+      const requestedSymbol = String(body.symbol ?? "").trim().toUpperCase();
+      if (!/^(?:\d{6}|Q\d{6})$/.test(requestedSymbol)) {
+        return json(response, 400, {
+          error: "symbol은 6자리 종목코드 또는 Q로 시작하는 ETN 코드여야 합니다.",
+          code: "INSTRUMENT_SELECT_INVALID_SYMBOL",
+        });
+      }
+      const searchResult = await instrumentCatalog.search(requestedSymbol, { limit: 20 });
+      const instrument = searchResult.results.find((item) => item.symbol === requestedSymbol);
+      if (!instrument) {
+        return json(response, 404, {
+          error: "종목 마스터에서 요청한 종목을 찾을 수 없습니다.",
+          code: "INSTRUMENT_NOT_FOUND",
+        });
+      }
+      const quote = await kisClient.getCurrentPrice({ symbol: instrument.symbol, market: "UN" });
+      const currentPrice = Number(quote.currentPrice);
+      const previousClose = Number(quote.basePrice);
+      const tickSize = Number(quote.askUnit);
+      if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+        return json(response, 502, {
+          error: "한국투자 현재가 응답에 유효한 현재가가 없습니다.",
+          code: "INSTRUMENT_QUOTE_PRICE_INVALID",
+        });
+      }
+      const selection = {
+        symbol: instrument.symbol,
+        symbolName: instrument.name,
+        market: instrument.market,
+        securityType: instrument.securityType,
+        initialPrice: currentPrice,
+        previousClose: Number.isFinite(previousClose) && previousClose > 0 ? previousClose : currentPrice,
+        tickSize: Number.isFinite(tickSize) && tickSize > 0 ? tickSize : 100,
+        priceSource: "KIS_PROD_READ_ONLY",
+        quoteFetchedAt: quote.fetchedAt,
+      };
+      const result = runtime.switchInstrument(selection, {
+        persist: (next) => selectedInstrumentStore.save(next),
+      });
+      return json(response, 200, {
+        changed: result.changed,
+        selected: {
+          symbol: instrument.symbol,
+          symbolName: instrument.name,
+          market: instrument.market,
+          securityType: instrument.securityType,
+        },
+        quote: {
+          currentPrice: quote.currentPrice,
+          basePrice: quote.basePrice,
+          askUnit: quote.askUnit,
+          fetchedAt: quote.fetchedAt,
+        },
+        snapshot: result.snapshot,
+      });
     }
     if (request.method === "GET" && url.pathname === "/api/kis/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;

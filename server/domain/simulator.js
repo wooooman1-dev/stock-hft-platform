@@ -15,10 +15,16 @@ class SeededRandom {
 }
 
 export class MarketSimulator {
-  constructor(initialPrice) {
-    this.tickSize = 100;
+  constructor(initialPrice, { tickSize = 100 } = {}) {
+    if (!Number.isFinite(Number(initialPrice)) || Number(initialPrice) <= 0) {
+      throw new TypeError("initialPrice는 양수여야 합니다.");
+    }
+    if (!Number.isFinite(Number(tickSize)) || Number(tickSize) <= 0) {
+      throw new TypeError("tickSize는 양수여야 합니다.");
+    }
+    this.tickSize = Number(tickSize);
     this.random = new SeededRandom();
-    this.price = Math.round(initialPrice / this.tickSize) * this.tickSize;
+    this.price = Math.max(this.tickSize, Math.round(Number(initialPrice) / this.tickSize) * this.tickSize);
     this.drift = 0;
     this.trades = [];
     this.candles = [];

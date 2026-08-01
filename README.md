@@ -14,6 +14,7 @@
 - 전략 설정 영구 저장과 결정적 검증 시장 틱
 - 주문·체결·계좌 초기화 append-only JSONL 실행 저널
 - 한국투자 실전 REST 현재가 조회 전용 `PROD_READ_ONLY`
+- KIS 공식 KOSPI·KOSDAQ 종목 마스터 기반 검색·메인 시뮬레이션 종목 전환
 - 한국투자 모의계좌 잔고·매수·매도·정정·취소 `PAPER_TRADING`
 - 모의계좌 주문 명령 선기록, 재시작 멱등 복원, `UNKNOWN_RESULT` 차단
 - 주문수량·주문금액·일일 주문횟수·일일 손실 한도
@@ -30,6 +31,22 @@
 - 수수료·세금, 실제 주문 큐 순서, 숨은 유동성은 아직 미반영
 
 세부 규칙은 `docs/PAPER_EXECUTION_MODEL.md`와 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
+
+
+## 국내 종목 검색과 메인 종목 전환
+
+대시보드 상단의 `종목변경` 버튼 또는 `Ctrl+K`로 KOSPI·KOSDAQ 종목을 이름이나 코드로 검색합니다. 첫 검색 시 KIS 공식 종목 마스터 ZIP을 내려받아 `.pulsehft/instrument-catalog.json`에 캐시하며, 24시간이 지나면 자동 갱신합니다. 네트워크 갱신에 실패해도 기존 캐시가 있으면 `STALE` 상태로 검색을 계속합니다.
+
+검색 결과를 선택하면 서버가 실전 `PROD_READ_ONLY` 현재가 API로 현재가·기준가·호가단위를 확인한 뒤 메인 `SIMULATION` 종목을 전환합니다. 상단 종목명, 차트, 호가, 체결, 분석 신호와 내부 모의주문 입력이 새 종목 기준으로 초기화되며 마지막 선택은 `.pulsehft/selected-instrument.json`에 저장되어 서버 재시작 후 복원됩니다.
+
+단일 종목 내부 모의체결의 데이터 혼합을 막기 위해 다음 상태에서는 전환을 거절합니다.
+
+- 내부 모의 자동전략이 켜져 있음
+- 내부 모의계좌 보유수량이 남아 있음
+- 대기 주문이 남아 있음
+- 이전 종목의 주문 내역이 남아 있음 — 화면의 내부 모의계좌 `초기화` 후 전환
+
+이 전환은 PulseHFT 내부 `SIMULATION`에만 적용됩니다. 한국투자 모의계좌 잔고와 실제 모의주문은 자동으로 변경하거나 제출하지 않습니다.
 
 ## 한국투자 실전 시세 전용
 
@@ -111,6 +128,9 @@ npm run check
 GET  /health
 GET  /api/snapshot
 GET  /api/events
+GET  /api/instruments/status
+GET  /api/instruments/search?q=삼성전자&limit=20
+POST /api/instruments/select
 GET  /api/kis/status
 GET  /api/kis/quote?symbol=005930&market=UN
 GET  /api/kis/paper/status
