@@ -52,11 +52,9 @@ export function evaluateAutoStrategy({
     && confidence >= normalized.exitMinimumConfidence
     && positionQuantity > 0
   ) {
-    const sellableQuantity = resolveSellableQuantity(account, positionQuantity);
-    if (sellableQuantity <= 0) return null;
     return {
       side: "SELL",
-      quantity: sellableQuantity,
+      quantity: positionQuantity,
       reason: "EXIT_SIGNAL",
     };
   }
@@ -73,10 +71,7 @@ export function evaluatePositionRiskExit({
 }) {
   const normalized = normalizeStrategySettings(settings);
   const positionQuantity = Number(account?.position?.quantity ?? 0);
-  if (positionQuantity <= 0) return null;
-
-  const quantity = resolveSellableQuantity(account, positionQuantity);
-  if (quantity <= 0) return null;
+  if (!Number.isInteger(positionQuantity) || positionQuantity <= 0) return null;
 
   const enabled = normalized.stopLossBps !== null
     || normalized.takeProfitBps !== null
@@ -91,7 +86,7 @@ export function evaluatePositionRiskExit({
 
   const returnBps = ((currentPrice - averagePrice) / averagePrice) * 10_000;
   if (normalized.stopLossBps !== null && returnBps <= -normalized.stopLossBps) {
-    return riskExitIntent(quantity, "STOP_LOSS", { returnBps });
+    return riskExitIntent(positionQuantity, "STOP_LOSS", { returnBps });
   }
 
   const peakPrice = Number(positionRiskState?.peakPrice);
@@ -102,7 +97,7 @@ export function evaluatePositionRiskExit({
   ) {
     const drawdownFromPeakBps = ((peakPrice - currentPrice) / peakPrice) * 10_000;
     if (drawdownFromPeakBps >= normalized.trailingStopBps) {
-      return riskExitIntent(quantity, "TRAILING_STOP", {
+      return riskExitIntent(positionQuantity, "TRAILING_STOP", {
         returnBps,
         drawdownFromPeakBps,
         peakPrice,
@@ -111,7 +106,7 @@ export function evaluatePositionRiskExit({
   }
 
   if (normalized.takeProfitBps !== null && returnBps >= normalized.takeProfitBps) {
-    return riskExitIntent(quantity, "TAKE_PROFIT", { returnBps });
+    return riskExitIntent(positionQuantity, "TAKE_PROFIT", { returnBps });
   }
 
   const openedAt = Number(positionRiskState?.openedAt);
@@ -124,19 +119,11 @@ export function evaluatePositionRiskExit({
   ) {
     const heldMs = currentTime - openedAt;
     if (heldMs >= normalized.maxHoldingMs) {
-      return riskExitIntent(quantity, "MAX_HOLDING_TIME", { returnBps, heldMs });
+      return riskExitIntent(positionQuantity, "MAX_HOLDING_TIME", { returnBps, heldMs });
     }
   }
 
   return null;
-}
-
-function resolveSellableQuantity(account, positionQuantity) {
-  const sellable = Number(account?.sellableQuantity);
-  if (Number.isInteger(sellable) && sellable >= 0) {
-    return Math.min(positionQuantity, sellable);
-  }
-  return positionQuantity;
 }
 
 function riskExitIntent(quantity, reason, diagnostics) {
