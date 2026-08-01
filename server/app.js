@@ -1,16 +1,25 @@
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MarketRuntime } from "./domain/runtime.js";
+import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const publicDir = join(root, "public");
+const dataDir = process.env.PULSEHFT_DATA_DIR
+  ? resolve(process.env.PULSEHFT_DATA_DIR)
+  : join(root, ".pulsehft");
+const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
 const port = Number(process.env.PORT ?? 8787);
 const runtime = new MarketRuntime(
   process.env.DEFAULT_SYMBOL ?? "005930",
   process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자",
   Number(process.env.DEFAULT_PRICE ?? 70_000),
+  {
+    strategySettings: strategySettingsStore.load(),
+    strategySettingsStore,
+  },
 );
 const eventClients = new Set();
 runtime.start();
@@ -70,6 +79,15 @@ const server = createServer(async (request, response) => {
       eventClients.add(response);
       request.on("close", () => eventClients.delete(response));
       return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/strategy/settings") {
+      return json(response, 200, runtime.getStrategySettings());
+    }
+    if (request.method === "PUT" && url.pathname === "/api/strategy/settings") {
+      return json(response, 200, runtime.setStrategySettings(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/strategy/settings/reset") {
+      return json(response, 200, runtime.resetStrategySettings());
     }
     if (request.method === "POST" && url.pathname === "/api/paper/orders") {
       const body = await readJson(request);

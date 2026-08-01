@@ -2,9 +2,18 @@ import { EventEmitter } from "node:events";
 import { calculateMicrostructureMetrics } from "./analysis.js";
 import { PaperTrader } from "./paperTrader.js";
 import { MarketSimulator } from "./simulator.js";
+import { evaluateAutoStrategy } from "./strategyPolicy.js";
+import {
+  DEFAULT_STRATEGY_SETTINGS,
+  normalizeStrategySettings,
+} from "./strategySettings.js";
 
 export class MarketRuntime extends EventEmitter {
-  constructor(symbol, symbolName, initialPrice, { now = Date.now } = {}) {
+  constructor(symbol, symbolName, initialPrice, {
+    now = Date.now,
+    strategySettings = DEFAULT_STRATEGY_SETTINGS,
+    strategySettingsStore = null,
+  } = {}) {
     super();
     this.symbol = symbol;
     this.symbolName = symbolName;
@@ -12,6 +21,10 @@ export class MarketRuntime extends EventEmitter {
     this.now = now;
     this.simulator = new MarketSimulator(initialPrice);
     this.trader = new PaperTrader(10_000_000, { now });
+    this.strategySettingsStore = strategySettingsStore;
+    this.strategySettings = normalizeStrategySettings(strategySettings, {
+      maxOrderQuantity: this.trader.limits.maxOrderQuantity,
+    });
     this.killSwitch = false;
     this.autoPaperTrading = false;
     this.lastAutoOrderAt = 0;
@@ -29,6 +42,34 @@ export class MarketRuntime extends EventEmitter {
   }
 
   snapshot() { return structuredClone(this.snapshotValue); }
+
+  getStrategySettings() {
+    return structuredClone(this.strategySettings);
+  }
+
+  setStrategySettings(patch) {
+    const normalized = normalizeStrategySettings(patch, {
+      base: this.strategySettings,
+      maxOrderQuantity: this.trader.limits.maxOrderQuantity,
+    });
+    this.strategySettings = this.strategySettingsStore
+      ? this.strategySettingsStore.save(normalized)
+      : normalized;
+    this.snapshotValue.strategy.settings = this.getStrategySettings();
+    this.emitSnapshot();
+    return this.getStrategySettings();
+  }
+
+  resetStrategySettings() {
+    this.strategySettings = this.strategySettingsStore
+      ? this.strategySettingsStore.reset()
+      : normalizeStrategySettings(DEFAULT_STRATEGY_SETTINGS, {
+        maxOrderQuantity: this.trader.limits.maxOrderQuantity,
+      });
+    this.snapshotValue.strategy.settings = this.getStrategySettings();
+    this.emitSnapshot();
+    return this.getStrategySettings();
+  }
 
   submitOrder(sideOrInput, quantity, source = "MANUAL", emit = true) {
     const request = typeof sideOrInput === "object" && sideOrInput !== null
@@ -109,6 +150,11 @@ export class MarketRuntime extends EventEmitter {
       account: this.trader.snapshot(tick.lastPrice),
       riskLimits: this.trader.limits,
       tickSize: this.simulator.tickSize,
+      strategy: {
+        settings: this.getStrategySettings(),
+        lastAutoOrderAt: this.lastAutoOrderAt,
+        enabledOnRestart: false,
+      },
       system: {
         mode: "SIMULATION",
         feedConnected: true,
@@ -123,29 +169,26 @@ export class MarketRuntime extends EventEmitter {
 
   maybeRunStrategy(now = this.now()) {
     if (!this.autoPaperTrading || this.killSwitch) return;
-    if (now - this.lastAutoOrderAt < 5_000) return;
-    const { signal, confidence, spreadTicks } = this.snapshotValue.metrics;
-    const quantity = this.snapshotValue.account.position.quantity;
-    if (signal === "BUY" && confidence >= 50 && spreadTicks <= 2 && quantity === 0) {
-      const order = this.submitOrder({
-        side: "BUY",
-        type: "MARKET",
-        quantity: 10,
-        source: "STRATEGY",
-        clientOrderId: `strategy-buy-${now}`,
-        timestamp: now,
-      }, undefined, "STRATEGY", false);
-      if (order.status !== "REJECTED" && order.status !== "CANCELLED") this.lastAutoOrderAt = now;
-    } else if (signal === "SELL" && confidence >= 50 && quantity > 0) {
-      const order = this.submitOrder({
-        side: "SELL",
-        type: "MARKET",
-        quantity,
-        source: "STRATEGY",
-        clientOrderId: `strategy-sell-${now}`,
-        timestamp: now,
-      }, undefined, "STRATEGY", false);
-      if (order.status !== "REJECTED" && order.status !== "CANCELLED") this.lastAutoOrderAt = now;
+    const intent = evaluateAutoStrategy({
+      metrics: this.snapshotValue.metrics,
+      account: this.snapshotValue.account,
+      settings: this.strategySettings,
+      now,
+      lastOrderAt: this.lastAutoOrderAt,
+    });
+    if (!intent) return;
+
+    const order = this.submitOrder({
+      side: intent.side,
+      type: "MARKET",
+      quantity: intent.quantity,
+      source: "STRATEGY",
+      clientOrderId: `strategy-${intent.side.toLowerCase()}-${now}`,
+      timestamp: now,
+    }, undefined, "STRATEGY", false);
+    if (order.status !== "REJECTED" && order.status !== "CANCELLED") {
+      this.lastAutoOrderAt = now;
+      this.snapshotValue.strategy.lastAutoOrderAt = now;
     }
   }
 
