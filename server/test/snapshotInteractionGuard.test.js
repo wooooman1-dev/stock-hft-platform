@@ -155,6 +155,30 @@ test("zero-delay flush defers DOM replacement until after focusout", async () =>
   assert.deepEqual(received, ["pending"]);
 });
 
+test("strategy action buttons keep snapshots buffered through the click handler", async () => {
+  const { GuardedEventSource, document, runTimers } = await loadGuard();
+  const source = new GuardedEventSource("/api/events");
+  const nativeSource = FakeNativeEventSource.instances[0];
+  const received = [];
+  let clicks = 0;
+  const saveButton = { dataset: { strategyAction: "save" } };
+  source.addEventListener("snapshot", (event) => received.push(event.data));
+  document.addEventListener("click", (event) => {
+    if (event.target?.dataset?.strategyAction === "save") clicks += 1;
+  });
+
+  document.emit("pointerdown", { target: saveButton });
+  nativeSource.emit("snapshot", { type: "snapshot", data: "during-save-click" });
+  assert.deepEqual(received, []);
+
+  document.emit("click", { target: saveButton });
+  assert.equal(clicks, 1);
+  assert.deepEqual(received, []);
+
+  runTimers(0);
+  assert.deepEqual(received, ["during-save-click"]);
+});
+
 test("escape and timeout release buffered interactions", async () => {
   const { GuardedEventSource, document, runTimers } = await loadGuard();
   const source = new GuardedEventSource("/api/events");
