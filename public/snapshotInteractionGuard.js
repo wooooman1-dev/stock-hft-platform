@@ -22,6 +22,18 @@
     return GUARDED_CONTROL_IDS.has(target?.id);
   }
 
+  function strategyActionElement(target) {
+    if (target?.dataset?.strategyAction) return target;
+    if (typeof target?.closest === "function") {
+      return target.closest("[data-strategy-action]");
+    }
+    return null;
+  }
+
+  function isGuardedInteractionTarget(target) {
+    return isGuardedControl(target) || Boolean(strategyActionElement(target));
+  }
+
   function callListener(listener, target, event) {
     if (typeof listener === "function") {
       listener.call(target, event);
@@ -139,11 +151,11 @@
   }
 
   document.addEventListener("pointerdown", (event) => {
-    if (isGuardedControl(event.target)) beginInteraction();
+    if (isGuardedInteractionTarget(event.target)) beginInteraction();
   }, true);
 
   document.addEventListener("focusin", (event) => {
-    if (isGuardedControl(event.target)) beginInteraction();
+    if (isGuardedInteractionTarget(event.target)) beginInteraction();
   }, true);
 
   document.addEventListener("input", (event) => {
@@ -151,7 +163,7 @@
   }, true);
 
   document.addEventListener("keydown", (event) => {
-    if (!isGuardedControl(event.target)) return;
+    if (!isGuardedInteractionTarget(event.target)) return;
     if (event.key === "Escape") {
       endInteraction();
       return;
@@ -163,9 +175,13 @@
     if (event.target?.id === "order-type") endInteraction();
   }, true);
 
+  document.addEventListener("click", (event) => {
+    if (strategyActionElement(event.target)) endInteraction({ defer: true });
+  }, true);
+
   document.addEventListener("focusout", (event) => {
-    if (!isGuardedControl(event.target)) return;
-    if (isGuardedControl(event.relatedTarget)) {
+    if (!isGuardedInteractionTarget(event.target)) return;
+    if (isGuardedInteractionTarget(event.relatedTarget)) {
       beginInteraction();
       return;
     }
@@ -173,7 +189,7 @@
   }, true);
 
   document.addEventListener("pointercancel", (event) => {
-    if (isGuardedControl(event.target)) endInteraction({ defer: true });
+    if (isGuardedInteractionTarget(event.target)) endInteraction({ defer: true });
   }, true);
 
   globalThis.EventSource = SnapshotInteractionGuardEventSource;
