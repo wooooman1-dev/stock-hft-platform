@@ -67,6 +67,7 @@ export class PaperTrader {
 
   validate(input) {
     if (input.killSwitch) return "킬 스위치 활성화";
+    if (input.marketDataAvailable === false) return input.marketDataReason ?? "시세 데이터 사용 불가";
     if (!Number.isInteger(input.quantity) || input.quantity <= 0) return "수량은 양의 정수여야 함";
     if (input.quantity > this.limits.maxOrderQuantity) return "1회 최대 주문 수량 초과";
     if (this.account.realizedPnl <= -this.limits.dailyLossLimit) return "일일 손실 한도 도달";
