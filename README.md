@@ -79,6 +79,8 @@ POST /api/strategy/auto
 POST /api/system/kill-switch
 ```
 
+결정적 위험청산 검증이 필요한 경우에만 서버 시작 전에 `PULSEHFT_ENABLE_VERIFICATION_API=true`를 설정할 수 있습니다. 이때도 로컬 루프백 요청만 `POST /api/verification/market-tick`에 접근할 수 있으며 일반 실행에서는 HTTP 404를 반환합니다. 세부 사용법은 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
+
 시장가 주문 예시:
 
 ```json
