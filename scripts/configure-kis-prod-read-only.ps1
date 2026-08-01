@@ -8,18 +8,22 @@ $dataDir = Join-Path $root ".pulsehft"
 $credentialPath = Join-Path $dataDir "kis-prod-read-only.json"
 $launcherPath = Join-Path $dataDir "start-kis-prod-read-only.ps1"
 
-$appKey = (Read-Host "한국투자 실전 App Key").Trim()
-if ([string]::IsNullOrWhiteSpace($appKey)) {
-    throw "App Key가 비어 있습니다."
-}
-
-$secureSecret = Read-Host "한국투자 실전 App Secret (화면에 표시되지 않음)" -AsSecureString
-$secretPointer = [IntPtr]::Zero
+$secureAppKey = Read-Host "한국투자 실전 App Key (화면에 표시되지 않음)" -AsSecureString
+$secureAppSecret = Read-Host "한국투자 실전 App Secret (화면에 표시되지 않음)" -AsSecureString
+$appKeyPointer = [IntPtr]::Zero
+$appSecretPointer = [IntPtr]::Zero
+$appKey = $null
 $appSecret = $null
 
 try {
-    $secretPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureSecret)
-    $appSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($secretPointer)
+    $appKeyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureAppKey)
+    $appSecretPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureAppSecret)
+    $appKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($appKeyPointer)
+    $appSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($appSecretPointer)
+
+    if ([string]::IsNullOrWhiteSpace($appKey)) {
+        throw "App Key가 비어 있습니다."
+    }
     if ([string]::IsNullOrWhiteSpace($appSecret)) {
         throw "App Secret이 비어 있습니다."
     }
@@ -58,11 +62,16 @@ node server/app.js
     }
 }
 finally {
-    if ($secretPointer -ne [IntPtr]::Zero) {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secretPointer)
+    if ($appKeyPointer -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($appKeyPointer)
     }
+    if ($appSecretPointer -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($appSecretPointer)
+    }
+    $appKey = $null
     $appSecret = $null
-    $secureSecret = $null
+    $secureAppKey = $null
+    $secureAppSecret = $null
 }
 
 Write-Host ""
