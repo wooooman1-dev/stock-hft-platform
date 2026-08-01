@@ -62,16 +62,14 @@ function createDocument() {
 async function loadGuard() {
   FakeNativeEventSource.instances = [];
   const document = createDocument();
-  const microtasks = [];
   const timers = new Map();
   let timerSequence = 0;
   const context = vm.createContext({
     EventSource: FakeNativeEventSource,
     document,
-    queueMicrotask: (callback) => microtasks.push(callback),
-    setTimeout: (callback) => {
+    setTimeout: (callback, delay = 0) => {
       const id = ++timerSequence;
-      timers.set(id, callback);
+      timers.set(id, { callback, delay });
       return id;
     },
     clearTimeout: (id) => timers.delete(id),
@@ -81,19 +79,18 @@ async function loadGuard() {
   return {
     GuardedEventSource: context.EventSource,
     document,
-    flushMicrotasks() {
-      while (microtasks.length > 0) microtasks.shift()();
-    },
-    runTimers() {
-      const callbacks = [...timers.values()];
-      timers.clear();
-      for (const callback of callbacks) callback();
+    runTimers(delay) {
+      const entries = [...timers.entries()].filter(([, timer]) => delay === undefined || timer.delay === delay);
+      for (const [id, timer] of entries) {
+        timers.delete(id);
+        timer.callback();
+      }
     },
   };
 }
 
-test("snapshot events are buffered from pointerdown until order type selection completes", async () => {
-  const { GuardedEventSource, document, flushMicrotasks } = await loadGuard();
+test("snapshot events are buffered until order type selection completes", async () => {
+  const { GuardedEventSource, document, runTimers } = await loadGuard();
   const source = new GuardedEventSource("/api/events");
   const nativeSource = FakeNativeEventSource.instances[0];
   const received = [];
@@ -105,15 +102,53 @@ test("snapshot events are buffered from pointerdown until order type selection c
   assert.deepEqual(received, []);
 
   document.emit("change", { target: { id: "order-type" } });
-  flushMicrotasks();
+  runTimers(0);
   assert.deepEqual(received, ["latest"]);
 
   nativeSource.emit("snapshot", { type: "snapshot", data: "live" });
   assert.deepEqual(received, ["latest", "live"]);
 });
 
-test("escape and timeout release a buffered select interaction", async () => {
-  const { GuardedEventSource, document, flushMicrotasks, runTimers } = await loadGuard();
+test("quantity and limit price editing buffer snapshots until focus leaves", async () => {
+  const { GuardedEventSource, document, runTimers } = await loadGuard();
+  const source = new GuardedEventSource("/api/events");
+  const nativeSource = FakeNativeEventSource.instances[0];
+  const received = [];
+  source.addEventListener("snapshot", (event) => received.push(event.data));
+
+  document.emit("focusin", { target: { id: "limit-price" } });
+  document.emit("input", { target: { id: "limit-price" } });
+  nativeSource.emit("snapshot", { type: "snapshot", data: "during-price-entry" });
+  assert.deepEqual(received, []);
+
+  document.emit("focusout", { target: { id: "limit-price" }, relatedTarget: { id: "quantity" } });
+  nativeSource.emit("snapshot", { type: "snapshot", data: "during-quantity-entry" });
+  runTimers(0);
+  assert.deepEqual(received, []);
+
+  document.emit("focusout", { target: { id: "quantity" }, relatedTarget: { id: "buy-button" } });
+  assert.deepEqual(received, []);
+  runTimers(0);
+  assert.deepEqual(received, ["during-quantity-entry"]);
+});
+
+test("zero-delay flush defers DOM replacement until after focusout", async () => {
+  const { GuardedEventSource, document, runTimers } = await loadGuard();
+  const source = new GuardedEventSource("/api/events");
+  const nativeSource = FakeNativeEventSource.instances[0];
+  const received = [];
+  source.addEventListener("snapshot", (event) => received.push(event.data));
+
+  document.emit("focusin", { target: { id: "limit-price" } });
+  nativeSource.emit("snapshot", { type: "snapshot", data: "pending" });
+  document.emit("focusout", { target: { id: "limit-price" }, relatedTarget: { dataset: { action: "buy" } } });
+  assert.deepEqual(received, []);
+  runTimers(0);
+  assert.deepEqual(received, ["pending"]);
+});
+
+test("escape and timeout release buffered interactions", async () => {
+  const { GuardedEventSource, document, runTimers } = await loadGuard();
   const source = new GuardedEventSource("/api/events");
   const nativeSource = FakeNativeEventSource.instances[0];
   const received = [];
@@ -122,13 +157,13 @@ test("escape and timeout release a buffered select interaction", async () => {
   document.emit("keydown", { target: { id: "order-type" }, key: "Enter" });
   nativeSource.emit("snapshot", { type: "snapshot", data: "keyboard" });
   document.emit("keydown", { target: { id: "order-type" }, key: "Escape" });
-  flushMicrotasks();
+  runTimers(0);
   assert.deepEqual(received, ["keyboard"]);
 
-  document.emit("pointerdown", { target: { id: "order-type" } });
+  document.emit("focusin", { target: { id: "limit-price" } });
   nativeSource.emit("snapshot", { type: "snapshot", data: "timeout" });
-  runTimers();
-  flushMicrotasks();
+  runTimers(15_000);
+  runTimers(0);
   assert.deepEqual(received, ["keyboard", "timeout"]);
 });
 
@@ -138,7 +173,7 @@ test("non-snapshot events and EventSource properties continue to pass through", 
   const nativeSource = FakeNativeEventSource.instances[0];
   const received = [];
 
-  document.emit("pointerdown", { target: { id: "order-type" } });
+  document.emit("pointerdown", { target: { id: "limit-price" } });
   source.addEventListener("notice", (event) => received.push(event.data));
   nativeSource.emit("notice", { type: "notice", data: "immediate" });
   assert.deepEqual(received, ["immediate"]);
