@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { calculateMicrostructureMetrics } from "./analysis.js";
 import { PaperTrader } from "./paperTrader.js";
+import { PositionRiskTracker } from "./positionRiskTracker.js";
 import { MarketSimulator } from "./simulator.js";
 import { evaluateAutoStrategy } from "./strategyPolicy.js";
 import {
@@ -21,6 +22,7 @@ export class MarketRuntime extends EventEmitter {
     this.now = now;
     this.simulator = new MarketSimulator(initialPrice);
     this.trader = new PaperTrader(10_000_000, { now });
+    this.positionRiskTracker = new PositionRiskTracker();
     this.strategySettingsStore = strategySettingsStore;
     this.strategySettings = normalizeStrategySettings(strategySettings, {
       maxOrderQuantity: this.trader.limits.maxOrderQuantity,
@@ -29,7 +31,9 @@ export class MarketRuntime extends EventEmitter {
     this.autoPaperTrading = false;
     this.lastAutoOrderAt = 0;
     this.timer = null;
-    this.snapshotValue = this.makeSnapshot(this.simulator.next(), 0);
+    const initialTick = this.simulator.next(this.now());
+    this.snapshotValue = this.makeSnapshot(initialTick, 0);
+    this.syncPositionRisk(initialTick.lastPrice, initialTick.timestamp);
   }
 
   start() {
@@ -87,6 +91,7 @@ export class MarketRuntime extends EventEmitter {
       killSwitch: this.killSwitch,
     });
     this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
+    this.syncPositionRisk(this.snapshotValue.lastPrice, timestamp);
     if (emit) this.emitSnapshot();
     return order;
   }
@@ -114,7 +119,9 @@ export class MarketRuntime extends EventEmitter {
 
   resetPaperAccount() {
     this.trader.reset();
+    this.positionRiskTracker.reset();
     this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
+    this.snapshotValue.strategy.riskState = this.positionRiskTracker.snapshot();
     this.emitSnapshot();
   }
 
@@ -124,8 +131,10 @@ export class MarketRuntime extends EventEmitter {
     this.snapshotValue = this.makeSnapshot(tick, Number((performance.now() - startedAt).toFixed(2)));
     this.trader.processOpenOrders({ book: tick.book, timestamp: tick.timestamp });
     this.snapshotValue.account = this.trader.snapshot(tick.lastPrice);
+    this.syncPositionRisk(tick.lastPrice, tick.timestamp);
     this.maybeRunStrategy(tick.timestamp);
     this.snapshotValue.account = this.trader.snapshot(tick.lastPrice);
+    this.syncPositionRisk(tick.lastPrice, tick.timestamp);
     this.emitSnapshot();
   }
 
@@ -154,6 +163,7 @@ export class MarketRuntime extends EventEmitter {
         settings: this.getStrategySettings(),
         lastAutoOrderAt: this.lastAutoOrderAt,
         enabledOnRestart: false,
+        riskState: this.positionRiskTracker.snapshot(),
       },
       system: {
         mode: "SIMULATION",
@@ -167,23 +177,57 @@ export class MarketRuntime extends EventEmitter {
     };
   }
 
+  syncPositionRisk(lastPrice, timestamp) {
+    const state = this.positionRiskTracker.update({
+      quantity: this.snapshotValue.account.position.quantity,
+      lastPrice,
+      timestamp,
+    });
+    if (this.snapshotValue.strategy) this.snapshotValue.strategy.riskState = state;
+    return state;
+  }
+
+  cancelOpenOrdersForStrategyExit(timestamp, reason) {
+    const openOrderIds = this.trader.account.orders
+      .filter((order) => order.isOpen)
+      .map((order) => order.id);
+    for (const orderId of openOrderIds) {
+      this.trader.cancel(orderId, {
+        reason: `전략 청산(${reason}) 전 대기 주문 취소`,
+        timestamp,
+      });
+    }
+    this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
+    return openOrderIds.length;
+  }
+
   maybeRunStrategy(now = this.now()) {
     if (!this.autoPaperTrading || this.killSwitch) return;
-    const intent = evaluateAutoStrategy({
+    let intent = evaluateAutoStrategy({
       metrics: this.snapshotValue.metrics,
       account: this.snapshotValue.account,
       settings: this.strategySettings,
       now,
       lastOrderAt: this.lastAutoOrderAt,
+      lastPrice: this.snapshotValue.lastPrice,
+      positionRiskState: this.snapshotValue.strategy.riskState,
     });
     if (!intent) return;
 
+    if (intent.side === "SELL") {
+      this.cancelOpenOrdersForStrategyExit(now, intent.reason);
+      const positionQuantity = this.snapshotValue.account.position.quantity;
+      if (!Number.isInteger(positionQuantity) || positionQuantity <= 0) return;
+      intent = { ...intent, quantity: positionQuantity };
+    }
+
+    const reason = intent.reason.toLowerCase().replaceAll("_", "-");
     const order = this.submitOrder({
       side: intent.side,
       type: "MARKET",
       quantity: intent.quantity,
       source: "STRATEGY",
-      clientOrderId: `strategy-${intent.side.toLowerCase()}-${now}`,
+      clientOrderId: `strategy-${reason}-${now}`,
       timestamp: now,
     }, undefined, "STRATEGY", false);
     if (order.status !== "REJECTED" && order.status !== "CANCELLED") {

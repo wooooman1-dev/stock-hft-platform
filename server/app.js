@@ -4,6 +4,11 @@ import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MarketRuntime } from "./domain/runtime.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
+import {
+  applyVerificationMarketTick,
+  isLoopbackAddress,
+  isVerificationApiEnabled,
+} from "./domain/verificationMarket.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const publicDir = join(root, "public");
@@ -11,6 +16,7 @@ const dataDir = process.env.PULSEHFT_DATA_DIR
   ? resolve(process.env.PULSEHFT_DATA_DIR)
   : join(root, ".pulsehft");
 const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
+const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 const runtime = new MarketRuntime(
   process.env.DEFAULT_SYMBOL ?? "005930",
@@ -88,6 +94,12 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "POST" && url.pathname === "/api/strategy/settings/reset") {
       return json(response, 200, runtime.resetStrategySettings());
+    }
+    if (request.method === "POST" && url.pathname === "/api/verification/market-tick") {
+      if (!verificationApiEnabled || !isLoopbackAddress(request.socket.remoteAddress)) {
+        return json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
+      }
+      return json(response, 200, applyVerificationMarketTick(runtime, await readJson(request)));
     }
     if (request.method === "POST" && url.pathname === "/api/paper/orders") {
       const body = await readJson(request);
