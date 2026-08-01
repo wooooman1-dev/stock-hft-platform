@@ -82,6 +82,47 @@ POST /api/strategy/settings/reset
 
 `PUT`은 전체 또는 일부 설정을 받을 수 있으며 알 수 없는 필드와 허용범위를 벗어난 값은 HTTP 400으로 거절합니다.
 
+## 결정적 위험청산 검증 API
+
+손절·익절·트레일링 스톱을 무작위 시뮬레이터 움직임에 의존하지 않고 검증하기 위한 로컬 전용 API가 있습니다. 일반 실행에서는 존재하지 않는 경로처럼 HTTP 404를 반환합니다.
+
+다음 조건을 모두 만족해야 사용할 수 있습니다.
+
+1. 서버 시작 전에 `PULSEHFT_ENABLE_VERIFICATION_API=true`를 명시
+2. 요청이 `127.0.0.1`, `::1` 또는 IPv4-mapped loopback에서 들어옴
+3. 현재가격이 실제 호가 단위에 맞음
+4. 검증용 호가 잔량과 시각이 서버 검증을 통과함
+
+PowerShell 시작 예시:
+
+```powershell
+$env:PULSEHFT_ENABLE_VERIFICATION_API = "true"
+npm start
+```
+
+검증용 시장 틱 요청:
+
+```text
+POST /api/verification/market-tick
+```
+
+```json
+{
+  "lastPrice": 69000,
+  "depthSize": 1000
+}
+```
+
+이 요청은 지정한 현재가격을 중심으로 10단계 검증용 표시호가를 만들고, 열린 주문 처리와 자동전략 평가를 한 번의 동기 실행 흐름으로 완료한 뒤 스냅샷을 반환합니다. 설정을 변경하거나 자동전략을 강제로 켜지는 않습니다.
+
+검증이 끝나면 서버를 종료하고 환경변수를 제거합니다.
+
+```powershell
+Remove-Item Env:PULSEHFT_ENABLE_VERIFICATION_API -ErrorAction SilentlyContinue
+```
+
+이 API는 내부 모의체결 검증용이며 실제 증권사 시세 또는 주문 모드에서는 사용하지 않습니다.
+
 ## 아직 포함하지 않는 항목
 
 - 하루 최대 거래 횟수
