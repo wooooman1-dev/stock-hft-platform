@@ -43,44 +43,37 @@ accountConfigured: false
 
 활성화 상태에서도 기존 `MarketRuntime`은 계속 `SIMULATION`입니다. 한국투자 현재가는 별도 읽기 전용 API로만 조회되며 자동전략이나 PaperTrader의 입력으로 사용되지 않습니다.
 
-## 로컬 자격정보 설정
+## `.env` 자격정보 설정
 
 App Key와 App Secret을 채팅, Git, 브라우저 또는 실행 저널에 입력하지 않습니다.
 
-Windows PowerShell에서 다음 스크립트를 실행합니다.
+프로젝트 루트의 `.env` 파일에 다음 세 줄만 저장합니다.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\configure-kis-prod-read-only.ps1
+```dotenv
+PULSEHFT_KIS_MODE=PROD_READ_ONLY
+PULSEHFT_KIS_APP_KEY=발급받은_실전_APP_KEY
+PULSEHFT_KIS_APP_SECRET=발급받은_실전_APP_SECRET
 ```
 
-스크립트는 App Secret을 화면에 표시하지 않고 다음 파일에 저장합니다.
+`.env`는 Git에서 제외되며, 저장소에는 실제 비밀값이 없는 `.env.example`만 포함됩니다. `.env`는 평문 로컬 파일이므로 Windows 계정과 프로젝트 폴더 접근 권한을 안전하게 유지해야 합니다.
+
+계좌 관련 환경변수는 허용하지 않습니다. 다음 값이 존재하면 서버 시작 단계에서 거절합니다.
 
 ```text
-.pulsehft/kis-prod-read-only.json
-```
-
-허용되는 필드는 두 개뿐입니다.
-
-```json
-{
-  "appKey": "...",
-  "appSecret": "..."
-}
-```
-
-계좌번호, HTS ID, 상품코드 또는 임의의 추가 필드가 들어오면 서버 시작 시 거절합니다. `.pulsehft/`는 Git에서 제외됩니다.
-
-설정 스크립트는 현재 Windows 사용자만 접근하도록 로컬 디렉터리와 파일의 ACL을 제한하고 다음 실행 파일도 생성합니다.
-
-```text
-.pulsehft/start-kis-prod-read-only.ps1
+PULSEHFT_KIS_ACCOUNT_NUMBER
+PULSEHFT_KIS_ACCOUNT_PRODUCT_CODE
+PULSEHFT_KIS_HTS_ID
 ```
 
 실행:
 
 ```powershell
-& .\.pulsehft\start-kis-prod-read-only.ps1
+npm run start:kis:prod-read-only
 ```
+
+이 명령은 Node.js 22의 `--env-file=.env` 기능으로 환경변수를 로드합니다. 일반 `npm start`는 `.env`를 자동으로 읽지 않으므로 한국투자 연결은 기본적으로 비활성 상태를 유지합니다.
+
+기존 JSON 자격정보 방식도 하위 호환으로 남아 있지만, `.env`에 App Key와 App Secret이 모두 있으면 `.env` 값이 우선됩니다. 둘 중 하나만 설정된 경우에는 시작을 거절합니다.
 
 ## 토큰 정책
 
