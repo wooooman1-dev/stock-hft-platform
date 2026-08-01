@@ -12,6 +12,7 @@
     "strategy-order-quantity",
     "strategy-cooldown-seconds",
   ]);
+  const INTERACTION_TIMEOUT_MS = 15_000;
   const guardedSources = new Set();
   let interactionActive = false;
   let safetyTimeout = null;
@@ -54,7 +55,7 @@
     if (deferredReleaseTimeout !== null) clearTimeout(deferredReleaseTimeout);
     if (safetyTimeout !== null) clearTimeout(safetyTimeout);
     deferredReleaseTimeout = null;
-    safetyTimeout = setTimeout(finishInteraction, 30_000);
+    safetyTimeout = setTimeout(finishInteraction, INTERACTION_TIMEOUT_MS);
   }
 
   function endInteraction({ defer = false } = {}) {
@@ -163,7 +164,12 @@
   }, true);
 
   document.addEventListener("focusout", (event) => {
-    if (isGuardedControl(event.target)) endInteraction({ defer: true });
+    if (!isGuardedControl(event.target)) return;
+    if (isGuardedControl(event.relatedTarget)) {
+      beginInteraction();
+      return;
+    }
+    endInteraction({ defer: true });
   }, true);
 
   document.addEventListener("pointercancel", (event) => {
