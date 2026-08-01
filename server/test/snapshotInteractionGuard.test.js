@@ -63,10 +63,12 @@ async function loadGuard() {
   FakeNativeEventSource.instances = [];
   const document = createDocument();
   const timers = new Map();
+  const microtasks = [];
   let timerSequence = 0;
   const context = vm.createContext({
     EventSource: FakeNativeEventSource,
     document,
+    queueMicrotask: (callback) => microtasks.push(callback),
     setTimeout: (callback, delay = 0) => {
       const id = ++timerSequence;
       timers.set(id, { callback, delay });
@@ -76,6 +78,11 @@ async function loadGuard() {
   });
   const source = await readFile(new URL("../../public/snapshotInteractionGuard.js", import.meta.url), "utf8");
   vm.runInContext(source, context);
+
+  function flushMicrotasks() {
+    while (microtasks.length > 0) microtasks.shift()();
+  }
+
   return {
     GuardedEventSource: context.EventSource,
     document,
@@ -85,6 +92,7 @@ async function loadGuard() {
         timers.delete(id);
         timer.callback();
       }
+      flushMicrotasks();
     },
   };
 }
@@ -145,6 +153,30 @@ test("zero-delay flush defers DOM replacement until after focusout", async () =>
   assert.deepEqual(received, []);
   runTimers(0);
   assert.deepEqual(received, ["pending"]);
+});
+
+test("strategy action buttons keep snapshots buffered through the click handler", async () => {
+  const { GuardedEventSource, document, runTimers } = await loadGuard();
+  const source = new GuardedEventSource("/api/events");
+  const nativeSource = FakeNativeEventSource.instances[0];
+  const received = [];
+  let clicks = 0;
+  const saveButton = { dataset: { strategyAction: "save" } };
+  source.addEventListener("snapshot", (event) => received.push(event.data));
+  document.addEventListener("click", (event) => {
+    if (event.target?.dataset?.strategyAction === "save") clicks += 1;
+  });
+
+  document.emit("pointerdown", { target: saveButton });
+  nativeSource.emit("snapshot", { type: "snapshot", data: "during-save-click" });
+  assert.deepEqual(received, []);
+
+  document.emit("click", { target: saveButton });
+  assert.equal(clicks, 1);
+  assert.deepEqual(received, []);
+
+  runTimers(0);
+  assert.deepEqual(received, ["during-save-click"]);
 });
 
 test("escape and timeout release buffered interactions", async () => {

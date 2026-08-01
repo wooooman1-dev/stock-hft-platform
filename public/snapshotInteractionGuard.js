@@ -2,14 +2,40 @@
   const NativeEventSource = globalThis.EventSource;
   if (typeof NativeEventSource !== "function") return;
 
-  const GUARDED_CONTROL_IDS = new Set(["order-type", "quantity", "limit-price"]);
+  const GUARDED_CONTROL_IDS = new Set([
+    "order-type",
+    "quantity",
+    "limit-price",
+    "strategy-entry-confidence",
+    "strategy-exit-confidence",
+    "strategy-max-spread",
+    "strategy-order-quantity",
+    "strategy-cooldown-seconds",
+    "strategy-stop-loss",
+    "strategy-take-profit",
+    "strategy-trailing-stop",
+    "strategy-max-holding-seconds",
+  ]);
+  const INTERACTION_TIMEOUT_MS = 15_000;
   const guardedSources = new Set();
-  let orderEntryInteractionActive = false;
-  let interactionTimeout = null;
-  let flushTimeout = null;
+  let interactionActive = false;
+  let safetyTimeout = null;
+  let deferredReleaseTimeout = null;
 
   function isGuardedControl(target) {
     return GUARDED_CONTROL_IDS.has(target?.id);
+  }
+
+  function strategyActionElement(target) {
+    if (target?.dataset?.strategyAction) return target;
+    if (typeof target?.closest === "function") {
+      return target.closest("[data-strategy-action]");
+    }
+    return null;
+  }
+
+  function isGuardedInteractionTarget(target) {
+    return isGuardedControl(target) || Boolean(strategyActionElement(target));
   }
 
   function callListener(listener, target, event) {
@@ -21,31 +47,40 @@
   }
 
   function flushPendingSnapshots() {
-    if (flushTimeout !== null) clearTimeout(flushTimeout);
-    flushTimeout = setTimeout(() => {
-      flushTimeout = null;
-      if (orderEntryInteractionActive) return;
+    queueMicrotask(() => {
+      if (interactionActive) return;
       for (const source of guardedSources) source.flushPendingSnapshots();
-    }, 0);
+    });
   }
 
-  function beginOrderEntryInteraction() {
-    orderEntryInteractionActive = true;
-    if (flushTimeout !== null) clearTimeout(flushTimeout);
-    flushTimeout = null;
-    if (interactionTimeout !== null) clearTimeout(interactionTimeout);
-    interactionTimeout = setTimeout(() => {
-      interactionTimeout = null;
-      orderEntryInteractionActive = false;
-      flushPendingSnapshots();
-    }, 15_000);
+  function clearReleaseTimers() {
+    if (safetyTimeout !== null) clearTimeout(safetyTimeout);
+    if (deferredReleaseTimeout !== null) clearTimeout(deferredReleaseTimeout);
+    safetyTimeout = null;
+    deferredReleaseTimeout = null;
   }
 
-  function endOrderEntryInteraction() {
-    if (interactionTimeout !== null) clearTimeout(interactionTimeout);
-    interactionTimeout = null;
-    orderEntryInteractionActive = false;
+  function finishInteraction() {
+    clearReleaseTimers();
+    interactionActive = false;
     flushPendingSnapshots();
+  }
+
+  function beginInteraction() {
+    interactionActive = true;
+    if (deferredReleaseTimeout !== null) clearTimeout(deferredReleaseTimeout);
+    if (safetyTimeout !== null) clearTimeout(safetyTimeout);
+    deferredReleaseTimeout = null;
+    safetyTimeout = setTimeout(finishInteraction, INTERACTION_TIMEOUT_MS);
+  }
+
+  function endInteraction({ defer = false } = {}) {
+    if (!defer) {
+      finishInteraction();
+      return;
+    }
+    if (deferredReleaseTimeout !== null) clearTimeout(deferredReleaseTimeout);
+    deferredReleaseTimeout = setTimeout(finishInteraction, 0);
   }
 
   class SnapshotInteractionGuardEventSource {
@@ -79,7 +114,7 @@
 
       if (this.snapshotWrappers.has(listener)) return;
       const wrapped = (event) => {
-        if (orderEntryInteractionActive) {
+        if (interactionActive) {
           this.pendingSnapshots.set(listener, event);
           return;
         }
@@ -102,9 +137,7 @@
       this.pendingSnapshots.delete(listener);
     }
 
-    dispatchEvent(event) {
-      return this.nativeSource.dispatchEvent(event);
-    }
+    dispatchEvent(event) { return this.nativeSource.dispatchEvent(event); }
 
     close() {
       this.pendingSnapshots.clear();
@@ -114,7 +147,7 @@
     }
 
     flushPendingSnapshots() {
-      if (orderEntryInteractionActive || this.pendingSnapshots.size === 0) return;
+      if (interactionActive || this.pendingSnapshots.size === 0) return;
       const pending = [...this.pendingSnapshots.entries()];
       this.pendingSnapshots.clear();
       for (const [listener, event] of pending) callListener(listener, this, event);
@@ -122,45 +155,45 @@
   }
 
   document.addEventListener("pointerdown", (event) => {
-    if (isGuardedControl(event.target)) beginOrderEntryInteraction();
+    if (isGuardedInteractionTarget(event.target)) beginInteraction();
+  }, true);
+
+  document.addEventListener("click", (event) => {
+    if (strategyActionElement(event.target)) endInteraction({ defer: true });
   }, true);
 
   document.addEventListener("focusin", (event) => {
-    if (isGuardedControl(event.target)) beginOrderEntryInteraction();
+    if (isGuardedControl(event.target)) beginInteraction();
   }, true);
 
   document.addEventListener("input", (event) => {
-    if (event.target?.id === "quantity" || event.target?.id === "limit-price") {
-      beginOrderEntryInteraction();
-    }
+    if (isGuardedControl(event.target)) beginInteraction();
   }, true);
 
   document.addEventListener("keydown", (event) => {
-    if (event.target?.id !== "order-type") return;
+    if (!isGuardedControl(event.target)) return;
     if (event.key === "Escape") {
-      endOrderEntryInteraction();
+      endInteraction();
       return;
     }
-    if (["Enter", " ", "ArrowDown", "ArrowUp", "F4"].includes(event.key)) {
-      beginOrderEntryInteraction();
-    }
+    beginInteraction();
   }, true);
 
   document.addEventListener("change", (event) => {
-    if (event.target?.id === "order-type") endOrderEntryInteraction();
+    if (event.target?.id === "order-type") endInteraction();
   }, true);
 
   document.addEventListener("focusout", (event) => {
     if (!isGuardedControl(event.target)) return;
-    if (isGuardedControl(event.relatedTarget)) {
-      beginOrderEntryInteraction();
+    if (isGuardedInteractionTarget(event.relatedTarget)) {
+      beginInteraction();
       return;
     }
-    endOrderEntryInteraction();
+    endInteraction({ defer: true });
   }, true);
 
   document.addEventListener("pointercancel", (event) => {
-    if (isGuardedControl(event.target)) endOrderEntryInteraction();
+    if (isGuardedInteractionTarget(event.target)) endInteraction({ defer: true });
   }, true);
 
   globalThis.EventSource = SnapshotInteractionGuardEventSource;
