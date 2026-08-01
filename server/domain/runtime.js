@@ -187,9 +187,23 @@ export class MarketRuntime extends EventEmitter {
     return state;
   }
 
+  cancelOpenOrdersForStrategyExit(timestamp, reason) {
+    const openOrderIds = this.trader.account.orders
+      .filter((order) => order.isOpen)
+      .map((order) => order.id);
+    for (const orderId of openOrderIds) {
+      this.trader.cancel(orderId, {
+        reason: `전략 청산(${reason}) 전 대기 주문 취소`,
+        timestamp,
+      });
+    }
+    this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
+    return openOrderIds.length;
+  }
+
   maybeRunStrategy(now = this.now()) {
     if (!this.autoPaperTrading || this.killSwitch) return;
-    const intent = evaluateAutoStrategy({
+    let intent = evaluateAutoStrategy({
       metrics: this.snapshotValue.metrics,
       account: this.snapshotValue.account,
       settings: this.strategySettings,
@@ -199,6 +213,13 @@ export class MarketRuntime extends EventEmitter {
       positionRiskState: this.snapshotValue.strategy.riskState,
     });
     if (!intent) return;
+
+    if (intent.side === "SELL") {
+      this.cancelOpenOrdersForStrategyExit(now, intent.reason);
+      const positionQuantity = this.snapshotValue.account.position.quantity;
+      if (!Number.isInteger(positionQuantity) || positionQuantity <= 0) return;
+      intent = { ...intent, quantity: positionQuantity };
+    }
 
     const reason = intent.reason.toLowerCase().replaceAll("_", "-");
     const order = this.submitOrder({
