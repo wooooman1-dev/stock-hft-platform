@@ -5,6 +5,10 @@ export const DEFAULT_STRATEGY_SETTINGS = Object.freeze({
   maximumSpreadTicks: 2,
   orderQuantity: 10,
   cooldownMs: 5_000,
+  stopLossBps: null,
+  takeProfitBps: null,
+  trailingStopBps: null,
+  maxHoldingMs: null,
 });
 
 const EDITABLE_KEYS = Object.freeze([
@@ -13,6 +17,10 @@ const EDITABLE_KEYS = Object.freeze([
   "maximumSpreadTicks",
   "orderQuantity",
   "cooldownMs",
+  "stopLossBps",
+  "takeProfitBps",
+  "trailingStopBps",
+  "maxHoldingMs",
 ]);
 
 export class StrategySettingsError extends Error {
@@ -81,6 +89,29 @@ export function normalizeStrategySettings(
       600_000,
       "재진입 대기시간",
     ),
+    stopLossBps: optionalIntegerInRange(
+      merged.stopLossBps,
+      1,
+      10_000,
+      "손절률",
+    ),
+    takeProfitBps: optionalIntegerInRange(
+      merged.takeProfitBps,
+      1,
+      10_000,
+      "익절률",
+    ),
+    trailingStopBps: optionalIntegerInRange(
+      merged.trailingStopBps,
+      1,
+      10_000,
+      "트레일링 스톱",
+    ),
+    maxHoldingMs: optionalSafeIntegerAtLeast(
+      merged.maxHoldingMs,
+      1_000,
+      "최대 보유시간",
+    ),
   });
 }
 
@@ -93,6 +124,20 @@ function integerInRange(value, minimum, maximum, label) {
   const number = Number(value);
   if (!Number.isInteger(number) || number < minimum || number > maximum) {
     throw new StrategySettingsError(`${label}는 ${minimum} 이상 ${maximum} 이하의 정수여야 합니다.`);
+  }
+  return number;
+}
+
+function optionalIntegerInRange(value, minimum, maximum, label) {
+  if (value === null) return null;
+  return integerInRange(value, minimum, maximum, label);
+}
+
+function optionalSafeIntegerAtLeast(value, minimum, label) {
+  if (value === null) return null;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < minimum) {
+    throw new StrategySettingsError(`${label}는 ${minimum} 이상의 안전한 정수여야 합니다.`);
   }
   return number;
 }
