@@ -2,9 +2,15 @@
   const NativeEventSource = globalThis.EventSource;
   if (typeof NativeEventSource !== "function") return;
 
+  const GUARDED_CONTROL_IDS = new Set(["order-type", "quantity", "limit-price"]);
   const guardedSources = new Set();
-  let orderTypeInteractionActive = false;
+  let orderEntryInteractionActive = false;
   let interactionTimeout = null;
+  let flushTimeout = null;
+
+  function isGuardedControl(target) {
+    return GUARDED_CONTROL_IDS.has(target?.id);
+  }
 
   function callListener(listener, target, event) {
     if (typeof listener === "function") {
@@ -15,26 +21,30 @@
   }
 
   function flushPendingSnapshots() {
-    queueMicrotask(() => {
-      if (orderTypeInteractionActive) return;
+    if (flushTimeout !== null) clearTimeout(flushTimeout);
+    flushTimeout = setTimeout(() => {
+      flushTimeout = null;
+      if (orderEntryInteractionActive) return;
       for (const source of guardedSources) source.flushPendingSnapshots();
-    });
+    }, 0);
   }
 
-  function beginOrderTypeInteraction() {
-    orderTypeInteractionActive = true;
+  function beginOrderEntryInteraction() {
+    orderEntryInteractionActive = true;
+    if (flushTimeout !== null) clearTimeout(flushTimeout);
+    flushTimeout = null;
     if (interactionTimeout !== null) clearTimeout(interactionTimeout);
     interactionTimeout = setTimeout(() => {
       interactionTimeout = null;
-      orderTypeInteractionActive = false;
+      orderEntryInteractionActive = false;
       flushPendingSnapshots();
     }, 15_000);
   }
 
-  function endOrderTypeInteraction() {
+  function endOrderEntryInteraction() {
     if (interactionTimeout !== null) clearTimeout(interactionTimeout);
     interactionTimeout = null;
-    orderTypeInteractionActive = false;
+    orderEntryInteractionActive = false;
     flushPendingSnapshots();
   }
 
@@ -69,7 +79,7 @@
 
       if (this.snapshotWrappers.has(listener)) return;
       const wrapped = (event) => {
-        if (orderTypeInteractionActive) {
+        if (orderEntryInteractionActive) {
           this.pendingSnapshots.set(listener, event);
           return;
         }
@@ -104,7 +114,7 @@
     }
 
     flushPendingSnapshots() {
-      if (orderTypeInteractionActive || this.pendingSnapshots.size === 0) return;
+      if (orderEntryInteractionActive || this.pendingSnapshots.size === 0) return;
       const pending = [...this.pendingSnapshots.entries()];
       this.pendingSnapshots.clear();
       for (const [listener, event] of pending) callListener(listener, this, event);
@@ -112,30 +122,45 @@
   }
 
   document.addEventListener("pointerdown", (event) => {
-    if (event.target?.id === "order-type") beginOrderTypeInteraction();
+    if (isGuardedControl(event.target)) beginOrderEntryInteraction();
+  }, true);
+
+  document.addEventListener("focusin", (event) => {
+    if (isGuardedControl(event.target)) beginOrderEntryInteraction();
+  }, true);
+
+  document.addEventListener("input", (event) => {
+    if (event.target?.id === "quantity" || event.target?.id === "limit-price") {
+      beginOrderEntryInteraction();
+    }
   }, true);
 
   document.addEventListener("keydown", (event) => {
     if (event.target?.id !== "order-type") return;
     if (event.key === "Escape") {
-      endOrderTypeInteraction();
+      endOrderEntryInteraction();
       return;
     }
     if (["Enter", " ", "ArrowDown", "ArrowUp", "F4"].includes(event.key)) {
-      beginOrderTypeInteraction();
+      beginOrderEntryInteraction();
     }
   }, true);
 
   document.addEventListener("change", (event) => {
-    if (event.target?.id === "order-type") endOrderTypeInteraction();
+    if (event.target?.id === "order-type") endOrderEntryInteraction();
   }, true);
 
   document.addEventListener("focusout", (event) => {
-    if (event.target?.id === "order-type") endOrderTypeInteraction();
+    if (!isGuardedControl(event.target)) return;
+    if (isGuardedControl(event.relatedTarget)) {
+      beginOrderEntryInteraction();
+      return;
+    }
+    endOrderEntryInteraction();
   }, true);
 
   document.addEventListener("pointercancel", (event) => {
-    if (event.target?.id === "order-type") endOrderTypeInteraction();
+    if (isGuardedControl(event.target)) endOrderEntryInteraction();
   }, true);
 
   globalThis.EventSource = SnapshotInteractionGuardEventSource;
