@@ -39,6 +39,12 @@ export function describeAutoStrategy(value) {
   return `진입 ${value.entryMinimumConfidence}% · 청산 ${value.exitMinimumConfidence}% · 최대 ${value.maximumSpreadTicks}틱 · ${value.orderQuantity}주 · ${value.cooldownMs / 1_000}초 대기`;
 }
 
+export function setTextContentIfChanged(element, nextText) {
+  if (!element || element.textContent === nextText) return false;
+  element.textContent = nextText;
+  return true;
+}
+
 function parseInteger(value, minimum, maximum, label) {
   const number = Number(value);
   if (!Number.isInteger(number) || number < minimum || number > maximum) {
@@ -103,7 +109,7 @@ function updateAutoDescription(systemPanel) {
   for (const row of systemPanel.querySelectorAll(".control-row")) {
     if (row.querySelector("strong")?.textContent.trim() !== "모의 자동전략") continue;
     const description = row.querySelector("span");
-    if (description) description.textContent = describeAutoStrategy(settings);
+    setTextContentIfChanged(description, describeAutoStrategy(settings));
   }
 }
 
