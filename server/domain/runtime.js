@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { calculateMicrostructureMetrics } from "./analysis.js";
+import { ExecutionJournalRecorder } from "./executionJournal.js";
 import { PaperTrader } from "./paperTrader.js";
 import { PositionRiskTracker } from "./positionRiskTracker.js";
 import { MarketSimulator } from "./simulator.js";
@@ -14,6 +15,7 @@ export class MarketRuntime extends EventEmitter {
     now = Date.now,
     strategySettings = DEFAULT_STRATEGY_SETTINGS,
     strategySettingsStore = null,
+    executionJournal = null,
   } = {}) {
     super();
     this.symbol = symbol;
@@ -22,6 +24,7 @@ export class MarketRuntime extends EventEmitter {
     this.now = now;
     this.simulator = new MarketSimulator(initialPrice);
     this.trader = new PaperTrader(10_000_000, { now });
+    this.executionJournalRecorder = new ExecutionJournalRecorder(executionJournal);
     this.positionRiskTracker = new PositionRiskTracker();
     this.strategySettingsStore = strategySettingsStore;
     this.strategySettings = normalizeStrategySettings(strategySettings, {
@@ -90,6 +93,7 @@ export class MarketRuntime extends EventEmitter {
       timestamp,
       killSwitch: this.killSwitch,
     });
+    this.captureExecutionJournal();
     this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
     this.syncPositionRisk(this.snapshotValue.lastPrice, timestamp);
     if (emit) this.emitSnapshot();
@@ -98,6 +102,7 @@ export class MarketRuntime extends EventEmitter {
 
   cancelOrder(orderId, emit = true) {
     const order = this.trader.cancel(orderId, { timestamp: this.now() });
+    this.captureExecutionJournal();
     this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
     if (emit) this.emitSnapshot();
     return order;
@@ -118,6 +123,12 @@ export class MarketRuntime extends EventEmitter {
   }
 
   resetPaperAccount() {
+    try {
+      this.executionJournalRecorder.recordAccountReset(this.trader.account, this.now());
+    } catch (error) {
+      this.haltForExecutionJournalError();
+      throw error;
+    }
     this.trader.reset();
     this.positionRiskTracker.reset();
     this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
@@ -130,6 +141,7 @@ export class MarketRuntime extends EventEmitter {
     const tick = this.simulator.next(now);
     this.snapshotValue = this.makeSnapshot(tick, Number((performance.now() - startedAt).toFixed(2)));
     this.trader.processOpenOrders({ book: tick.book, timestamp: tick.timestamp });
+    this.captureExecutionJournal();
     this.snapshotValue.account = this.trader.snapshot(tick.lastPrice);
     this.syncPositionRisk(tick.lastPrice, tick.timestamp);
     this.maybeRunStrategy(tick.timestamp);
@@ -197,6 +209,7 @@ export class MarketRuntime extends EventEmitter {
         timestamp,
       });
     }
+    this.captureExecutionJournal();
     this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
     return openOrderIds.length;
   }
@@ -233,6 +246,24 @@ export class MarketRuntime extends EventEmitter {
     if (order.status !== "REJECTED" && order.status !== "CANCELLED") {
       this.lastAutoOrderAt = now;
       this.snapshotValue.strategy.lastAutoOrderAt = now;
+    }
+  }
+
+  captureExecutionJournal() {
+    try {
+      return this.executionJournalRecorder.capture(this.trader.account);
+    } catch (error) {
+      this.haltForExecutionJournalError();
+      throw error;
+    }
+  }
+
+  haltForExecutionJournalError() {
+    this.killSwitch = true;
+    this.autoPaperTrading = false;
+    if (this.snapshotValue?.system) {
+      this.snapshotValue.system.killSwitch = true;
+      this.snapshotValue.system.autoPaperTrading = false;
     }
   }
 

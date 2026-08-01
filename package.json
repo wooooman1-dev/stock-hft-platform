@@ -1,6 +1,6 @@
 {
   "name": "stock-hft-platform",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Dependency-free real-time microstructure analysis and paper-trading dashboard.",
@@ -8,7 +8,7 @@
     "dev": "node --watch server/app.js",
     "start": "node server/app.js",
     "test": "node --test server/test/*.test.js",
-    "check": "node --check server/app.js && node --check server/domain/runtime.js && node --check server/domain/strategyPolicy.js && node --check server/domain/strategySettings.js && node --check server/domain/positionRiskTracker.js && node --check server/domain/verificationMarket.js && node --check public/app.js && node --check public/snapshotInteractionGuard.js && node --check public/strategySettingsPanel.js && npm test"
+    "check": "node --check server/app.js && node --check server/domain/runtime.js && node --check server/domain/strategyPolicy.js && node --check server/domain/strategySettings.js && node --check server/domain/positionRiskTracker.js && node --check server/domain/executionJournal.js && node --check server/domain/verificationMarket.js && node --check public/app.js && node --check public/snapshotInteractionGuard.js && node --check public/strategySettingsPanel.js && npm test"
   },
   "engines": {
     "node": ">=22"
