@@ -64,7 +64,7 @@ test("risk exit settings accept null and reject unsafe boundaries", () => {
   assert.throws(() => normalizeStrategySettings({ maxHoldingMs: 999 }), /최대 보유시간/);
 });
 
-test("stop loss triggers exactly at the configured loss and uses only sellable shares", () => {
+test("stop loss triggers exactly at the configured loss for the complete position", () => {
   const intent = evaluatePositionRiskExit({
     account: account({ quantity: 10, averagePrice: 10_000, sellableQuantity: 6 }),
     settings: { ...DEFAULT_STRATEGY_SETTINGS, stopLossBps: 100 },
@@ -73,7 +73,7 @@ test("stop loss triggers exactly at the configured loss and uses only sellable s
     positionRiskState: riskState(),
   });
   assert.equal(intent.side, "SELL");
-  assert.equal(intent.quantity, 6);
+  assert.equal(intent.quantity, 10);
   assert.equal(intent.reason, "STOP_LOSS");
   assert.ok(intent.diagnostics.returnBps <= -100);
 });
@@ -123,7 +123,7 @@ test("maximum holding time triggers at the exact boundary", () => {
   assert.equal(intent.diagnostics.heldMs, 5_000);
 });
 
-test("protective exits bypass entry cooldown but still require auto strategy evaluation", () => {
+test("protective exits bypass entry cooldown", () => {
   const intent = evaluateAutoStrategy({
     metrics: { signal: "HOLD", confidence: 0, spreadTicks: 1 },
     account: account(),
@@ -136,17 +136,24 @@ test("protective exits bypass entry cooldown but still require auto strategy eva
   assert.equal(intent.reason, "STOP_LOSS");
 });
 
-test("risk exits do not create an oversell when every share is reserved", () => {
-  assert.equal(evaluatePositionRiskExit({
-    account: account({ quantity: 10, sellableQuantity: 0 }),
-    settings: { ...DEFAULT_STRATEGY_SETTINGS, stopLossBps: 1 },
-    now: 2_000,
-    lastPrice: 9_000,
-    positionRiskState: riskState(),
-  }), null);
+test("protective exit priority is stop loss then trailing then take profit then holding time", () => {
+  const intent = evaluatePositionRiskExit({
+    account: account({ averagePrice: 10_000 }),
+    settings: {
+      ...DEFAULT_STRATEGY_SETTINGS,
+      stopLossBps: 50,
+      trailingStopBps: 50,
+      takeProfitBps: 1,
+      maxHoldingMs: 1_000,
+    },
+    now: 5_000,
+    lastPrice: 9_900,
+    positionRiskState: riskState({ openedAt: 1_000, peakPrice: 10_100 }),
+  });
+  assert.equal(intent.reason, "STOP_LOSS");
 });
 
-test("signal exits also respect sellable quantity reservations", () => {
+test("signal exits request the complete open position", () => {
   assert.deepEqual(evaluateAutoStrategy({
     metrics: { signal: "SELL", confidence: 80, spreadTicks: 10 },
     account: account({ quantity: 10, sellableQuantity: 4 }),
@@ -155,5 +162,5 @@ test("signal exits also respect sellable quantity reservations", () => {
     lastOrderAt: 0,
     lastPrice: 10_000,
     positionRiskState: riskState(),
-  }), { side: "SELL", quantity: 4, reason: "EXIT_SIGNAL" });
+  }), { side: "SELL", quantity: 10, reason: "EXIT_SIGNAL" });
 });
