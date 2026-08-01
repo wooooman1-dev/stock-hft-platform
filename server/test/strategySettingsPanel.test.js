@@ -4,6 +4,7 @@ import {
   describeAutoStrategy,
   draftToPayload,
   settingsToDraft,
+  setTextContentIfChanged,
 } from "../../public/strategySettingsPanel.js";
 
 const settings = {
@@ -43,4 +44,21 @@ test("auto strategy description reflects the effective saved values", () => {
     describeAutoStrategy(settings),
     "진입 61% · 청산 57% · 최대 3틱 · 25주 · 12초 대기",
   );
+});
+
+test("strategy description does not mutate DOM when text is already current", () => {
+  let writes = 0;
+  const element = {
+    value: describeAutoStrategy(settings),
+    get textContent() { return this.value; },
+    set textContent(next) {
+      writes += 1;
+      this.value = next;
+    },
+  };
+
+  assert.equal(setTextContentIfChanged(element, describeAutoStrategy(settings)), false);
+  assert.equal(writes, 0);
+  assert.equal(setTextContentIfChanged(element, "변경된 설명"), true);
+  assert.equal(writes, 1);
 });
