@@ -3,17 +3,20 @@ import { createServer } from "node:http";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MarketRuntime } from "./domain/runtime.js";
+import { createMarketDataSource } from "./market/createMarketDataSource.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const publicDir = join(root, "public");
 const port = Number(process.env.PORT ?? 8787);
-const runtime = new MarketRuntime(
-  process.env.DEFAULT_SYMBOL ?? "005930",
-  process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자",
-  Number(process.env.DEFAULT_PRICE ?? 70_000),
-);
+const symbol = process.env.DEFAULT_SYMBOL ?? "005930";
+const symbolName = process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자";
+const initialPrice = Number(process.env.DEFAULT_PRICE ?? 70_000);
+const marketSource = createMarketDataSource({ env: process.env, symbol, initialPrice });
+const runtime = new MarketRuntime(symbol, symbolName, initialPrice, { marketSource });
 const eventClients = new Set();
-runtime.start();
+void runtime.start().catch((error) => {
+  console.error(`[market-feed] ${error instanceof Error ? error.message : error}`);
+});
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -54,7 +57,15 @@ const server = createServer(async (request, response) => {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   try {
     if (request.method === "GET" && url.pathname === "/health") {
-      return json(response, 200, { status: "ok", mode: "SIMULATION", clients: eventClients.size });
+      const snapshot = runtime.snapshot();
+      return json(response, snapshot.system.feedConnected ? 200 : 503, {
+        status: snapshot.system.feedConnected ? "ok" : "degraded",
+        mode: snapshot.system.mode,
+        provider: snapshot.system.provider,
+        feedConnected: snapshot.system.feedConnected,
+        lastError: snapshot.system.lastError,
+        clients: eventClients.size,
+      });
     }
     if (request.method === "GET" && url.pathname === "/api/snapshot") {
       return json(response, 200, runtime.snapshot());
@@ -112,6 +123,7 @@ const heartbeat = setInterval(() => {
 
 server.listen(port, "0.0.0.0", () => {
   console.log(`PulseHFT running at http://localhost:${port}`);
+  console.log(`Market source: ${runtime.snapshot().system.mode}`);
 });
 
 function shutdown() {
