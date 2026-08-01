@@ -80,7 +80,12 @@ export function createVerificationMarketTick(
 }
 
 export function applyVerificationMarketTick(runtime, input) {
-  if (!runtime?.simulator || !runtime?.trader || typeof runtime.makeSnapshot !== "function") {
+  if (
+    !runtime?.simulator
+    || !runtime?.trader
+    || typeof runtime.makeSnapshot !== "function"
+    || typeof runtime.stop !== "function"
+  ) {
     throw new TypeError("검증용 시장 틱을 적용할 유효한 런타임이 필요합니다.");
   }
 
@@ -90,8 +95,11 @@ export function applyVerificationMarketTick(runtime, input) {
     candles: runtime.snapshotValue?.candles,
   });
 
+  runtime.stop();
   runtime.simulator.price = tick.lastPrice;
   runtime.snapshotValue = runtime.makeSnapshot(tick, 0);
+  runtime.snapshotValue.system.verificationMode = true;
+  runtime.snapshotValue.system.marketTimerPaused = true;
   runtime.trader.processOpenOrders({ book: tick.book, timestamp: tick.timestamp });
   runtime.snapshotValue.account = runtime.trader.snapshot(tick.lastPrice);
   runtime.syncPositionRisk(tick.lastPrice, tick.timestamp);
