@@ -11,6 +11,10 @@
     "strategy-max-spread",
     "strategy-order-quantity",
     "strategy-cooldown-seconds",
+    "strategy-stop-loss",
+    "strategy-take-profit",
+    "strategy-trailing-stop",
+    "strategy-max-holding-seconds",
   ]);
   const INTERACTION_TIMEOUT_MS = 15_000;
   const guardedSources = new Set();
@@ -154,8 +158,12 @@
     if (isGuardedInteractionTarget(event.target)) beginInteraction();
   }, true);
 
+  document.addEventListener("click", (event) => {
+    if (strategyActionElement(event.target)) endInteraction({ defer: true });
+  }, true);
+
   document.addEventListener("focusin", (event) => {
-    if (isGuardedInteractionTarget(event.target)) beginInteraction();
+    if (isGuardedControl(event.target)) beginInteraction();
   }, true);
 
   document.addEventListener("input", (event) => {
@@ -163,7 +171,7 @@
   }, true);
 
   document.addEventListener("keydown", (event) => {
-    if (!isGuardedInteractionTarget(event.target)) return;
+    if (!isGuardedControl(event.target)) return;
     if (event.key === "Escape") {
       endInteraction();
       return;
@@ -175,12 +183,8 @@
     if (event.target?.id === "order-type") endInteraction();
   }, true);
 
-  document.addEventListener("click", (event) => {
-    if (strategyActionElement(event.target)) endInteraction({ defer: true });
-  }, true);
-
   document.addEventListener("focusout", (event) => {
-    if (!isGuardedInteractionTarget(event.target)) return;
+    if (!isGuardedControl(event.target)) return;
     if (isGuardedInteractionTarget(event.relatedTarget)) {
       beginInteraction();
       return;
