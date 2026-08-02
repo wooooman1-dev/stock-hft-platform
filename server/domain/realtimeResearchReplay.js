@@ -38,6 +38,7 @@ export function replayRealtimeResearchEvents(events, {
           transition(symbol, states.get(symbol) ?? null, "DROPPED", event, {
             reason: "추천 후보에서 제외",
           });
+          states.set(symbol, "DROPPED");
         }
       }
       candidates.clear();
