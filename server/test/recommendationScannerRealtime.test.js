@@ -5,7 +5,7 @@ import { RecommendationScanner } from "../domain/recommendationScanner.js";
 const settings = {
   cacheTtlMs: 15_000,
   maxUniverse: 10,
-  maxEnriched: 1,
+  maxEnriched: 3,
   minimumTradingValue: 1_000_000_000,
   targetNetProfitBps: 300,
   buyCommissionBps: 1.40527,
