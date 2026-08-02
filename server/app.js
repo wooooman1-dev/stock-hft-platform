@@ -4,6 +4,8 @@ import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ExecutionJournal } from "./domain/executionJournal.js";
 import { InstrumentCatalog } from "./domain/instrumentCatalog.js";
+import { RecommendationScanner } from "./domain/recommendationScanner.js";
+import { loadRecommendationSettings } from "./domain/recommendationSettings.js";
 import { MarketRuntime } from "./domain/runtime.js";
 import { SelectedInstrumentStore } from "./domain/selectedInstrumentStore.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
@@ -12,6 +14,9 @@ import {
   publicKisConfiguration,
 } from "./integrations/kis/kisConfig.js";
 import { KisProdReadOnlyClient } from "./integrations/kis/kisProdReadOnlyClient.js";
+import { KisRecommendationDataClient } from "./integrations/kis/kisRecommendationDataClient.js";
+import { createNaverApiHubClientFromEnv } from "./integrations/naver/naverApiHubClient.js";
+import { createOpenDartClientFromEnv } from "./integrations/opendart/openDartClient.js";
 import {
   loadKisPaperConfiguration,
   publicKisPaperConfiguration,
@@ -57,6 +62,22 @@ const kisClient = kisConfiguration.enabled
   ? new KisProdReadOnlyClient({ config: kisConfiguration, tokenStore: kisTokenStore })
   : null;
 if (kisClient) kisClient.status();
+const recommendationSettings = loadRecommendationSettings(process.env);
+const recommendationDataClient = kisClient
+  ? new KisRecommendationDataClient({
+    client: kisClient,
+    instrumentCatalog,
+    minimumIntervalMs: recommendationSettings.requestSpacingMs,
+  })
+  : null;
+const openDartClient = createOpenDartClientFromEnv(process.env);
+const naverApiHubClient = createNaverApiHubClientFromEnv(process.env);
+const recommendationScanner = new RecommendationScanner({
+  dataClient: recommendationDataClient,
+  disclosureClient: openDartClient,
+  socialClient: naverApiHubClient,
+  settings: recommendationSettings,
+});
 
 const kisPaperConfiguration = loadKisPaperConfiguration(join(dataDir, "kis-paper.json"));
 const kisPaperTokenStore = kisPaperConfiguration.enabled
@@ -108,6 +129,10 @@ executionJournal.append("SESSION_STARTED", {
   kisPaperOrderEnabled: Boolean(kisPaperOrderService),
   kisPaperAutomaticStrategyConnected: false,
   instrumentSearchEnabled: true,
+  recommendationScannerEnabled: Boolean(recommendationDataClient),
+  recommendationDartEnabled: Boolean(openDartClient),
+  recommendationNaverApiHubEnabled: Boolean(naverApiHubClient),
+  recommendationAutomaticOrderConnected: false,
 });
 const eventClients = new Set();
 runtime.start();
@@ -229,6 +254,7 @@ const server = createServer(async (request, response) => {
         kis: getKisHealthStatus(),
         kisPaper: getKisPaperHealthStatus(),
         instruments: instrumentCatalog.status(),
+        recommendations: recommendationScanner.status(),
       });
     }
     if (request.method === "GET" && url.pathname === "/api/snapshot") {
@@ -329,6 +355,14 @@ const server = createServer(async (request, response) => {
         },
         snapshot: result.snapshot,
       });
+    }
+    if (request.method === "GET" && url.pathname === "/api/recommendations") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, await recommendationScanner.get({ refreshIfStale: true }));
+    }
+    if (request.method === "POST" && url.pathname === "/api/recommendations/refresh") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, await recommendationScanner.refresh({ force: true }));
     }
     if (request.method === "GET" && url.pathname === "/api/kis/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
