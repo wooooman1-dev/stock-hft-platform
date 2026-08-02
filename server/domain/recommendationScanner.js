@@ -1,0 +1,267 @@
+import { evaluateRecommendationCandidate } from "./recommendationEngine.js";
+import {
+  normalizeRecommendationSettings,
+  publicRecommendationSettings,
+} from "./recommendationSettings.js";
+
+export class RecommendationScanner {
+  constructor({
+    dataClient = null,
+    disclosureClient = null,
+    socialClient = null,
+    settings = {},
+    now = Date.now,
+    sleep = defaultSleep,
+  } = {}) {
+    if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
+    if (typeof sleep !== "function") throw new TypeError("sleep은 함수여야 합니다.");
+    this.dataClient = dataClient;
+    this.disclosureClient = disclosureClient;
+    this.socialClient = socialClient;
+    this.settings = normalizeRecommendationSettings(settings);
+    this.now = now;
+    this.sleep = sleep;
+    this.inFlight = null;
+    this.value = this.emptySnapshot();
+  }
+
+  status() {
+    const dataStatus = this.dataClient?.status?.() ?? {
+      enabled: false,
+      mode: "DISABLED",
+      rankingApiAvailable: false,
+      orderBookApiAvailable: false,
+      minuteBarsApiAvailable: false,
+      realtimeConfirmationAvailable: false,
+    };
+    return {
+      enabled: Boolean(this.dataClient),
+      state: this.inFlight ? "REFRESHING" : this.value.state,
+      generatedAt: this.value.generatedAt,
+      expiresAt: this.value.expiresAt,
+      candidateCount: this.value.candidates.length,
+      dataSources: {
+        kis: dataStatus,
+        dart: this.disclosureClient?.status?.() ?? {
+          enabled: false,
+          state: "NOT_CONNECTED",
+          role: "공시 위험 필터",
+        },
+        news: this.socialClient
+          ? { ...this.socialClient.status(), role: "재료·추격 위험 보조" }
+          : { enabled: false, state: "NOT_CONNECTED", role: "재료·추격 위험 보조" },
+        community: this.socialClient
+          ? { ...this.socialClient.status(), role: "과열 관심도 참고" }
+          : { enabled: false, state: "NOT_CONNECTED", role: "과열 관심도 참고" },
+      },
+    };
+  }
+
+  async get({ refreshIfStale = true } = {}) {
+    if (!this.dataClient) return this.snapshot();
+    const stale = this.value.expiresAt === null || this.now() >= this.value.expiresAt;
+    if (refreshIfStale && stale) await this.refresh();
+    return this.snapshot();
+  }
+
+  async refresh({ force = false } = {}) {
+    if (!this.dataClient) return this.snapshot();
+    if (this.inFlight) return this.inFlight;
+    const fresh = this.value.expiresAt !== null && this.now() < this.value.expiresAt;
+    if (!force && fresh) return this.snapshot();
+    this.inFlight = this.performRefresh().finally(() => {
+      this.inFlight = null;
+    });
+    return this.inFlight;
+  }
+
+  snapshot() {
+    return structuredClone({
+      ...this.value,
+      settings: publicRecommendationSettings(this.settings),
+      status: this.status(),
+    });
+  }
+
+  async performRefresh() {
+    const startedAt = this.now();
+    const errors = [];
+    let universe;
+    try {
+      universe = await this.dataClient.getUniverse({ limit: this.settings.maxUniverse });
+    } catch (error) {
+      this.value = {
+        ...this.value,
+        state: "ERROR",
+        lastAttemptAt: startedAt,
+        errors: [safeError(error)],
+      };
+      return this.snapshot();
+    }
+
+    const candidates = [];
+    const enrichTargets = universe.slice(0, this.settings.maxEnriched);
+    let disclosures = new Map();
+    if (this.disclosureClient) {
+      try {
+        disclosures = await this.disclosureClient.getRecentDisclosures({
+          stockCodes: enrichTargets.map((item) => item.symbol).filter((symbol) => /^\d{6}$/.test(symbol)),
+        });
+      } catch (error) {
+        errors.push({ source: "DART", ...safeError(error) });
+      }
+    }
+
+    for (let index = 0; index < enrichTargets.length; index += 1) {
+      const base = enrichTargets[index];
+      try {
+        const details = await this.dataClient.getCandidateDetails({ symbol: base.symbol, market: "UN" });
+        const quote = details.quote ?? {};
+        const orderBook = {
+          ...(details.orderBook ?? {}),
+          tickSize: quote.askUnit ?? details.orderBook?.tickSize ?? 1,
+        };
+        let social = emptySocialSignal();
+        if (this.socialClient) {
+          try {
+            social = await this.socialClient.getSignals({
+              symbol: base.symbol,
+              name: base.name ?? quote.name ?? base.symbol,
+            });
+          } catch (error) {
+            errors.push({ source: "NAVER", symbol: base.symbol, ...safeError(error) });
+          }
+        }
+        const disclosure = disclosures.get(base.symbol) ?? emptyDisclosureSignal(Boolean(this.disclosureClient));
+        let evaluated = evaluateRecommendationCandidate({
+          ...base,
+          name: base.name ?? quote.name ?? base.symbol,
+          currentPrice: quote.currentPrice ?? base.currentPrice,
+          previousClose: quote.basePrice,
+          openPrice: quote.openPrice,
+          highPrice: quote.highPrice,
+          lowPrice: quote.lowPrice,
+          upperLimitPrice: quote.upperLimitPrice,
+          changePercent: quote.changePercent ?? base.changePercent,
+          accumulatedVolume: quote.accumulatedVolume ?? base.accumulatedVolume,
+          accumulatedTradingValue: quote.accumulatedTradingValue ?? base.accumulatedTradingValue,
+          tradingHalted: quote.tradingHalted,
+          tickSize: quote.askUnit ?? 1,
+          orderBook,
+          minuteBars: details.minuteBars,
+          fetchedAt: details.fetchedAt ?? quote.fetchedAt ?? this.now(),
+          evaluatedAt: this.now(),
+        }, this.settings);
+        evaluated = attachAuxiliarySignals(evaluated, { disclosure, social });
+        candidates.push(evaluated);
+      } catch (error) {
+        errors.push({ symbol: base.symbol, ...safeError(error) });
+      }
+      if (index < enrichTargets.length - 1 && this.settings.requestSpacingMs > 0) {
+        await this.sleep(this.settings.requestSpacingMs);
+      }
+    }
+
+    const generatedAt = this.now();
+    candidates.sort((a, b) => {
+      const stageOrder = stagePriority(b.stage) - stagePriority(a.stage);
+      return stageOrder || b.score - a.score || b.accumulatedTradingValue - a.accumulatedTradingValue;
+    });
+    const ranked = candidates.map((candidate, index) => ({ ...candidate, rank: index + 1 }));
+    this.value = {
+      state: ranked.length > 0 ? "READY" : "EMPTY",
+      generatedAt,
+      lastAttemptAt: startedAt,
+      expiresAt: generatedAt + this.settings.cacheTtlMs,
+      candidates: ranked,
+      errors,
+      universeCount: universe.length,
+      enrichedCount: enrichTargets.length,
+      executionBoundary: {
+        automaticOrderConnected: false,
+        actionableStages: [],
+        explanation: "추천 목록은 분석용입니다. 실시간 WebSocket 전환 확인과 별도 승인 전에는 주문으로 연결되지 않습니다.",
+      },
+    };
+    return this.snapshot();
+  }
+
+  emptySnapshot() {
+    return {
+      state: this.dataClient ? "STALE" : "DISABLED",
+      generatedAt: null,
+      lastAttemptAt: null,
+      expiresAt: null,
+      candidates: [],
+      errors: [],
+      universeCount: 0,
+      enrichedCount: 0,
+      executionBoundary: {
+        automaticOrderConnected: false,
+        actionableStages: [],
+        explanation: "추천 목록은 분석용이며 자동주문과 연결되지 않습니다.",
+      },
+    };
+  }
+}
+
+function stagePriority(stage) {
+  if (stage === "CONFIRMATION_REQUIRED") return 4;
+  if (stage === "WATCH") return 3;
+  if (stage === "LOW_PRIORITY") return 2;
+  if (stage === "BLOCKED") return 1;
+  return 0;
+}
+
+function safeError(error) {
+  return {
+    code: typeof error?.code === "string" ? error.code : "RECOMMENDATION_DATA_ERROR",
+    message: error instanceof Error ? error.message : "추천 데이터 조회 오류",
+  };
+}
+
+function defaultSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function attachAuxiliarySignals(candidate, { disclosure, social }) {
+  const riskReasons = Array.isArray(disclosure?.riskReasons) ? disclosure.riskReasons : [];
+  const blocked = disclosure?.riskLevel === "HIGH";
+  return {
+    ...candidate,
+    stage: blocked ? "BLOCKED" : candidate.stage,
+    score: blocked ? Math.min(49, candidate.score) : candidate.score,
+    blockReasons: blocked
+      ? [...new Set([...(candidate.blockReasons ?? []), ...riskReasons.map((reason) => `중요 공시 확인: ${reason}`)])]
+      : candidate.blockReasons,
+    auxiliary: {
+      disclosure,
+      news: social?.news ?? emptySocialSignal().news,
+      community: social?.community ?? emptySocialSignal().community,
+      policy: {
+        newsAffectsScore: false,
+        communityAffectsScore: false,
+        disclosureHighRiskBlocksEntry: true,
+      },
+    },
+  };
+}
+
+function emptyDisclosureSignal(enabled) {
+  return {
+    enabled,
+    fetchedAt: null,
+    count: 0,
+    items: [],
+    riskLevel: "NONE",
+    riskReasons: [],
+  };
+}
+
+function emptySocialSignal() {
+  return {
+    fetchedAt: null,
+    news: { total: 0, returned: 0, items: [] },
+    community: { total: 0, returned: 0, items: [] },
+  };
+}
