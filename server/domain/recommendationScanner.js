@@ -1,4 +1,9 @@
 import { evaluateRecommendationCandidate } from "./recommendationEngine.js";
+import { KisRealtimeMarketDataClient } from "../integrations/kis/kisRealtimeMarketDataClient.js";
+import {
+  evaluateRealtimeConfirmation,
+  summarizeRealtimeStates,
+} from "./realtimeConfirmationEngine.js";
 import {
   normalizeRecommendationSettings,
   publicRecommendationSettings,
@@ -9,16 +14,25 @@ export class RecommendationScanner {
     dataClient = null,
     disclosureClient = null,
     socialClient = null,
+    realtimeClient = null,
     settings = {},
     now = Date.now,
     sleep = defaultSleep,
   } = {}) {
     if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
     if (typeof sleep !== "function") throw new TypeError("sleep은 함수여야 합니다.");
+    if (realtimeClient !== null && (
+      typeof realtimeClient.status !== "function"
+      || typeof realtimeClient.snapshot !== "function"
+      || typeof realtimeClient.watchSymbols !== "function"
+    )) {
+      throw new TypeError("realtimeClient는 status, snapshot, watchSymbols 함수를 제공해야 합니다.");
+    }
     this.dataClient = dataClient;
     this.disclosureClient = disclosureClient;
     this.socialClient = socialClient;
     this.settings = normalizeRecommendationSettings(settings);
+    this.realtimeClient = realtimeClient ?? createDefaultRealtimeClient(dataClient, this.settings.maxEnriched);
     this.now = now;
     this.sleep = sleep;
     this.inFlight = null;
@@ -34,6 +48,14 @@ export class RecommendationScanner {
       minuteBarsApiAvailable: false,
       realtimeConfirmationAvailable: false,
     };
+    const realtimeStatus = this.realtimeClient?.status?.() ?? {
+      enabled: false,
+      state: "NOT_CONNECTED",
+      connected: false,
+      desiredSymbolCount: 0,
+      activeSubscriptionCount: 0,
+      automaticOrderConnected: false,
+    };
     return {
       enabled: Boolean(this.dataClient),
       state: this.inFlight ? "REFRESHING" : this.value.state,
@@ -41,7 +63,13 @@ export class RecommendationScanner {
       expiresAt: this.value.expiresAt,
       candidateCount: this.value.candidates.length,
       dataSources: {
-        kis: dataStatus,
+        kis: {
+          ...dataStatus,
+          realtimeConfirmationAvailable: Boolean(
+            realtimeStatus.connected && realtimeStatus.activeSubscriptionCount > 0
+          ),
+        },
+        realtime: realtimeStatus,
         dart: this.disclosureClient?.status?.() ?? {
           enabled: false,
           state: "NOT_CONNECTED",
@@ -76,8 +104,11 @@ export class RecommendationScanner {
   }
 
   snapshot() {
+    const candidates = this.value.candidates.map((candidate) => this.attachRealtime(candidate));
     return structuredClone({
       ...this.value,
+      candidates,
+      realtimeStateCounts: summarizeRealtimeStates(candidates),
       settings: publicRecommendationSettings(this.settings),
       status: this.status(),
     });
@@ -168,6 +199,16 @@ export class RecommendationScanner {
       return stageOrder || b.score - a.score || b.accumulatedTradingValue - a.accumulatedTradingValue;
     });
     const ranked = candidates.map((candidate, index) => ({ ...candidate, rank: index + 1 }));
+    if (this.realtimeClient) {
+      try {
+        this.realtimeClient.watchSymbols(ranked.map((candidate) => ({
+          symbol: candidate.symbol,
+          venue: realtimeVenue(candidate.market),
+        })));
+      } catch (error) {
+        errors.push({ source: "KIS_WEBSOCKET", ...safeError(error) });
+      }
+    }
     this.value = {
       state: ranked.length > 0 ? "READY" : "EMPTY",
       generatedAt,
@@ -180,10 +221,43 @@ export class RecommendationScanner {
       executionBoundary: {
         automaticOrderConnected: false,
         actionableStages: [],
-        explanation: "추천 목록은 분석용입니다. 실시간 WebSocket 전환 확인과 별도 승인 전에는 주문으로 연결되지 않습니다.",
+        realtimeEntryReadyIsOrderSignal: false,
+        explanation: "추천과 ENTRY_READY는 분석 상태입니다. 별도 승인 전에는 KIS 모의·실전 주문으로 연결되지 않습니다.",
       },
     };
     return this.snapshot();
+  }
+
+  attachRealtime(candidate) {
+    let realtimeSnapshot = null;
+    if (this.realtimeClient) {
+      try {
+        realtimeSnapshot = this.realtimeClient.snapshot(candidate.symbol);
+      } catch {
+        realtimeSnapshot = {
+          connectionState: "DISCONNECTED",
+          connected: false,
+          orderBook: null,
+          trade: null,
+          latestAt: null,
+        };
+      }
+    }
+    const realtime = evaluateRealtimeConfirmation(candidate, realtimeSnapshot, {
+      now: this.now(),
+      staleAfterMs: realtimeSnapshot?.staleAfterMs,
+    });
+    return {
+      ...candidate,
+      realtime,
+      confirmation: {
+        ...candidate.confirmation,
+        required: realtime.state !== "ENTRY_READY",
+        realtimeState: realtime.state,
+        reason: realtime.reasons.join(" "),
+        automaticOrderConnected: false,
+      },
+    };
   }
 
   emptySnapshot() {
@@ -199,6 +273,7 @@ export class RecommendationScanner {
       executionBoundary: {
         automaticOrderConnected: false,
         actionableStages: [],
+        realtimeEntryReadyIsOrderSignal: false,
         explanation: "추천 목록은 분석용이며 자동주문과 연결되지 않습니다.",
       },
     };
@@ -264,4 +339,24 @@ function emptySocialSignal() {
     news: { total: 0, returned: 0, items: [] },
     community: { total: 0, returned: 0, items: [] },
   };
+}
+
+function realtimeVenue(market) {
+  const normalized = String(market ?? "").trim().toUpperCase();
+  if (normalized === "NXT" || normalized === "NX") return "NXT";
+  if (normalized === "UNIFIED" || normalized === "UN" || normalized === "INTEGRATED") return "UNIFIED";
+  return "KRX";
+}
+
+function createDefaultRealtimeClient(dataClient, maxSymbols) {
+  const config = dataClient?.client?.config;
+  if (!config?.enabled || typeof globalThis.WebSocket !== "function") return null;
+  try {
+    return new KisRealtimeMarketDataClient({
+      config,
+      maxSymbols: Math.max(1, Math.min(20, Number(maxSymbols) || 8)),
+    });
+  } catch {
+    return null;
+  }
 }
