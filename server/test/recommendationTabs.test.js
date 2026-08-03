@@ -4,18 +4,19 @@ import test from "node:test";
 
 const tabsSource = readFileSync(new URL("../../public/recommendationTabs.js", import.meta.url), "utf8");
 const indexSource = readFileSync(new URL("../../public/index.html", import.meta.url), "utf8");
+const appSource = readFileSync(new URL("../../public/app.js", import.meta.url), "utf8");
 
 test("recommendation workspace loads the tab adapter after the existing panel", () => {
   const panelIndex = indexSource.indexOf('/recommendationPanel.js');
   const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
-  assert.match(indexSource, /recommendationTabs\.js\?v=4/);
+  assert.match(indexSource, /recommendationTabs\.js\?v=5/);
 });
 
 test("recommendation workspace can be isolated without loading the tab adapter", () => {
   assert.match(indexSource, /noRecommendationTabs/);
-  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=4"\)/);
+  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=5"\)/);
 });
 
 test("recommendation workspace converts the modal into persistent tabs", () => {
@@ -27,7 +28,16 @@ test("recommendation workspace converts the modal into persistent tabs", () => {
   assert.match(tabsSource, /setInterval\(\(\) => void refreshTabStatus\(\), 15_000\)/);
 });
 
-test("recommendation observers cannot observe their own nested tab mutations", () => {
+test("recommendation tabs live outside the snapshot-rendered app tree", () => {
+  assert.match(appSource, /app\.innerHTML\s*=/);
+  assert.match(tabsSource, /tabsPortal\.className = "recommendation-tabs-portal"/);
+  assert.match(tabsSource, /document\.body\.append\(tabsPortal\)/);
+  assert.match(tabsSource, /tabsPortal\.querySelectorAll\("\[data-recommendation-tab\]"\)/);
+  assert.doesNotMatch(tabsSource, /topStatus\.insertBefore\(tabs/);
+  assert.match(tabsSource, /positionTabs\(topStatus\)/);
+});
+
+test("recommendation observers cannot observe their own tab mutations", () => {
   assert.match(
     tabsSource,
     /new MutationObserver\(scheduleEnsureTabs\)\.observe\(app, \{ childList: true \}\)/,
