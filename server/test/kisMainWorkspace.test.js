@@ -56,8 +56,36 @@ function clients(now) {
       ];
     },
   };
+  const restoredCommand = {
+    commandId: "command-1",
+    clientOrderId: "manual-buy-005930-20260803-145408-01",
+    operation: "SUBMIT",
+    request: {
+      side: "BUY",
+      symbol: "005930",
+      type: "MARKET",
+      quantity: 1,
+      referencePrice: 240_000,
+      exchange: "KRX",
+    },
+    timestamp: Date.parse("2026-08-03T05:54:10Z"),
+    day: "2026-08-03",
+    state: "RESULT",
+    result: {
+      clientOrderId: "manual-buy-005930-20260803-145408-01",
+      operation: "SUBMIT",
+      status: "ACCEPTED",
+      replayed: false,
+      result: {
+        orderNumber: "0000035986",
+        orderOrganizationNumber: "00950",
+      },
+    },
+    error: null,
+  };
   const paperService = {
     submitted: null,
+    commands: new Map([[restoredCommand.clientOrderId, restoredCommand]]),
     status() { return { killSwitch: false, unknownResult: false, automaticStrategyConnected: false }; },
     async getBalance() {
       return {
@@ -130,6 +158,10 @@ test("main workspace maps KIS market and paper values into the existing dashboar
   assert.equal(snapshot.account.equity, 9_999_000);
   assert.equal(snapshot.account.position.quantity, 2);
   assert.equal(snapshot.account.openOrderCount, 1);
+  assert.equal(snapshot.account.commands.length, 1);
+  assert.equal(snapshot.account.commands[0].request.side, "BUY");
+  assert.equal(snapshot.account.commands[0].response.status, "ACCEPTED");
+  assert.equal(snapshot.account.commands[0].response.result.orderNumber, "0000035986");
   assert.equal(snapshot.system.autoPaperTrading, false);
   assert.equal(snapshot.system.automaticStrategyConnected, false);
   assert.deepEqual(fake.realtime.items, [{ symbol: "005930", venue: "KRX" }]);
