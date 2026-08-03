@@ -10,6 +10,7 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
+  assert.match(indexSource, /recommendationTabs\.js\?v=2/);
 });
 
 test("recommendation workspace converts the modal into persistent tabs", () => {
@@ -28,5 +29,11 @@ test("recommendation tabs preserve view state and return selected symbols to mai
   assert.match(tabsSource, /tableScrollTop/);
   assert.match(tabsSource, /event\.stopImmediatePropagation\(\)/);
   assert.match(tabsSource, /setActiveView\(VIEW_MAIN\)/);
+  assert.match(tabsSource, /let activeView = VIEW_MAIN/);
+  assert.match(tabsSource, /pendingInitialView/);
+  assert.match(tabsSource, /isWorkspaceReady\(\)/);
+  assert.match(tabsSource, /#app\.app-shell> :not\(\.topbar\)/);
+  assert.doesNotMatch(tabsSource, /#app> :not\(\.topbar\)/);
+  assert.doesNotMatch(tabsSource, /setActiveView\(activeView/);
   assert.doesNotMatch(tabsSource, /api\/orders/);
 });
