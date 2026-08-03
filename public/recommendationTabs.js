@@ -2,7 +2,10 @@ const style = document.createElement("style");
 style.dataset.pulsehftRecommendationTabs = "true";
 style.textContent = String.raw`
 .recommendation-trigger{display:none!important}
-.recommendation-workspace-tabs{display:inline-flex;align-items:center;gap:3px;padding:3px;border:1px solid #26384f;border-radius:10px;background:#09111d;white-space:nowrap}
+.recommendation-tabs-portal{position:fixed;z-index:45;left:0;top:0;pointer-events:none}
+.recommendation-tabs-portal[hidden]{display:none!important}
+.recommendation-tabs-portal .recommendation-workspace-tabs{pointer-events:auto}
+.recommendation-workspace-tabs{display:inline-flex;align-items:center;gap:3px;padding:3px;border:1px solid #26384f;border-radius:10px;background:#09111d;white-space:nowrap;box-shadow:0 8px 24px rgba(0,0,0,.28)}
 .recommendation-workspace-tab{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:26px;border:0;border-radius:7px;background:transparent;color:#71849b;padding:0 9px;font-size:9px;font-weight:900}
 .recommendation-workspace-tab:hover{color:#d8f8ff;background:#101d2d}
 .recommendation-workspace-tab.active{color:#dffbff;background:linear-gradient(180deg,#15304a,#102237);box-shadow:inset 0 0 0 1px #2d5b78}
@@ -28,6 +31,16 @@ const VIEW_RECOMMENDATIONS = "RECOMMENDATIONS";
 const FILTERS = new Set(["ALL", "PULLBACK", "REVERSAL", "BLOCKED"]);
 
 const app = document.querySelector("#app");
+const tabsPortal = document.createElement("div");
+tabsPortal.className = "recommendation-tabs-portal";
+tabsPortal.hidden = true;
+tabsPortal.innerHTML = `
+  <div class="recommendation-workspace-tabs" role="tablist" aria-label="분석 화면 전환">
+    <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="main">메인 분석</button>
+    <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="recommendations"><i class="recommendation-tab-ready"></i>매수추천 <span class="recommendation-tab-count">0</span></button>
+  </div>`;
+document.body.append(tabsPortal);
+
 const storedView = readStorage(VIEW_KEY);
 let pendingInitialView = storedView === VIEW_RECOMMENDATIONS
   ? VIEW_RECOMMENDATIONS
@@ -74,6 +87,29 @@ function applyViewClass() {
   );
 }
 
+function positionTabs(topStatus) {
+  const tabs = tabsPortal.querySelector(".recommendation-workspace-tabs");
+  if (!tabs || !topStatus?.isConnected) {
+    tabsPortal.hidden = true;
+    return;
+  }
+
+  tabsPortal.hidden = false;
+  const statusRect = topStatus.getBoundingClientRect();
+  const firstStatusItem = [...topStatus.children].find((element) => {
+    const computed = window.getComputedStyle(element);
+    return computed.display !== "none" && computed.visibility !== "hidden";
+  });
+  const firstRect = firstStatusItem?.getBoundingClientRect();
+  const tabsRect = tabs.getBoundingClientRect();
+  const gap = 12;
+  const desiredLeft = (firstRect?.left ?? statusRect.right) - gap - tabsRect.width;
+  const left = Math.max(statusRect.left, desiredLeft);
+  const top = statusRect.top + Math.max(0, (statusRect.height - tabsRect.height) / 2);
+
+  tabsPortal.style.transform = `translate(${Math.round(left)}px,${Math.round(top)}px)`;
+}
+
 function scheduleEnsureTabs() {
   if (ensureTabsScheduled) return;
   ensureTabsScheduled = true;
@@ -86,22 +122,12 @@ function scheduleEnsureTabs() {
 function ensureTabs() {
   const topStatus = app?.querySelector(".topbar .top-status");
   if (!topStatus) {
+    tabsPortal.hidden = true;
     document.body.classList.remove("recommendation-view-active");
     return;
   }
 
-  let tabs = topStatus.querySelector(".recommendation-workspace-tabs");
-  if (!tabs) {
-    tabs = document.createElement("div");
-    tabs.className = "recommendation-workspace-tabs";
-    tabs.setAttribute("role", "tablist");
-    tabs.setAttribute("aria-label", "분석 화면 전환");
-    tabs.innerHTML = `
-      <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="main">메인 분석</button>
-      <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="recommendations"><i class="recommendation-tab-ready"></i>매수추천 <span class="recommendation-tab-count">0</span></button>`;
-    topStatus.insertBefore(tabs, topStatus.firstChild);
-  }
-
+  positionTabs(topStatus);
   bindPanelObserver();
 
   if (!initialViewRestored) {
@@ -213,7 +239,7 @@ function setActiveView(nextView, { restoreScroll = true } = {}) {
 }
 
 function syncTabs() {
-  for (const tab of app?.querySelectorAll("[data-recommendation-tab]") ?? []) {
+  for (const tab of tabsPortal.querySelectorAll("[data-recommendation-tab]")) {
     const recommendationTab = tab.dataset.recommendationTab === "recommendations";
     const selected = recommendationTab
       ? activeView === VIEW_RECOMMENDATIONS
@@ -223,7 +249,9 @@ function syncTabs() {
     tab.tabIndex = selected ? 0 : -1;
     if (recommendationTab) {
       const count = tab.querySelector(".recommendation-tab-count");
-      if (count) count.textContent = String(candidateCount);
+      if (count && count.textContent !== String(candidateCount)) {
+        count.textContent = String(candidateCount);
+      }
       tab.querySelector(".recommendation-tab-ready")
         ?.classList.toggle("live", entryReadyCount > 0);
       tab.title = entryReadyCount > 0
@@ -378,6 +406,8 @@ if (app) {
 }
 document.addEventListener("click", handleClick, true);
 document.addEventListener("keydown", handleKeydown, true);
+window.addEventListener("resize", scheduleEnsureTabs);
+window.addEventListener("scroll", scheduleEnsureTabs, { passive: true });
 
 document.body.classList.remove("recommendation-view-active");
 scheduleEnsureTabs();
