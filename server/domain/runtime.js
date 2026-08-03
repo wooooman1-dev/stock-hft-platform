@@ -101,9 +101,7 @@ export class MarketRuntime extends EventEmitter {
 
   switchInstrument(input, { persist = null } = {}) {
     const selection = normalizeRuntimeInstrument(input, this.now());
-    if (selection.symbol === this.symbol) {
-      return { changed: false, snapshot: this.snapshot() };
-    }
+    const sameSymbol = selection.symbol === this.symbol;
     const account = this.trader.snapshot(this.snapshotValue.lastPrice);
     if (this.autoPaperTrading) {
       throw new InstrumentSwitchError(
@@ -125,7 +123,9 @@ export class MarketRuntime extends EventEmitter {
     }
     if (account.orders.length !== 0) {
       throw new InstrumentSwitchError(
-        "다른 종목의 주문 내역이 섞이지 않도록 내부 모의계좌를 초기화한 뒤 종목을 변경하세요.",
+        sameSymbol
+          ? "최신 KIS 가격으로 다시 초기화하려면 내부 모의계좌를 먼저 초기화하세요."
+          : "다른 종목의 주문 내역이 섞이지 않도록 내부 모의계좌를 초기화한 뒤 종목을 변경하세요.",
         "INSTRUMENT_SWITCH_ACCOUNT_NOT_RESET",
       );
     }
@@ -150,7 +150,11 @@ export class MarketRuntime extends EventEmitter {
     this.snapshotValue.account = this.trader.snapshot(tick.lastPrice);
     this.syncPositionRisk(tick.lastPrice, tick.timestamp);
     this.emitSnapshot();
-    return { changed: true, snapshot: this.snapshot() };
+    return {
+      changed: !sameSymbol,
+      refreshed: sameSymbol,
+      snapshot: this.snapshot(),
+    };
   }
 
   submitOrder(sideOrInput, quantity, source = "MANUAL", emit = true) {
