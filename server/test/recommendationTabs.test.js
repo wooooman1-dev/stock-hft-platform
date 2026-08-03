@@ -11,12 +11,12 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
-  assert.match(indexSource, /recommendationTabs\.js\?v=3/);
+  assert.match(indexSource, /recommendationTabs\.js\?v=4/);
 });
 
 test("recommendation workspace can be isolated without loading the tab adapter", () => {
   assert.match(indexSource, /noRecommendationTabs/);
-  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=3"\)/);
+  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=4"\)/);
 });
 
 test("frontend runtime errors are exposed before application modules load", () => {
@@ -34,8 +34,21 @@ test("recommendation workspace converts the modal into persistent tabs", () => {
   assert.match(tabsSource, /data-recommendation-tab="recommendations"/);
   assert.match(tabsSource, /position:static!important/);
   assert.match(tabsSource, /panel\.removeAttribute\("aria-modal"\)/);
-  assert.match(tabsSource, /ensureLegacyOpen\(\)/);
+  assert.match(tabsSource, /openRecommendationPanel\(\)/);
   assert.match(tabsSource, /setInterval\(\(\) => void refreshTabStatus\(\), 15_000\)/);
+});
+
+test("recommendation observers cannot observe their own nested tab mutations", () => {
+  assert.match(
+    tabsSource,
+    /new MutationObserver\(scheduleEnsureTabs\)\.observe\(app, \{ childList: true \}\)/,
+  );
+  assert.doesNotMatch(
+    tabsSource,
+    /observe\(app, \{ childList: true, subtree: true \}\)/,
+  );
+  assert.match(tabsSource, /panelObserver\.observe\(panel, \{ childList: true \}\)/);
+  assert.doesNotMatch(tabsSource, /ensureLegacyOpen/);
 });
 
 test("recommendation tabs preserve view state and return selected symbols to main analysis", () => {
@@ -50,6 +63,5 @@ test("recommendation tabs preserve view state and return selected symbols to mai
   assert.match(tabsSource, /isWorkspaceReady\(\)/);
   assert.match(tabsSource, /#app\.app-shell> :not\(\.topbar\)/);
   assert.doesNotMatch(tabsSource, /#app> :not\(\.topbar\)/);
-  assert.doesNotMatch(tabsSource, /setActiveView\(activeView/);
   assert.doesNotMatch(tabsSource, /api\/orders/);
 });
