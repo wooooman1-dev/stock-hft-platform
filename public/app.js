@@ -1,16 +1,20 @@
 const app = document.querySelector("#app");
+const KIS_COMMANDS_KEY = "pulsehft.kisPaperCommands";
+
 let snapshot = null;
 let connection = "connecting";
 let busy = false;
-let quantity = 10;
+let quantity = 1;
 let orderType = "MARKET";
 let limitPrice = null;
 let message = null;
+let lastSymbol = null;
+let kisCommands = readStoredCommands();
 
 const fmt = (value) => Math.round(Number(value) || 0).toLocaleString("ko-KR");
-const signed = (value, digits = 1) => `${value >= 0 ? "+" : ""}${value.toFixed(digits)}`;
+const signed = (value, digits = 1) => `${value >= 0 ? "+" : ""}${Number(value || 0).toFixed(digits)}`;
 const tone = (value) => value > 0.03 ? "positive" : value < -0.03 ? "negative" : "neutral";
-const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (char) => ({
+const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({
   "&": "&amp;",
   "<": "&lt;",
   ">": "&gt;",
@@ -18,27 +22,27 @@ const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (char) => ({
   '"': "&quot;",
 })[char]);
 
-async function request(path, body) {
+async function request(path, body, { method = "POST" } = {}) {
   const response = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body ?? {}),
+    method,
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: method === "GET" ? undefined : JSON.stringify(body ?? {}),
   });
-  const result = await response.json();
+  const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result.error ?? `요청 실패 (${response.status})`);
   return result;
 }
 
 function priceChart(candles) {
-  const data = candles.slice(-90);
-  if (data.length < 2) return '<div class="chart-empty">차트 데이터를 수집하는 중입니다.</div>';
+  const data = Array.isArray(candles) ? candles.slice(-90) : [];
+  if (data.length < 2) return '<div class="chart-empty">KIS 차트 데이터를 불러오는 중입니다.</div>';
   const width = 1000;
   const height = 360;
   const padding = { top: 24, right: 72, bottom: 30, left: 14 };
-  const values = data.flatMap((item) => [item.high, item.low]);
+  const values = data.flatMap((item) => [item.high, item.low]).filter(Number.isFinite);
   const min = Math.min(...values);
   const max = Math.max(...values);
-  const range = Math.max(100, max - min);
+  const range = Math.max(1, max - min);
   const y = (price) => padding.top + ((max - price) / range) * (height - padding.top - padding.bottom);
   const step = (width - padding.left - padding.right) / data.length;
   const candleWidth = Math.max(2, Math.min(8, step * 0.55));
@@ -66,56 +70,84 @@ function bookRow(level, type, maxSize) {
   return `<div class="book-row ${type}"><div class="book-depth" style="width:${Math.max(4, level.size / maxSize * 100)}%"></div><span class="book-price">${fmt(level.price)}</span><span class="book-size">${fmt(level.size)}</span></div>`;
 }
 
-function statusLabel(order) {
-  if (order.status === "ACCEPTED") return "접수·대기";
-  if (order.status === "PARTIALLY_FILLED") return order.isOpen ? "부분체결·대기" : "부분체결·IOC 종료";
-  if (order.status === "FILLED") return "체결완료";
-  if (order.status === "CANCELLED") return "취소";
-  if (order.status === "REJECTED") return "거절";
-  return order.status;
-}
-
-function orderTypeLabel(order) {
-  if (order.type === "MARKET") return "시장가 IOC";
-  return `지정가 ${fmt(order.limitPrice)}`;
-}
-
-function orderRow(order) {
-  const sideClass = order.side === "BUY" ? "positive-text" : "negative-text";
-  const statusClass = ["FILLED", "ACCEPTED", "PARTIALLY_FILLED"].includes(order.status)
-    ? "status-ok"
-    : "status-error";
-  const fillText = order.filledQuantity > 0
-    ? `${order.filledQuantity}/${order.requestedQuantity}주 · ${fmt(order.averageFilledPrice)}`
-    : `0/${order.requestedQuantity}주`;
-  return `<div class="order-row" title="${escapeHtml(order.reason)}">
-    <span class="${sideClass}">${order.side === "BUY" ? "매수" : "매도"} ${order.requestedQuantity}주</span>
-    <span>${orderTypeLabel(order)}</span>
-    <span>${fillText}</span>
-    <span class="${statusClass}">${statusLabel(order)}</span>
-    <span>${order.isOpen ? `<button class="cancel-order-button" data-action="cancel-order" data-order-id="${escapeHtml(order.id)}">취소</button>` : "-"}</span>
-  </div>`;
-}
-
-function createClientOrderId(side) {
-  if (globalThis.crypto?.randomUUID) return `ui-${side.toLowerCase()}-${crypto.randomUUID()}`;
-  return `ui-${side.toLowerCase()}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+function createClientOrderId(operation) {
+  if (globalThis.crypto?.randomUUID) return `ui-${operation.toLowerCase()}-${crypto.randomUUID()}`;
+  return `ui-${operation.toLowerCase()}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function orderRequest(side) {
   const body = {
     side,
+    symbol: snapshot.symbol,
     type: orderType,
     quantity,
+    exchange: "KRX",
     clientOrderId: createClientOrderId(side),
   };
   if (orderType === "LIMIT") body.limitPrice = limitPrice;
+  else body.referencePrice = snapshot.lastPrice;
   return body;
+}
+
+function commandStatusLabel(status) {
+  if (status === "ACCEPTED") return "접수·체결 미확인";
+  if (status === "UNKNOWN_RESULT") return "결과 불명";
+  if (status === "REJECTED") return "거절";
+  return status || "오류";
+}
+
+function commandRow(command) {
+  const requestValue = command.request ?? {};
+  const responseValue = command.response ?? {};
+  const brokerResult = responseValue.result ?? {};
+  const status = responseValue.status ?? "ERROR";
+  const sideClass = requestValue.side === "BUY" ? "positive-text" : "negative-text";
+  const statusClass = status === "ACCEPTED" ? "status-ok" : "status-error";
+  const orderNumber = brokerResult.orderNumber ?? "-";
+  const typeText = requestValue.type === "LIMIT"
+    ? `지정가 ${fmt(requestValue.limitPrice)}`
+    : "시장가";
+  const cancelable = findCancelableOrder(brokerResult);
+  const control = cancelable
+    ? `<button class="cancel-order-button" data-action="cancel-order" data-order-number="${escapeHtml(cancelable.orderNumber)}" data-order-organization-number="${escapeHtml(cancelable.orderOrganizationNumber)}" data-cancel-quantity="${Number(cancelable.cancelableQuantity) || 0}">취소</button>`
+    : "-";
+  return `<div class="order-row" title="${escapeHtml(responseValue.error?.message ?? "ACCEPTED는 실제 체결 완료를 의미하지 않습니다.")}">
+    <span class="${sideClass}">${requestValue.side === "BUY" ? "매수" : "매도"} ${Number(requestValue.quantity) || 0}주</span>
+    <span>${typeText}</span>
+    <span>${escapeHtml(orderNumber)} · 체결 미확인</span>
+    <span class="${statusClass}">${commandStatusLabel(status)}</span>
+    <span>${control}</span>
+  </div>`;
+}
+
+function findCancelableOrder(result) {
+  const orders = snapshot?.account?.cancelableOrders;
+  if (!Array.isArray(orders) || !result?.orderNumber) return null;
+  return orders.find((order) => (
+    order.orderNumber === result.orderNumber
+    && (!result.orderOrganizationNumber
+      || order.orderOrganizationNumber === result.orderOrganizationNumber)
+  )) ?? null;
+}
+
+function nullableMoney(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  return Number.isFinite(Number(value)) ? `${fmt(value)}원` : "-";
+}
+
+function nullableNumber(value, suffix = "") {
+  if (value === null || value === undefined || value === "") return "-";
+  return Number.isFinite(Number(value)) ? `${fmt(value)}${suffix}` : "-";
 }
 
 function render() {
   if (!snapshot) return;
-  if (limitPrice === null) limitPrice = snapshot.lastPrice;
+  if (lastSymbol !== snapshot.symbol) {
+    lastSymbol = snapshot.symbol;
+    limitPrice = snapshot.lastPrice;
+  } else if (limitPrice === null) {
+    limitPrice = snapshot.lastPrice;
+  }
 
   const activeElement = document.activeElement;
   const activeId = activeElement?.id;
@@ -127,44 +159,55 @@ function render() {
   const bids = snapshot.book.bids.slice(0, 7);
   const maxSize = Math.max(1, ...asks.map((level) => level.size), ...bids.map((level) => level.size));
   const signalLabel = metrics.signal === "BUY" ? "매수 후보" : metrics.signal === "SELL" ? "매도 후보" : "관망";
-  const disabled = busy || snapshot.system.killSwitch ? "disabled" : "";
+  const paperAvailable = Boolean(account.available);
+  const disabled = busy || snapshot.system.killSwitch || !paperAvailable ? "disabled" : "";
   const limitDisabled = orderType === "MARKET" ? "disabled" : "";
+  const feedConnected = Boolean(snapshot.system.feedConnected);
+  const feedLabel = feedConnected
+    ? "KIS 실시간 연결"
+    : snapshot.system.marketDataSource === "KIS_REST"
+      ? "KIS REST 시세"
+      : "KIS 연결 대기";
+  const dataAge = Number(snapshot.system.latencyMs) || 0;
+  const accountNote = account.error?.message
+    ? ` · ${escapeHtml(account.error.message)}`
+    : "";
 
   app.className = "app-shell";
   app.innerHTML = `
-    <header class="topbar"><div class="brand"><div class="pulse-logo">P</div><div><strong>PulseHFT</strong><span>Microstructure & Paper Execution</span></div></div><div class="instrument"><div><span>${snapshot.symbol}</span><strong>${snapshot.symbolName}</strong></div><div class="headline-price"><strong>${fmt(snapshot.lastPrice)}</strong><span class="${snapshot.changePercent >= 0 ? "positive-text" : "negative-text"}">${signed(snapshot.changePercent, 2)}%</span></div></div><div class="top-status"><span class="simulation-badge">SIMULATION</span><span class="connection ${connection}"><i></i>${connection === "connected" ? "실시간 연결" : connection === "connecting" ? "연결 중" : "재연결 중"}</span><span class="latency">분석 ${snapshot.system.latencyMs.toFixed(1)}ms</span></div></header>
+    <header class="topbar"><div class="brand"><div class="pulse-logo">P</div><div><strong>PulseHFT</strong><span>Microstructure & KIS Paper Execution</span></div></div><div class="instrument"><div><span>${snapshot.symbol}</span><strong>${escapeHtml(snapshot.symbolName)}</strong></div><div class="headline-price"><strong>${fmt(snapshot.lastPrice)}</strong><span class="${snapshot.changePercent >= 0 ? "positive-text" : "negative-text"}">${signed(snapshot.changePercent, 2)}%</span></div></div><div class="top-status"><span class="simulation-badge">KIS PROD READ-ONLY</span><span class="connection ${feedConnected ? "connected" : connection}"><i></i>${feedLabel}</span><span class="latency">데이터 ${dataAge.toFixed(0)}ms</span></div></header>
     ${message ? `<div class="toast" data-action="dismiss">${escapeHtml(message)}</div>` : ""}
-    ${snapshot.system.killSwitch ? '<div class="kill-banner">킬 스위치가 활성화되어 모든 신규 주문이 차단되었습니다.</div>' : ""}
-    <section class="metric-grid">${metric("가중 호가 불균형", `${signed(metrics.weightedImbalance * 100)}%`, "1~3호가 가중치 반영", tone(metrics.weightedImbalance))}${metric("체결 흐름", `${signed(metrics.tradeFlow * 100)}%`, "최근 5초 매수·매도 체결량", tone(metrics.tradeFlow))}${metric("거래 속도", `${metrics.tradesPerSecond.toFixed(1)}/초`, `${fmt(metrics.volumePerSecond)}주/초`)}${metric("모멘텀", `${signed(metrics.momentumBps, 2)}bp`, "최근 5초 가격 방향", tone(metrics.momentumBps))}${metric("스프레드", `${metrics.spreadTicks.toFixed(0)}틱`, `${fmt(metrics.spread)}원`, metrics.spreadTicks <= 1 ? "positive" : metrics.spreadTicks >= 3 ? "negative" : "neutral")}${metric("초단기 변동성", `${metrics.volatilityBps.toFixed(2)}bp`, "틱 수익률 표준편차")}</section>
+    ${snapshot.system.killSwitch ? '<div class="kill-banner">KIS 모의투자 킬 스위치가 활성화되어 신규·정정 주문이 차단되었습니다.</div>' : ""}
+    <section class="metric-grid">${metric("가중 호가 불균형", `${signed(metrics.weightedImbalance * 100)}%`, "KIS 1~3호가 가중치 반영", tone(metrics.weightedImbalance))}${metric("체결 흐름", `${signed(metrics.tradeFlow * 100)}%`, "최근 5초 KIS 체결량", tone(metrics.tradeFlow))}${metric("거래 속도", `${metrics.tradesPerSecond.toFixed(1)}/초`, `${fmt(metrics.volumePerSecond)}주/초`)}${metric("모멘텀", `${signed(metrics.momentumBps, 2)}bp`, "최근 KIS 체결 가격 방향", tone(metrics.momentumBps))}${metric("스프레드", `${metrics.spreadTicks.toFixed(0)}틱`, `${fmt(metrics.spread)}원`, metrics.spreadTicks <= 1 ? "positive" : metrics.spreadTicks >= 3 ? "negative" : "neutral")}${metric("초단기 변동성", `${metrics.volatilityBps.toFixed(2)}bp`, "KIS 체결 수익률 표준편차")}</section>
     <section class="workspace-grid">
-      <div class="chart-panel panel"><div class="panel-title-row"><div><span class="eyebrow">1-SECOND MARKET VIEW</span><h3>실시간 가격·체결 구조</h3></div><div class="chart-legend"><span class="up">상승</span><span class="down">하락</span></div></div>${priceChart(snapshot.candles)}</div>
-      <div class="book-panel panel"><div class="panel-title-row"><div><span class="eyebrow">ORDER BOOK</span><h3>10단계 호가</h3></div></div><div class="book-head"><span>가격</span><span>잔량</span></div>${asks.map((level) => bookRow(level, "ask", maxSize)).join("")}<div class="last-price-row"><span>현재가</span><strong>${fmt(snapshot.lastPrice)}</strong></div>${bids.map((level) => bookRow(level, "bid", maxSize)).join("")}</div>
-      <div class="signal-wrap"><div class="signal-panel signal-${metrics.signal.toLowerCase()}"><div class="signal-header"><div><span class="eyebrow">MICROSTRUCTURE SIGNAL</span><h2>${signalLabel}</h2></div><div class="score-ring" style="--score:${metrics.confidence * 3.6}deg"><div><strong>${metrics.score}</strong><small>점수</small></div></div></div><div class="confidence-track"><span style="width:${metrics.confidence}%"></span></div><div class="signal-reasons">${metrics.reasons.slice(0, 4).map((reason) => `<div>• ${escapeHtml(reason)}</div>`).join("")}</div><p>이 신호는 모의 데이터 기반 분석 결과이며 투자 권유가 아닙니다.</p></div></div>
-      <div class="tape-panel panel"><div class="panel-title-row"><div><span class="eyebrow">TIME & SALES</span><h3>실시간 체결</h3></div></div><div class="trade-tape">${snapshot.trades.slice(0, 30).map((trade) => `<div class="trade-row ${trade.side.toLowerCase()}"><span>${new Date(trade.timestamp).toLocaleTimeString("ko-KR", { hour12: false, minute: "2-digit", second: "2-digit", fractionalSecondDigits: 1 })}</span><strong>${fmt(trade.price)}</strong><span>${trade.size}</span></div>`).join("")}</div></div>
+      <div class="chart-panel panel"><div class="panel-title-row"><div><span class="eyebrow">KIS INTRADAY MARKET VIEW</span><h3>실시간 가격·체결 구조</h3></div><div class="chart-legend"><span class="up">상승</span><span class="down">하락</span></div></div>${priceChart(snapshot.candles)}</div>
+      <div class="book-panel panel"><div class="panel-title-row"><div><span class="eyebrow">KIS ORDER BOOK</span><h3>10단계 호가</h3></div></div><div class="book-head"><span>가격</span><span>잔량</span></div>${asks.map((level) => bookRow(level, "ask", maxSize)).join("")}<div class="last-price-row"><span>현재가</span><strong>${fmt(snapshot.lastPrice)}</strong></div>${bids.map((level) => bookRow(level, "bid", maxSize)).join("")}</div>
+      <div class="signal-wrap"><div class="signal-panel signal-${metrics.signal.toLowerCase()}"><div class="signal-header"><div><span class="eyebrow">KIS MICROSTRUCTURE SIGNAL</span><h2>${signalLabel}</h2></div><div class="score-ring" style="--score:${metrics.confidence * 3.6}deg"><div><strong>${metrics.score}</strong><small>점수</small></div></div></div><div class="confidence-track"><span style="width:${metrics.confidence}%"></span></div><div class="signal-reasons">${metrics.reasons.slice(0, 4).map((reason) => `<div>• ${escapeHtml(reason)}</div>`).join("")}</div><p>KIS 실제 시세·호가·체결 기반 분석이며 투자 권유가 아닙니다.</p></div></div>
+      <div class="tape-panel panel"><div class="panel-title-row"><div><span class="eyebrow">KIS TIME & SALES</span><h3>실시간 체결</h3></div></div><div class="trade-tape">${snapshot.trades.slice(0, 30).map((trade) => `<div class="trade-row ${String(trade.side).toLowerCase()}"><span>${new Date(trade.timestamp).toLocaleTimeString("ko-KR", { hour12: false, minute: "2-digit", second: "2-digit", fractionalSecondDigits: 1 })}</span><strong>${fmt(trade.price)}</strong><span>${fmt(trade.size)}</span></div>`).join("") || '<div class="empty-list">KIS 실시간 체결을 기다리는 중입니다.</div>'}</div></div>
     </section>
     <section class="execution-grid">
-      <div class="paper-panel"><div class="panel-title-row"><div><span class="eyebrow">PAPER ACCOUNT</span><h3>호가 기반 모의주문</h3></div><button class="ghost-button" data-action="reset" ${busy ? "disabled" : ""}>초기화</button></div>
+      <div class="paper-panel"><div class="panel-title-row"><div><span class="eyebrow">KIS PAPER ACCOUNT</span><h3>KIS 모의계좌 수동 주문</h3></div><button class="ghost-button" data-action="refresh" ${busy ? "disabled" : ""}>새로고침</button></div>
         <div class="account-grid">
-          <div><span>총자산</span><strong>${fmt(account.equity)}원</strong></div>
-          <div><span>가용현금</span><strong>${fmt(account.availableCash)}원</strong></div>
-          <div><span>매수예약</span><strong>${fmt(account.reservedCash)}원</strong></div>
-          <div><span>보유수량</span><strong>${account.position.quantity}주</strong></div>
-          <div><span>매도가능</span><strong>${account.sellableQuantity}주</strong></div>
-          <div><span>평균단가</span><strong>${fmt(account.position.averagePrice)}원</strong></div>
-          <div><span>평가손익</span><strong class="${account.unrealizedPnl >= 0 ? "positive-text" : "negative-text"}">${fmt(account.unrealizedPnl)}원</strong></div>
-          <div><span>실현손익</span><strong class="${account.realizedPnl >= 0 ? "positive-text" : "negative-text"}">${fmt(account.realizedPnl)}원</strong></div>
+          <div><span>총자산</span><strong>${nullableMoney(account.equity)}</strong></div>
+          <div><span>가용현금</span><strong>${nullableMoney(account.availableCash)}</strong></div>
+          <div><span>매수예약</span><strong>${nullableMoney(account.reservedCash)}</strong></div>
+          <div><span>보유수량</span><strong>${nullableNumber(account.position.quantity, "주")}</strong></div>
+          <div><span>매도가능</span><strong>${nullableNumber(account.sellableQuantity, "주")}</strong></div>
+          <div><span>평균단가</span><strong>${nullableMoney(account.position.averagePrice)}</strong></div>
+          <div><span>평가손익</span><strong class="${Number(account.unrealizedPnl) >= 0 ? "positive-text" : "negative-text"}">${nullableMoney(account.unrealizedPnl)}</strong></div>
+          <div><span>실현손익</span><strong>-</strong></div>
         </div>
         <div class="order-entry">
-          <label>주문 유형<select id="order-type"><option value="MARKET" ${orderType === "MARKET" ? "selected" : ""}>시장가 IOC</option><option value="LIMIT" ${orderType === "LIMIT" ? "selected" : ""}>지정가 GTC</option></select></label>
+          <label>주문 유형<select id="order-type"><option value="MARKET" ${orderType === "MARKET" ? "selected" : ""}>시장가</option><option value="LIMIT" ${orderType === "LIMIT" ? "selected" : ""}>지정가</option></select></label>
           <label>주문 수량<input id="quantity" type="number" min="1" max="${snapshot.riskLimits.maxOrderQuantity}" value="${quantity}"></label>
           <label>지정 가격<input id="limit-price" type="number" min="1" step="${snapshot.tickSize}" value="${limitPrice}" ${limitDisabled}></label>
-          <div class="order-buttons"><button class="buy-button" data-action="buy" ${disabled}>모의 매수</button><button class="sell-button" data-action="sell" ${disabled}>모의 매도</button></div>
+          <div class="order-buttons"><button class="buy-button" data-action="buy" ${disabled}>KIS 모의 매수</button><button class="sell-button" data-action="sell" ${disabled}>KIS 모의 매도</button></div>
         </div>
-        <div class="execution-note">시장가는 화면의 반대편 호가 잔량을 순서대로 소비하며, 보이는 잔량이 부족하면 IOC 잔량을 취소합니다. 지정가는 가격이 교차할 때만 체결되고 미체결 잔량은 대기합니다.</div>
-        <div class="orders-list"><div class="table-head"><span>주문</span><span>유형·가격</span><span>체결수량·평균가</span><span>상태</span><span>제어</span></div>${account.orders.slice(0, 10).map(orderRow).join("") || '<div class="empty-list">아직 주문 내역이 없습니다.</div>'}</div>
+        <div class="execution-note">주문 전 최종 확인을 거칩니다. ACCEPTED는 증권사 주문 접수이며 실제 체결 완료를 뜻하지 않습니다.${accountNote}</div>
+        <div class="orders-list"><div class="table-head"><span>주문</span><span>유형·가격</span><span>주문번호·체결</span><span>상태</span><span>제어</span></div>${kisCommands.slice(0, 10).map(commandRow).join("") || '<div class="empty-list">이 브라우저에서 전송한 KIS 주문 명령이 없습니다.</div>'}</div>
       </div>
-      <div class="system-panel"><div class="panel-title-row"><div><span class="eyebrow">RISK & EXECUTION</span><h3>자동매매 제어</h3></div></div><div class="execution-model"><span>모의체결 모델</span><strong>Visible Depth</strong><small>시장가 IOC · 지정가 GTC · 중복주문 방지</small></div><div class="control-row"><div><strong>모의 자동전략</strong><span>신호 50점 이상·시장가 IOC·5초 쿨다운</span></div><button class="toggle ${snapshot.system.autoPaperTrading ? "on" : ""}" data-action="auto" ${busy || snapshot.system.killSwitch ? "disabled" : ""}><span></span></button></div><div class="control-row danger-row"><div><strong>킬 스위치</strong><span>모든 신규 주문과 자동전략 즉시 차단</span></div><button class="toggle danger ${snapshot.system.killSwitch ? "on" : ""}" data-action="kill" ${busy ? "disabled" : ""}><span></span></button></div><div class="risk-list"><div><span>1회 최대</span><strong>${snapshot.riskLimits.maxOrderQuantity}주</strong></div><div><span>최대 보유</span><strong>${snapshot.riskLimits.maxPositionQuantity}주</strong></div><div><span>최대 포지션</span><strong>${fmt(snapshot.riskLimits.maxPositionNotional / 10000)}만원</strong></div><div><span>일일 손실 제한</span><strong>-${fmt(snapshot.riskLimits.dailyLossLimit / 10000)}만원</strong></div><div><span>대기 주문</span><strong>${account.openOrderCount}건</strong></div><div><span>매도 예약</span><strong>${account.reservedSellQuantity}주</strong></div></div></div>
-    </section><footer><span>현재 버전은 모의 시세·호가 기반 모의체결 전용입니다.</span><span>수수료·세금·실제 큐 순서는 아직 반영하지 않습니다.</span></footer>`;
+      <div class="system-panel"><div class="panel-title-row"><div><span class="eyebrow">KIS RISK & EXECUTION</span><h3>모의투자 주문 제어</h3></div></div><div class="execution-model"><span>주문 경계</span><strong>KIS PAPER · MANUAL ONLY</strong><small>실전주문 비활성 · 자동전략 미연결 · clientOrderId 멱등성</small></div><div class="control-row"><div><strong>자동주문</strong><span>내부 자동전략과 매수추천 자동주문은 연결되어 있지 않습니다.</span></div><button class="toggle" disabled><span></span></button></div><div class="control-row danger-row"><div><strong>킬 스위치</strong><span>KIS 모의계좌 신규·정정 주문 즉시 차단</span></div><button class="toggle danger ${snapshot.system.killSwitch ? "on" : ""}" data-action="kill" ${busy || !paperAvailable ? "disabled" : ""}><span></span></button></div><div class="risk-list"><div><span>1회 최대</span><strong>${fmt(snapshot.riskLimits.maxOrderQuantity)}주</strong></div><div><span>최대 주문금액</span><strong>${fmt(snapshot.riskLimits.maxOrderValue / 10000)}만원</strong></div><div><span>일일 주문</span><strong>${fmt(snapshot.riskLimits.maxDailyOrders)}건</strong></div><div><span>일일 손실 제한</span><strong>-${fmt(snapshot.riskLimits.maxDailyLoss / 10000)}만원</strong></div><div><span>취소 가능 주문</span><strong>${fmt(account.openOrderCount)}건</strong></div><div><span>매도 예약</span><strong>${fmt(account.reservedSellQuantity)}주</strong></div></div></div>
+    </section><footer><span>시세·호가·체결은 KIS 실전계좌 읽기 전용 데이터입니다.</span><span>잔고와 주문은 KIS 모의투자이며 자동주문과 실전주문은 연결하지 않습니다.</span></footer>`;
 
   if (activeId) {
     const next = document.getElementById(activeId);
@@ -177,19 +220,45 @@ function render() {
   }
 }
 
-async function run(action) {
+async function run(action, { recordRequest = null } = {}) {
   try {
     busy = true;
     message = null;
     render();
     const result = await action();
-    if (result?.status === "REJECTED") message = `주문 거절: ${result.reason}`;
+    if (recordRequest) {
+      kisCommands.unshift({
+        id: recordRequest.clientOrderId,
+        at: Date.now(),
+        request: structuredClone(recordRequest),
+        response: structuredClone(result),
+      });
+      kisCommands = kisCommands.slice(0, 30);
+      writeStoredCommands();
+    }
+    if (result?.status === "REJECTED") message = `주문 거절: ${result.error?.message ?? "증권사 거절"}`;
+    else if (result?.status === "UNKNOWN_RESULT") message = "주문 결과가 불명확합니다. 킬 스위치가 활성화됐는지 확인하세요.";
+    else if (result?.status === "ACCEPTED") message = "KIS 모의주문이 접수됐습니다. 실제 체결 여부는 별도로 확인해야 합니다.";
+    return result;
   } catch (error) {
     message = error instanceof Error ? error.message : "요청 처리 중 오류가 발생했습니다.";
+    return null;
   } finally {
     busy = false;
     render();
   }
+}
+
+async function submit(side) {
+  const requestBody = orderRequest(side);
+  const priceText = requestBody.type === "MARKET"
+    ? `시장가 · 기준가 ${fmt(requestBody.referencePrice)}원`
+    : `지정가 ${fmt(requestBody.limitPrice)}원`;
+  const confirmed = window.confirm(
+    `KIS 모의계좌 ${side === "BUY" ? "매수" : "매도"} 주문을 전송할까요?\n${snapshot.symbol} ${snapshot.symbolName}\n${requestBody.quantity}주 · ${priceText}\n\nACCEPTED는 접수이며 체결 완료가 아닙니다.`,
+  );
+  if (!confirmed) return;
+  await run(() => request("/api/kis/paper/orders", requestBody), { recordRequest: requestBody });
 }
 
 app.addEventListener("input", (event) => {
@@ -213,15 +282,27 @@ app.addEventListener("click", (event) => {
     message = null;
     render();
   }
-  if (action === "buy") void run(() => request("/api/paper/orders", orderRequest("BUY")));
-  if (action === "sell") void run(() => request("/api/paper/orders", orderRequest("SELL")));
+  if (action === "buy") void submit("BUY");
+  if (action === "sell") void submit("SELL");
+  if (action === "refresh") void run(() => request("/api/kis/main/refresh", {}));
   if (action === "cancel-order") {
-    const orderId = actionElement.dataset.orderId;
-    void run(() => request(`/api/paper/orders/${encodeURIComponent(orderId)}/cancel`));
+    const cancelBody = {
+      clientOrderId: createClientOrderId("CANCEL"),
+      originalOrderNumber: actionElement.dataset.orderNumber,
+      orderOrganizationNumber: actionElement.dataset.orderOrganizationNumber,
+      quantity: Number(actionElement.dataset.cancelQuantity),
+      exchange: "KRX",
+      allQuantity: true,
+    };
+    const confirmed = window.confirm(`KIS 모의주문 ${cancelBody.originalOrderNumber}의 취소 가능 수량 ${cancelBody.quantity}주를 전부 취소할까요?`);
+    if (confirmed) void run(
+      () => request("/api/kis/paper/orders/cancel", cancelBody),
+      { recordRequest: { ...cancelBody, side: "CANCEL", type: "CANCEL" } },
+    );
   }
-  if (action === "reset") void run(() => request("/api/paper/reset"));
-  if (action === "auto") void run(() => request("/api/strategy/auto", { enabled: !snapshot.system.autoPaperTrading }));
-  if (action === "kill") void run(() => request("/api/system/kill-switch", { enabled: !snapshot.system.killSwitch }));
+  if (action === "kill") void run(() => request("/api/kis/paper/kill-switch", {
+    enabled: !snapshot.system.killSwitch,
+  }));
 });
 
 function connect() {
@@ -239,8 +320,23 @@ function connect() {
   };
 }
 
+function readStoredCommands() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(KIS_COMMANDS_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 30) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredCommands() {
+  try { localStorage.setItem(KIS_COMMANDS_KEY, JSON.stringify(kisCommands.slice(0, 30))); } catch {
+    // localStorage가 차단돼도 현재 세션 주문은 유지합니다.
+  }
+}
+
 const staticMode = new URLSearchParams(window.location.search).has("static");
-fetch("/api/snapshot")
+fetch("/api/snapshot", { headers: { Accept: "application/json" } })
   .then((response) => response.json())
   .then((data) => {
     snapshot = data;
