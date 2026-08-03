@@ -4,23 +4,21 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#070a11" />
-  <title>PulseHFT — 초단타 분석·모의매매</title>
+  <title>PulseHFT — KIS 초단타 분석·모의투자</title>
   <link rel="stylesheet" href="/styles.css" />
-  <link rel="stylesheet" href="/strategySettingsPanel.css" />
 </head>
 <body>
   <main id="app" class="loading-screen">
-    <div class="pulse-logo">P</div><h1>PulseHFT</h1><p>시장 데이터 엔진에 연결하는 중입니다.</p>
+    <div class="pulse-logo">P</div><h1>PulseHFT</h1><p>KIS 시장 데이터에 연결하는 중입니다.</p>
   </main>
   <script src="/snapshotInteractionGuard.js"></script>
   <script type="module" src="/app.js"></script>
-  <script type="module" src="/strategySettingsPanel.js"></script>
   <script type="module" src="/instrumentSearch.js"></script>
   <script type="module" src="/recommendationPanel.js"></script>
   <script type="module">
     const params = new URLSearchParams(window.location.search);
     if (!params.has("noRecommendationTabs")) {
-      await import("/recommendationTabs.js?v=6");
+      await import("/recommendationTabs.js?v=7");
     }
   </script>
 </body>
