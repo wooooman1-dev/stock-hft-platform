@@ -167,7 +167,7 @@ jobs:
           test -s browser-targets.json
 
           node <<'NODE'
-          const fs = require('node:fs');
+          const fs = await import('node:fs');
 
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           const targets = await fetch('http://127.0.0.1:9222/json/list').then((response) => response.json());
