@@ -1,0 +1,144 @@
+name: Browser Smoke
+
+on:
+  push:
+    branches:
+      - feat/recommendation-tabs
+  pull_request:
+    branches:
+      - feat/realtime-record-replay
+
+permissions:
+  contents: read
+
+jobs:
+  browser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run repository checks
+        run: npm run check
+
+      - name: Start PulseHFT
+        shell: bash
+        run: |
+          npm start > server.log 2>&1 &
+          echo $! > server.pid
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:8787/health > health.json; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          cat server.log
+          exit 1
+
+      - name: Render pages in real Chrome
+        shell: bash
+        run: |
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"
+          test -n "$CHROME"
+          echo "Chrome=$CHROME"
+
+          "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-main \
+            --virtual-time-budget=8000 \
+            --dump-dom \
+            'http://127.0.0.1:8787/?ci=main' \
+            > browser-main.html 2> browser-main.log
+
+          "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-main-shot \
+            --virtual-time-budget=8000 \
+            --window-size=1600,1000 \
+            --screenshot=browser-main.png \
+            'http://127.0.0.1:8787/?ci=main' \
+            2>> browser-main.log
+
+          "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-isolated \
+            --virtual-time-budget=8000 \
+            --dump-dom \
+            'http://127.0.0.1:8787/?noRecommendationTabs=1&ci=isolated' \
+            > browser-isolated.html 2> browser-isolated.log
+
+          "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-isolated-shot \
+            --virtual-time-budget=8000 \
+            --window-size=1600,1000 \
+            --screenshot=browser-isolated.png \
+            'http://127.0.0.1:8787/?noRecommendationTabs=1&ci=isolated' \
+            2>> browser-isolated.log
+
+      - name: Assert rendered DOM
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function verify(path, { expectTabs }) {
+            const html = fs.readFileSync(path, 'utf8');
+            const checks = {
+              bytes: Buffer.byteLength(html),
+              appShell: /id="app" class="app-shell"/.test(html),
+              topbar: /class="topbar"/.test(html),
+              instrument: /class="instrument"/.test(html),
+              loadingScreen: /id="app" class="loading-screen"/.test(html),
+              runtimeError: /data-pulsehft-runtime-error/.test(html),
+              tabs: /recommendation-workspace-tabs/.test(html),
+            };
+            console.log(path, checks);
+            if (!checks.appShell) throw new Error(`${path}: app-shell was not rendered`);
+            if (!checks.topbar) throw new Error(`${path}: topbar was not rendered`);
+            if (!checks.instrument) throw new Error(`${path}: instrument was not rendered`);
+            if (checks.loadingScreen) throw new Error(`${path}: loading screen remained active`);
+            if (checks.runtimeError) throw new Error(`${path}: runtime diagnostic reported a failure`);
+            if (checks.tabs !== expectTabs) {
+              throw new Error(`${path}: tabs=${checks.tabs}, expected ${expectTabs}`);
+            }
+          }
+
+          verify('browser-main.html', { expectTabs: true });
+          verify('browser-isolated.html', { expectTabs: false });
+          NODE
+
+      - name: Upload browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsehft-browser-smoke
+          path: |
+            health.json
+            server.log
+            browser-main.html
+            browser-main.log
+            browser-main.png
+            browser-isolated.html
+            browser-isolated.log
+            browser-isolated.png
+          if-no-files-found: warn
