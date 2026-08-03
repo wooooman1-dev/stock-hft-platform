@@ -90,6 +90,7 @@ function orderRequest(side) {
 }
 
 function commandStatusLabel(status) {
+  if (status === "PENDING") return "전송 중";
   if (status === "ACCEPTED") return "접수·체결 미확인";
   if (status === "UNKNOWN_RESULT") return "결과 불명";
   if (status === "REJECTED") return "거절";
@@ -101,18 +102,30 @@ function commandRow(command) {
   const responseValue = command.response ?? {};
   const brokerResult = responseValue.result ?? {};
   const status = responseValue.status ?? "ERROR";
-  const sideClass = requestValue.side === "BUY" ? "positive-text" : "negative-text";
+  const operation = String(command.operation ?? responseValue.operation ?? "SUBMIT").toUpperCase();
+  const side = String(requestValue.side ?? "").toUpperCase();
+  const quantityValue = Number(requestValue.quantity) || 0;
+  const actionText = operation === "CANCEL"
+    ? `취소 ${quantityValue}주`
+    : operation === "REVISE"
+      ? `정정 ${quantityValue}주`
+      : `${side === "BUY" ? "매수" : "매도"} ${quantityValue}주`;
+  const sideClass = operation === "SUBMIT"
+    ? side === "BUY" ? "positive-text" : "negative-text"
+    : "";
   const statusClass = status === "ACCEPTED" ? "status-ok" : "status-error";
-  const orderNumber = brokerResult.orderNumber ?? "-";
-  const typeText = requestValue.type === "LIMIT"
-    ? `지정가 ${fmt(requestValue.limitPrice)}`
-    : "시장가";
-  const cancelable = findCancelableOrder(brokerResult);
+  const orderNumber = brokerResult.orderNumber ?? requestValue.originalOrderNumber ?? "-";
+  const typeText = operation === "CANCEL"
+    ? `원주문 ${requestValue.originalOrderNumber ?? "-"}`
+    : requestValue.type === "LIMIT"
+      ? `지정가 ${fmt(requestValue.limitPrice)}`
+      : "시장가";
+  const cancelable = operation === "SUBMIT" ? findCancelableOrder(brokerResult) : null;
   const control = cancelable
     ? `<button class="cancel-order-button" data-action="cancel-order" data-order-number="${escapeHtml(cancelable.orderNumber)}" data-order-organization-number="${escapeHtml(cancelable.orderOrganizationNumber)}" data-cancel-quantity="${Number(cancelable.cancelableQuantity) || 0}">취소</button>`
     : "-";
   return `<div class="order-row" title="${escapeHtml(responseValue.error?.message ?? "ACCEPTED는 실제 체결 완료를 의미하지 않습니다.")}">
-    <span class="${sideClass}">${requestValue.side === "BUY" ? "매수" : "매도"} ${Number(requestValue.quantity) || 0}주</span>
+    <span class="${sideClass}">${actionText}</span>
     <span>${typeText}</span>
     <span>${escapeHtml(orderNumber)} · 체결 미확인</span>
     <span class="${statusClass}">${commandStatusLabel(status)}</span>
@@ -203,8 +216,8 @@ function render() {
           <label>지정 가격<input id="limit-price" type="number" min="1" step="${snapshot.tickSize}" value="${limitPrice}" ${limitDisabled}></label>
           <div class="order-buttons"><button class="buy-button" data-action="buy" ${disabled}>KIS 모의 매수</button><button class="sell-button" data-action="sell" ${disabled}>KIS 모의 매도</button></div>
         </div>
-        <div class="execution-note">주문 전 최종 확인을 거칩니다. ACCEPTED는 증권사 주문 접수이며 실제 체결 완료를 뜻하지 않습니다.${accountNote}</div>
-        <div class="orders-list"><div class="table-head"><span>주문</span><span>유형·가격</span><span>주문번호·체결</span><span>상태</span><span>제어</span></div>${kisCommands.slice(0, 10).map(commandRow).join("") || '<div class="empty-list">이 브라우저에서 전송한 KIS 주문 명령이 없습니다.</div>'}</div>
+        <div class="execution-note">주문 전 최종 확인을 거칩니다. 목록은 서버 실행 저널 기준 최근 KIS 주문 명령입니다. ACCEPTED는 증권사 주문 접수이며 실제 체결 완료를 뜻하지 않습니다.${accountNote}</div>
+        <div class="orders-list"><div class="table-head"><span>주문</span><span>유형·가격</span><span>주문번호·체결</span><span>상태</span><span>제어</span></div>${kisCommands.slice(0, 10).map(commandRow).join("") || '<div class="empty-list">실행 저널에 저장된 KIS 주문 명령이 없습니다.</div>'}</div>
       </div>
       <div class="system-panel"><div class="panel-title-row"><div><span class="eyebrow">KIS RISK & EXECUTION</span><h3>모의투자 주문 제어</h3></div></div><div class="execution-model"><span>주문 경계</span><strong>KIS PAPER · MANUAL ONLY</strong><small>실전주문 비활성 · 자동전략 미연결 · clientOrderId 멱등성</small></div><div class="control-row"><div><strong>자동주문</strong><span>내부 자동전략과 매수추천 자동주문은 연결되어 있지 않습니다.</span></div><button class="toggle" disabled><span></span></button></div><div class="control-row danger-row"><div><strong>킬 스위치</strong><span>KIS 모의계좌 신규·정정 주문 즉시 차단</span></div><button class="toggle danger ${snapshot.system.killSwitch ? "on" : ""}" data-action="kill" ${busy || !paperAvailable ? "disabled" : ""}><span></span></button></div><div class="risk-list"><div><span>1회 최대</span><strong>${fmt(snapshot.riskLimits.maxOrderQuantity)}주</strong></div><div><span>최대 주문금액</span><strong>${fmt(snapshot.riskLimits.maxOrderValue / 10000)}만원</strong></div><div><span>일일 주문</span><strong>${fmt(snapshot.riskLimits.maxDailyOrders)}건</strong></div><div><span>일일 손실 제한</span><strong>-${fmt(snapshot.riskLimits.maxDailyLoss / 10000)}만원</strong></div><div><span>취소 가능 주문</span><strong>${fmt(account.openOrderCount)}건</strong></div><div><span>매도 예약</span><strong>${fmt(account.reservedSellQuantity)}주</strong></div></div></div>
     </section><footer><span>시세·호가·체결은 KIS 실전계좌 읽기 전용 데이터입니다.</span><span>잔고와 주문은 KIS 모의투자이며 자동주문과 실전주문은 연결하지 않습니다.</span></footer>`;
@@ -220,6 +233,22 @@ function render() {
   }
 }
 
+function upsertCommand(command) {
+  const commandId = String(command?.id ?? command?.request?.clientOrderId ?? "");
+  kisCommands = [
+    { ...command, id: commandId },
+    ...kisCommands.filter((item) => String(item?.id ?? item?.request?.clientOrderId ?? "") !== commandId),
+  ].slice(0, 30);
+  writeStoredCommands();
+}
+
+function syncCommandsFromSnapshot(value) {
+  const commands = value?.account?.commands;
+  if (!Array.isArray(commands)) return;
+  kisCommands = commands.slice(0, 30).map((command) => structuredClone(command));
+  writeStoredCommands();
+}
+
 async function run(action, { recordRequest = null } = {}) {
   try {
     busy = true;
@@ -227,14 +256,13 @@ async function run(action, { recordRequest = null } = {}) {
     render();
     const result = await action();
     if (recordRequest) {
-      kisCommands.unshift({
+      upsertCommand({
         id: recordRequest.clientOrderId,
         at: Date.now(),
+        operation: result?.operation ?? (recordRequest.type === "CANCEL" ? "CANCEL" : "SUBMIT"),
         request: structuredClone(recordRequest),
         response: structuredClone(result),
       });
-      kisCommands = kisCommands.slice(0, 30);
-      writeStoredCommands();
     }
     if (result?.status === "REJECTED") message = `주문 거절: ${result.error?.message ?? "증권사 거절"}`;
     else if (result?.status === "UNKNOWN_RESULT") message = "주문 결과가 불명확합니다. 킬 스위치가 활성화됐는지 확인하세요.";
@@ -312,6 +340,7 @@ function connect() {
   events.addEventListener("snapshot", (event) => {
     connection = "connected";
     snapshot = JSON.parse(event.data);
+    syncCommandsFromSnapshot(snapshot);
     render();
   });
   events.onerror = () => {
@@ -340,6 +369,7 @@ fetch("/api/snapshot", { headers: { Accept: "application/json" } })
   .then((response) => response.json())
   .then((data) => {
     snapshot = data;
+    syncCommandsFromSnapshot(snapshot);
     connection = staticMode ? "connected" : connection;
     render();
     if (!staticMode) connect();
