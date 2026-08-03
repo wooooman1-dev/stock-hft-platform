@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
@@ -450,7 +450,7 @@ async function main() {
     process.env.PULSEHFT_VERIFY_REPORT_PATH
       ?? ".pulsehft/kis-paper-roundtrip-latest.json",
   );
-  mkdirSync(resolve(reportPath, ".."), { recursive: true });
+  mkdirSync(dirname(reportPath), { recursive: true });
   writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   console.log(JSON.stringify(report, null, 2));
   console.log(`REPORT=${reportPath}`);
