@@ -111,6 +111,7 @@ export class KisMainWorkspace extends EventEmitter {
       paperEnabled: Boolean(this.paperService),
       accountError: this.accountError,
     });
+    account.commands = mapPaperCommands(this.paperService);
     const paperStatus = this.paperService?.status?.() ?? {
       killSwitch: false,
       unknownResult: false,
@@ -448,6 +449,28 @@ function mapPaperAccount({ balance, symbol, cancelableOrders, paperEnabled, acco
     positions: structuredClone(positions),
     fetchedAt: balance?.fetchedAt ?? null,
   };
+}
+
+function mapPaperCommands(service, limit = 30) {
+  const states = service?.commands instanceof Map ? [...service.commands.values()] : [];
+  return states
+    .sort((left, right) => (Number(right?.timestamp) || 0) - (Number(left?.timestamp) || 0))
+    .slice(0, limit)
+    .map((state) => ({
+      id: String(state?.clientOrderId ?? state?.commandId ?? ""),
+      at: finiteNumberOr(state?.timestamp, null),
+      operation: String(state?.operation ?? "SUBMIT"),
+      request: structuredClone(state?.request ?? {}),
+      response: state?.result
+        ? structuredClone(state.result)
+        : {
+          clientOrderId: state?.clientOrderId ?? null,
+          operation: state?.operation ?? null,
+          status: state?.state === "PENDING" ? "PENDING" : "ERROR",
+          replayed: false,
+          ...(state?.error ? { error: structuredClone(state.error) } : {}),
+        },
+    }));
 }
 
 function normalizeSelection(input, selectedAt) {
