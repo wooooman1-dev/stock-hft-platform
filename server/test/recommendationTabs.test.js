@@ -10,7 +10,13 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
-  assert.match(indexSource, /recommendationTabs\.js\?v=2/);
+  assert.match(indexSource, /recommendationTabs\.js\?v=3/);
+});
+
+test("recommendation workspace provides an isolation mode without the tab adapter", () => {
+  assert.match(indexSource, /noRecommendationTabs/);
+  assert.match(indexSource, /if \(!params\.has\("noRecommendationTabs"\)\)/);
+  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=3"\)/);
 });
 
 test("recommendation workspace converts the modal into persistent tabs", () => {
