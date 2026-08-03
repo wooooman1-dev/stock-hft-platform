@@ -11,9 +11,8 @@ style.textContent = String.raw`
 .recommendation-tab-ready{width:6px;height:6px;border-radius:50%;background:#52657a}
 .recommendation-tab-ready.live{background:#4ee5ba;box-shadow:0 0 10px rgba(78,229,186,.75)}
 body.recommendation-open{overflow:auto!important}
-body.recommendation-view-active #app> :not(.topbar){display:none!important}
-body.recommendation-view-active #app{padding-bottom:0}
-body.recommendation-view-active #app.loading-screen{display:block;min-height:0}
+body.recommendation-view-active #app.app-shell> :not(.topbar){display:none!important}
+body.recommendation-view-active #app.app-shell{padding-bottom:0}
 .recommendation-backdrop{position:static!important;inset:auto!important;z-index:auto!important;width:auto!important;max-width:1880px;margin:0 auto!important;padding:12px 24px 24px!important;background:transparent!important;backdrop-filter:none!important;overflow:visible!important}
 body:not(.recommendation-view-active) .recommendation-backdrop{display:none!important}
 .recommendation-panel{width:100%!important;max-width:none!important;margin:0!important;box-shadow:0 24px 70px rgba(0,0,0,.38)!important}
@@ -28,9 +27,12 @@ const VIEW_MAIN = "MAIN";
 const VIEW_RECOMMENDATIONS = "RECOMMENDATIONS";
 const FILTERS = new Set(["ALL", "PULLBACK", "REVERSAL", "BLOCKED"]);
 
-let activeView = readStorage(VIEW_KEY) === VIEW_RECOMMENDATIONS
+const storedView = readStorage(VIEW_KEY);
+let pendingInitialView = storedView === VIEW_RECOMMENDATIONS
   ? VIEW_RECOMMENDATIONS
   : VIEW_MAIN;
+let activeView = VIEW_MAIN;
+let initialViewRestored = false;
 let mainScrollY = 0;
 let recommendationScrollY = 0;
 let tableScrollLeft = 0;
@@ -43,9 +45,26 @@ let selectingSymbol = null;
 const app = document.querySelector("#app");
 const overlay = document.querySelector(".recommendation-backdrop");
 
+function isWorkspaceReady() {
+  return Boolean(
+    app?.classList.contains("app-shell")
+    && app.querySelector(".topbar .top-status"),
+  );
+}
+
+function applyViewClass() {
+  document.body.classList.toggle(
+    "recommendation-view-active",
+    isWorkspaceReady() && activeView === VIEW_RECOMMENDATIONS,
+  );
+}
+
 function ensureTabs() {
   const topStatus = document.querySelector("#app .top-status");
-  if (!topStatus) return;
+  if (!topStatus) {
+    document.body.classList.remove("recommendation-view-active");
+    return;
+  }
   let tabs = topStatus.querySelector(".recommendation-workspace-tabs");
   if (!tabs) {
     tabs = document.createElement("div");
@@ -57,12 +76,17 @@ function ensureTabs() {
       <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="recommendations"><i class="recommendation-tab-ready"></i>매수추천 <span class="recommendation-tab-count">0</span></button>`;
     topStatus.insertBefore(tabs, topStatus.firstChild);
   }
+  if (!initialViewRestored) {
+    initialViewRestored = true;
+    activeView = pendingInitialView;
+  }
+  applyViewClass();
   syncTabs();
   ensureLegacyOpen();
 }
 
 function ensureLegacyOpen() {
-  if (!overlay || !overlay.hidden) return;
+  if (!isWorkspaceReady() || !overlay || !overlay.hidden) return;
   const trigger = document.querySelector(".recommendation-trigger");
   if (!trigger) return;
   trigger.click();
@@ -73,14 +97,17 @@ function setActiveView(nextView, { restoreScroll = true } = {}) {
   const normalized = nextView === VIEW_RECOMMENDATIONS
     ? VIEW_RECOMMENDATIONS
     : VIEW_MAIN;
+  pendingInitialView = normalized;
+  if (!isWorkspaceReady()) {
+    activeView = VIEW_MAIN;
+    document.body.classList.remove("recommendation-view-active");
+    return;
+  }
   if (activeView === VIEW_RECOMMENDATIONS) recommendationScrollY = window.scrollY;
   else mainScrollY = window.scrollY;
   activeView = normalized;
   writeStorage(VIEW_KEY, activeView);
-  document.body.classList.toggle(
-    "recommendation-view-active",
-    activeView === VIEW_RECOMMENDATIONS,
-  );
+  applyViewClass();
   syncTabs();
   ensureLegacyOpen();
   if (restoreScroll) {
@@ -261,9 +288,8 @@ if (overlay) {
 document.addEventListener("click", handleClick, true);
 document.addEventListener("keydown", handleKeydown, true);
 
-setActiveView(activeView, { restoreScroll: false });
+document.body.classList.remove("recommendation-view-active");
 ensureTabs();
-ensureLegacyOpen();
 normalizePanelSemantics();
 void refreshTabStatus();
 const statusTimer = setInterval(() => void refreshTabStatus(), 15_000);
