@@ -27,12 +27,19 @@ const VIEW_MAIN = "MAIN";
 const VIEW_RECOMMENDATIONS = "RECOMMENDATIONS";
 const FILTERS = new Set(["ALL", "PULLBACK", "REVERSAL", "BLOCKED"]);
 
+const app = document.querySelector("#app");
 const storedView = readStorage(VIEW_KEY);
 let pendingInitialView = storedView === VIEW_RECOMMENDATIONS
   ? VIEW_RECOMMENDATIONS
   : VIEW_MAIN;
 let activeView = VIEW_MAIN;
 let initialViewRestored = false;
+let ensureTabsScheduled = false;
+let panelOpenTimer = null;
+let panelOpenAttempts = 0;
+let observedPanel = null;
+let observedOverlay = null;
+let panelObserver = null;
 let mainScrollY = 0;
 let recommendationScrollY = 0;
 let tableScrollLeft = 0;
@@ -42,8 +49,9 @@ let candidateCount = 0;
 let entryReadyCount = 0;
 let selectingSymbol = null;
 
-const app = document.querySelector("#app");
-const overlay = document.querySelector(".recommendation-backdrop");
+function getOverlay() {
+  return document.querySelector(".recommendation-backdrop");
+}
 
 function isWorkspaceReady() {
   return Boolean(
@@ -52,19 +60,36 @@ function isWorkspaceReady() {
   );
 }
 
+function isRecommendationPanelOpen() {
+  const overlay = getOverlay();
+  return Boolean(overlay && !overlay.hidden);
+}
+
 function applyViewClass() {
   document.body.classList.toggle(
     "recommendation-view-active",
-    isWorkspaceReady() && activeView === VIEW_RECOMMENDATIONS,
+    isWorkspaceReady()
+      && activeView === VIEW_RECOMMENDATIONS
+      && isRecommendationPanelOpen(),
   );
 }
 
+function scheduleEnsureTabs() {
+  if (ensureTabsScheduled) return;
+  ensureTabsScheduled = true;
+  requestAnimationFrame(() => {
+    ensureTabsScheduled = false;
+    ensureTabs();
+  });
+}
+
 function ensureTabs() {
-  const topStatus = document.querySelector("#app .top-status");
+  const topStatus = app?.querySelector(".topbar .top-status");
   if (!topStatus) {
     document.body.classList.remove("recommendation-view-active");
     return;
   }
+
   let tabs = topStatus.querySelector(".recommendation-workspace-tabs");
   if (!tabs) {
     tabs = document.createElement("div");
@@ -76,21 +101,79 @@ function ensureTabs() {
       <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="recommendations"><i class="recommendation-tab-ready"></i>매수추천 <span class="recommendation-tab-count">0</span></button>`;
     topStatus.insertBefore(tabs, topStatus.firstChild);
   }
+
+  bindPanelObserver();
+
   if (!initialViewRestored) {
     initialViewRestored = true;
     activeView = pendingInitialView;
+    if (activeView === VIEW_RECOMMENDATIONS) schedulePanelOpen();
   }
+
   applyViewClass();
   syncTabs();
-  ensureLegacyOpen();
 }
 
-function ensureLegacyOpen() {
-  if (!isWorkspaceReady() || !overlay || !overlay.hidden) return;
-  const trigger = document.querySelector(".recommendation-trigger");
-  if (!trigger) return;
-  trigger.click();
+function bindPanelObserver() {
+  const overlay = getOverlay();
+  const panel = overlay?.querySelector(".recommendation-panel");
+  if (!overlay || !panel) return;
+
+  if (observedOverlay !== overlay) {
+    observedOverlay?.removeEventListener("scroll", captureTableScroll, true);
+    overlay.addEventListener("scroll", captureTableScroll, true);
+    observedOverlay = overlay;
+  }
+
+  if (observedPanel === panel) return;
+  panelObserver?.disconnect();
+  observedPanel = panel;
+  panelObserver = new MutationObserver(() => normalizePanelSemantics());
+  panelObserver.observe(panel, { childList: true });
   normalizePanelSemantics();
+}
+
+function openRecommendationPanel() {
+  if (!isWorkspaceReady()) return false;
+  const overlay = getOverlay();
+  if (!overlay) return false;
+
+  if (overlay.hidden) {
+    const trigger = app?.querySelector(".recommendation-trigger");
+    if (!trigger) return false;
+    trigger.click();
+  }
+
+  bindPanelObserver();
+  normalizePanelSemantics();
+  applyViewClass();
+  return !overlay.hidden;
+}
+
+function schedulePanelOpen() {
+  clearTimeout(panelOpenTimer);
+  panelOpenAttempts = 0;
+
+  const attempt = () => {
+    if (activeView !== VIEW_RECOMMENDATIONS) return;
+    if (openRecommendationPanel()) {
+      panelOpenTimer = null;
+      panelOpenAttempts = 0;
+      return;
+    }
+    panelOpenAttempts += 1;
+    if (panelOpenAttempts >= 40) {
+      activeView = VIEW_MAIN;
+      pendingInitialView = VIEW_MAIN;
+      writeStorage(VIEW_KEY, VIEW_MAIN);
+      applyViewClass();
+      syncTabs();
+      return;
+    }
+    panelOpenTimer = setTimeout(attempt, 50);
+  };
+
+  attempt();
 }
 
 function setActiveView(nextView, { restoreScroll = true } = {}) {
@@ -98,18 +181,29 @@ function setActiveView(nextView, { restoreScroll = true } = {}) {
     ? VIEW_RECOMMENDATIONS
     : VIEW_MAIN;
   pendingInitialView = normalized;
+
   if (!isWorkspaceReady()) {
     activeView = VIEW_MAIN;
     document.body.classList.remove("recommendation-view-active");
     return;
   }
+
   if (activeView === VIEW_RECOMMENDATIONS) recommendationScrollY = window.scrollY;
   else mainScrollY = window.scrollY;
+
   activeView = normalized;
   writeStorage(VIEW_KEY, activeView);
-  applyViewClass();
+
+  if (activeView === VIEW_RECOMMENDATIONS) {
+    schedulePanelOpen();
+  } else {
+    clearTimeout(panelOpenTimer);
+    panelOpenTimer = null;
+    applyViewClass();
+  }
+
   syncTabs();
-  ensureLegacyOpen();
+
   if (restoreScroll) {
     const targetY = activeView === VIEW_RECOMMENDATIONS
       ? recommendationScrollY
@@ -119,7 +213,7 @@ function setActiveView(nextView, { restoreScroll = true } = {}) {
 }
 
 function syncTabs() {
-  for (const tab of document.querySelectorAll("[data-recommendation-tab]")) {
+  for (const tab of app?.querySelectorAll("[data-recommendation-tab]") ?? []) {
     const recommendationTab = tab.dataset.recommendationTab === "recommendations";
     const selected = recommendationTab
       ? activeView === VIEW_RECOMMENDATIONS
@@ -155,7 +249,7 @@ async function refreshTabStatus() {
 }
 
 function normalizePanelSemantics() {
-  const panel = overlay?.querySelector(".recommendation-panel");
+  const panel = getOverlay()?.querySelector(".recommendation-panel");
   if (!panel) return;
   panel.setAttribute("role", "region");
   panel.setAttribute("aria-label", "매수추천 리스트");
@@ -165,14 +259,14 @@ function normalizePanelSemantics() {
 }
 
 function captureTableScroll() {
-  const wrap = overlay?.querySelector(".recommendation-table-wrap");
+  const wrap = getOverlay()?.querySelector(".recommendation-table-wrap");
   if (!wrap) return;
   tableScrollLeft = wrap.scrollLeft;
   tableScrollTop = wrap.scrollTop;
 }
 
 function restoreTableScroll() {
-  const wrap = overlay?.querySelector(".recommendation-table-wrap");
+  const wrap = getOverlay()?.querySelector(".recommendation-table-wrap");
   if (!wrap) return;
   wrap.scrollLeft = tableScrollLeft;
   wrap.scrollTop = tableScrollTop;
@@ -185,7 +279,9 @@ function restoreFilter() {
     filterRestored = true;
     return;
   }
-  const button = overlay?.querySelector(`[data-recommendation-action="filter"][data-filter="${stored}"]`);
+  const button = getOverlay()?.querySelector(
+    `[data-recommendation-action="filter"][data-filter="${stored}"]`,
+  );
   if (!button) return;
   filterRestored = true;
   button.click();
@@ -243,6 +339,8 @@ function handleClick(event) {
     });
     return;
   }
+
+  const overlay = getOverlay();
   if (event.target === overlay) {
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -276,21 +374,17 @@ function writeStorage(key, value) {
 }
 
 if (app) {
-  new MutationObserver(ensureTabs).observe(app, { childList: true, subtree: true });
-}
-if (overlay) {
-  overlay.addEventListener("scroll", captureTableScroll, true);
-  new MutationObserver(normalizePanelSemantics).observe(overlay, {
-    childList: true,
-    subtree: true,
-  });
+  new MutationObserver(scheduleEnsureTabs).observe(app, { childList: true });
 }
 document.addEventListener("click", handleClick, true);
 document.addEventListener("keydown", handleKeydown, true);
 
 document.body.classList.remove("recommendation-view-active");
-ensureTabs();
-normalizePanelSemantics();
+scheduleEnsureTabs();
 void refreshTabStatus();
 const statusTimer = setInterval(() => void refreshTabStatus(), 15_000);
-window.addEventListener("beforeunload", () => clearInterval(statusTimer));
+window.addEventListener("beforeunload", () => {
+  clearInterval(statusTimer);
+  clearTimeout(panelOpenTimer);
+  panelObserver?.disconnect();
+});
