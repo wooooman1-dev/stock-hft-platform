@@ -11,6 +11,7 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
+  assert.match(indexSource, /app\.js\?v=2/);
   assert.match(indexSource, /recommendationTabs\.js\?v=7/);
 });
 
@@ -60,4 +61,12 @@ test("main dashboard uses KIS values and KIS paper order APIs", () => {
   assert.match(appSource, /ACCEPTED는 증권사 주문 접수/);
   assert.doesNotMatch(appSource, /request\("\/api\/paper\/orders/);
   assert.doesNotMatch(appSource, /data-action="auto"/);
+});
+
+test("main order list restores server journal commands instead of browser-only history", () => {
+  assert.match(appSource, /syncCommandsFromSnapshot/);
+  assert.match(appSource, /value\?\.account\?\.commands/);
+  assert.match(appSource, /서버 실행 저널 기준 최근 KIS 주문 명령/);
+  assert.match(appSource, /실행 저널에 저장된 KIS 주문 명령이 없습니다/);
+  assert.doesNotMatch(appSource, /이 브라우저에서 전송한 KIS 주문 명령이 없습니다/);
 });
