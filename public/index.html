@@ -17,6 +17,11 @@
   <script type="module" src="/strategySettingsPanel.js"></script>
   <script type="module" src="/instrumentSearch.js"></script>
   <script type="module" src="/recommendationPanel.js"></script>
-  <script type="module" src="/recommendationTabs.js?v=2"></script>
+  <script type="module">
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("noRecommendationTabs")) {
+      await import("/recommendationTabs.js?v=3");
+    }
+  </script>
 </body>
 </html>
