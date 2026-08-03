@@ -4,6 +4,7 @@ import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ExecutionJournal } from "./domain/executionJournal.js";
 import { InstrumentCatalog } from "./domain/instrumentCatalog.js";
+import { KisMainWorkspace } from "./domain/kisMainWorkspace.js";
 import { RecommendationScanner } from "./domain/recommendationScanner.js";
 import { loadRecommendationSettings } from "./domain/recommendationSettings.js";
 import { createRealtimeResearchJournal } from "./domain/realtimeResearchJournal.js";
@@ -16,6 +17,8 @@ import {
 } from "./integrations/kis/kisConfig.js";
 import { KisProdReadOnlyClient } from "./integrations/kis/kisProdReadOnlyClient.js";
 import { KisRecommendationResearchDataClient } from "./integrations/kis/kisRecommendationResearchDataClient.js";
+import { KisRealtimeMarketDataClient } from "./integrations/kis/kisRealtimeMarketDataClient.js";
+import { KisRealtimeSubscriptionCoordinator } from "./integrations/kis/kisRealtimeSubscriptionCoordinator.js";
 import { createNaverApiHubClientFromEnv } from "./integrations/naver/naverApiHubClient.js";
 import { createOpenDartClientFromEnv } from "./integrations/opendart/openDartClient.js";
 import {
@@ -48,6 +51,7 @@ const defaultInstrument = {
   quoteFetchedAt: null,
   selectedAt: null,
 };
+
 const strategySettingsStore = new StrategySettingsStore(join(dataDir, "strategy-settings.json"));
 const strategySettings = strategySettingsStore.load();
 const executionJournal = new ExecutionJournal(join(dataDir, "execution-journal.jsonl"));
@@ -63,6 +67,7 @@ const kisClient = kisConfiguration.enabled
   ? new KisProdReadOnlyClient({ config: kisConfiguration, tokenStore: kisTokenStore })
   : null;
 if (kisClient) kisClient.status();
+
 const recommendationSettings = loadRecommendationSettings(process.env);
 const recommendationDataClient = kisClient
   ? new KisRecommendationResearchDataClient({
@@ -71,6 +76,26 @@ const recommendationDataClient = kisClient
     minimumIntervalMs: recommendationSettings.requestSpacingMs,
   })
   : null;
+
+const sharedRealtimeClient = kisConfiguration.enabled
+  && typeof globalThis.WebSocket === "function"
+  ? new KisRealtimeMarketDataClient({
+    config: kisConfiguration,
+    maxSymbols: Math.max(2, Math.min(20, recommendationSettings.maxEnriched + 1)),
+  })
+  : null;
+const realtimeCoordinator = sharedRealtimeClient
+  ? new KisRealtimeSubscriptionCoordinator(sharedRealtimeClient)
+  : null;
+const recommendationRealtimeClient = realtimeCoordinator?.createView(
+  "recommendations",
+  { priority: 10 },
+) ?? null;
+const mainRealtimeClient = realtimeCoordinator?.createView(
+  "main-workspace",
+  { priority: 100 },
+) ?? null;
+
 const realtimeResearchJournal = createRealtimeResearchJournal({
   dataDir,
   enabled: recommendationDataClient ? undefined : false,
@@ -83,6 +108,7 @@ const recommendationScanner = new RecommendationScanner({
   dataClient: recommendationDataClient,
   disclosureClient: openDartClient,
   socialClient: naverApiHubClient,
+  realtimeClient: recommendationRealtimeClient,
   researchJournal: realtimeResearchJournal,
   settings: recommendationSettings,
 });
@@ -106,6 +132,8 @@ if (kisPaperClient) kisPaperClient.status();
 
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
+
+// 내부 시뮬레이터는 검증 API와 회귀 테스트를 위해 보존하지만 사용자 메인 화면에는 연결하지 않습니다.
 const runtime = new MarketRuntime(
   selectedInstrument.symbol,
   selectedInstrument.symbolName,
@@ -123,6 +151,7 @@ const runtime = new MarketRuntime(
     instrumentSelectedAt: selectedInstrument.selectedAt,
   },
 );
+
 const kisPaperOrderService = kisPaperClient
   ? new KisPaperOrderService({
     client: kisPaperClient,
@@ -132,18 +161,32 @@ const kisPaperOrderService = kisPaperClient
   })
   : null;
 
-const startupSnapshot = runtime.snapshot();
+const mainWorkspace = new KisMainWorkspace({
+  selection: selectedInstrument,
+  quoteClient: kisClient,
+  marketDataClient: recommendationDataClient,
+  realtimeClient: mainRealtimeClient,
+  paperService: kisPaperOrderService,
+  paperClient: kisPaperClient,
+  paperLimits: kisPaperConfiguration.limits,
+  strategySettings,
+});
+mainWorkspace.start();
+
+const startupSnapshot = mainWorkspace.snapshot();
 executionJournal.append("SESSION_STARTED", {
-  mode: "SIMULATION",
+  mode: "KIS_MARKET_WITH_PAPER",
   symbol: startupSnapshot.symbol,
   symbolName: startupSnapshot.symbolName,
   processId: process.pid,
   kisMode: kisConfiguration.mode,
   kisQuoteEnabled: kisConfiguration.enabled,
+  kisRealtimeEnabled: Boolean(sharedRealtimeClient),
   kisPaperMode: kisPaperConfiguration.mode,
   kisPaperBalanceEnabled: Boolean(kisPaperClient),
   kisPaperOrderEnabled: Boolean(kisPaperOrderService),
   kisPaperAutomaticStrategyConnected: false,
+  internalSimulationConnectedToMainUi: false,
   instrumentSearchEnabled: true,
   recommendationScannerEnabled: Boolean(recommendationDataClient),
   recommendationDartEnabled: Boolean(openDartClient),
@@ -151,9 +194,8 @@ executionJournal.append("SESSION_STARTED", {
   recommendationResearchRecordingEnabled: realtimeResearchJournal.status().enabled,
   recommendationAutomaticOrderConnected: false,
 });
-const eventClients = new Set();
-runtime.start();
 
+const eventClients = new Set();
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -203,11 +245,15 @@ function serveStatic(pathname, response) {
 
 function getKisStatus() {
   return kisClient
-    ? kisClient.status()
+    ? {
+      ...kisClient.status(),
+      realtime: sharedRealtimeClient?.status?.() ?? null,
+    }
     : {
       ...publicKisConfiguration(kisConfiguration),
       token: { state: "MISSING", expiresAt: null },
       quoteApiAvailable: false,
+      realtime: null,
     };
 }
 
@@ -217,6 +263,8 @@ function getKisHealthStatus() {
     enabled: publicConfig.enabled,
     mode: publicConfig.mode,
     quoteApiAvailable: Boolean(kisClient),
+    realtimeApiAvailable: Boolean(sharedRealtimeClient),
+    realtimeConnected: sharedRealtimeClient?.status?.().connected ?? false,
     orderApiAvailable: false,
   };
 }
@@ -272,6 +320,11 @@ function requireKisPaperService(response) {
   return null;
 }
 
+function broadcastSnapshot(snapshot) {
+  const payload = `event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`;
+  for (const client of eventClients) client.write(payload);
+}
+
 const server = createServer(async (request, response) => {
   const url = new URL(
     request.url ?? "/",
@@ -281,8 +334,9 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, {
         status: "ok",
-        mode: "SIMULATION",
+        mode: "KIS_MARKET_WITH_PAPER",
         clients: eventClients.size,
+        main: mainWorkspace.snapshot().system,
         kis: getKisHealthStatus(),
         kisPaper: getKisPaperHealthStatus(),
         instruments: instrumentCatalog.status(),
@@ -290,7 +344,7 @@ const server = createServer(async (request, response) => {
       });
     }
     if (request.method === "GET" && url.pathname === "/api/snapshot") {
-      return json(response, 200, runtime.snapshot());
+      return json(response, 200, mainWorkspace.snapshot());
     }
     if (request.method === "GET" && url.pathname === "/api/events") {
       response.writeHead(200, {
@@ -299,7 +353,7 @@ const server = createServer(async (request, response) => {
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
       });
-      response.write(`event: snapshot\ndata: ${JSON.stringify(runtime.snapshot())}\n\n`);
+      response.write(`event: snapshot\ndata: ${JSON.stringify(mainWorkspace.snapshot())}\n\n`);
       eventClients.add(response);
       request.on("close", () => eventClients.delete(response));
       return;
@@ -313,7 +367,7 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/instruments/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
-      const selected = runtime.snapshot();
+      const selected = mainWorkspace.snapshot();
       return json(response, 200, {
         ...instrumentCatalog.status(),
         selected: {
@@ -340,19 +394,14 @@ const server = createServer(async (request, response) => {
         });
       }
       const searchResult = await instrumentCatalog.search(requestedSymbol, { limit: 20 });
-      const instrument = searchResult.results.find(
-        (item) => item.symbol === requestedSymbol,
-      );
+      const instrument = searchResult.results.find((item) => item.symbol === requestedSymbol);
       if (!instrument) {
         return json(response, 404, {
           error: "종목 마스터에서 요청한 종목을 찾을 수 없습니다.",
           code: "INSTRUMENT_NOT_FOUND",
         });
       }
-      const quote = await kisClient.getCurrentPrice({
-        symbol: instrument.symbol,
-        market: "UN",
-      });
+      const quote = await kisClient.getCurrentPrice({ symbol: instrument.symbol, market: "UN" });
       const currentPrice = Number(quote.currentPrice);
       const previousClose = Number(quote.basePrice);
       const tickSize = Number(quote.askUnit);
@@ -375,9 +424,10 @@ const server = createServer(async (request, response) => {
         priceSource: "KIS_PROD_READ_ONLY",
         quoteFetchedAt: quote.fetchedAt,
       };
-      const result = runtime.switchInstrument(selection, {
-        persist: (next) => selectedInstrumentStore.save(next),
-      });
+      // 내부 검증 런타임도 가능한 경우 동일 종목 메타데이터를 맞추되 메인 UI 데이터로 사용하지 않습니다.
+      try { runtime.switchInstrument(selection); } catch { /* 내부 검증 상태는 KIS 메인 전환을 차단하지 않습니다. */ }
+      const saved = selectedInstrumentStore.save(selection);
+      const result = await mainWorkspace.switchInstrument(saved);
       return json(response, 200, {
         changed: result.changed,
         selected: {
@@ -397,27 +447,13 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/recommendations") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
-      return json(
-        response,
-        200,
-        await recommendationScanner.get({ refreshIfStale: true }),
-      );
+      return json(response, 200, await recommendationScanner.get({ refreshIfStale: true }));
     }
-    if (
-      request.method === "POST"
-      && url.pathname === "/api/recommendations/refresh"
-    ) {
+    if (request.method === "POST" && url.pathname === "/api/recommendations/refresh") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
-      return json(
-        response,
-        200,
-        await recommendationScanner.refresh({ force: true }),
-      );
+      return json(response, 200, await recommendationScanner.refresh({ force: true }));
     }
-    if (
-      request.method === "GET"
-      && url.pathname === "/api/recommendations/research/status"
-    ) {
+    if (request.method === "GET" && url.pathname === "/api/recommendations/research/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       return json(response, 200, realtimeResearchJournal.status());
     }
@@ -438,6 +474,10 @@ const server = createServer(async (request, response) => {
         market: url.searchParams.get("market") ?? "UN",
       }));
     }
+    if (request.method === "POST" && url.pathname === "/api/kis/main/refresh") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, await mainWorkspace.refreshAll());
+    }
     if (request.method === "GET" && url.pathname === "/api/kis/paper/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       return json(response, 200, getKisPaperStatus());
@@ -452,30 +492,21 @@ const server = createServer(async (request, response) => {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
-      return json(response, 200, await service.submitOrder(await readJson(request)));
+      return json(response, 200, await mainWorkspace.submitOrder(await readJson(request)));
     }
-    if (
-      request.method === "POST"
-      && url.pathname === "/api/kis/paper/orders/revise"
-    ) {
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders/revise") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
-      return json(response, 200, await service.reviseOrder(await readJson(request)));
+      return json(response, 200, await mainWorkspace.reviseOrder(await readJson(request)));
     }
-    if (
-      request.method === "POST"
-      && url.pathname === "/api/kis/paper/orders/cancel"
-    ) {
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders/cancel") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
-      return json(response, 200, await service.cancelOrder(await readJson(request)));
+      return json(response, 200, await mainWorkspace.cancelOrder(await readJson(request)));
     }
-    if (
-      request.method === "POST"
-      && url.pathname === "/api/kis/paper/kill-switch"
-    ) {
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/kill-switch") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
@@ -484,7 +515,7 @@ const server = createServer(async (request, response) => {
         return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
       }
       if (body.enabled) runtime.setKillSwitch(true);
-      return json(response, 200, service.setKillSwitch(body.enabled));
+      return json(response, 200, mainWorkspace.setKillSwitch(body.enabled));
     }
     if (url.pathname === "/api/kis" || url.pathname.startsWith("/api/kis/")) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
@@ -493,30 +524,22 @@ const server = createServer(async (request, response) => {
         code: "KIS_ROUTE_NOT_FOUND",
       });
     }
+
+    // 아래 API는 사용자 메인 화면에 연결되지 않은 내부 시뮬레이터 검증용입니다.
     if (request.method === "GET" && url.pathname === "/api/strategy/settings") {
       return json(response, 200, runtime.getStrategySettings());
     }
     if (request.method === "PUT" && url.pathname === "/api/strategy/settings") {
       return json(response, 200, runtime.setStrategySettings(await readJson(request)));
     }
-    if (
-      request.method === "POST"
-      && url.pathname === "/api/strategy/settings/reset"
-    ) {
+    if (request.method === "POST" && url.pathname === "/api/strategy/settings/reset") {
       return json(response, 200, runtime.resetStrategySettings());
     }
-    if (
-      request.method === "POST"
-      && url.pathname === "/api/verification/market-tick"
-    ) {
+    if (request.method === "POST" && url.pathname === "/api/verification/market-tick") {
       if (!verificationApiEnabled || !isLoopbackAddress(request.socket.remoteAddress)) {
         return json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
       }
-      return json(
-        response,
-        200,
-        applyVerificationMarketTick(runtime, await readJson(request)),
-      );
+      return json(response, 200, applyVerificationMarketTick(runtime, await readJson(request)));
     }
     if (request.method === "POST" && url.pathname === "/api/paper/orders") {
       const body = await readJson(request);
@@ -533,16 +556,9 @@ const server = createServer(async (request, response) => {
       ? url.pathname.match(/^\/api\/paper\/orders\/([^/]+)\/cancel$/)
       : null;
     if (cancelMatch) {
-      return json(
-        response,
-        200,
-        runtime.cancelOrder(decodeURIComponent(cancelMatch[1])),
-      );
+      return json(response, 200, runtime.cancelOrder(decodeURIComponent(cancelMatch[1])));
     }
-    if (
-      request.method === "POST"
-      && url.pathname === "/api/system/kill-switch"
-    ) {
+    if (request.method === "POST" && url.pathname === "/api/system/kill-switch") {
       const body = await readJson(request);
       if (typeof body.enabled !== "boolean") {
         return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
@@ -574,10 +590,7 @@ const server = createServer(async (request, response) => {
   }
 });
 
-runtime.on("snapshot", (snapshot) => {
-  const payload = `event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`;
-  for (const client of eventClients) client.write(payload);
-});
+mainWorkspace.on("snapshot", broadcastSnapshot);
 
 const heartbeat = setInterval(() => {
   for (const client of eventClients) client.write(": heartbeat\n\n");
@@ -589,7 +602,9 @@ server.listen(port, "0.0.0.0", () => {
 
 function shutdown() {
   clearInterval(heartbeat);
+  mainWorkspace.stop();
   recommendationScanner.stop();
+  realtimeCoordinator?.stop();
   runtime.stop();
   for (const client of eventClients) client.end();
   server.close(() => process.exit(0));
