@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const tabsSource = readFileSync(new URL("../../public/recommendationTabs.js", import.meta.url), "utf8");
+const diagnosticSource = readFileSync(new URL("../../public/runtimeDiagnostic.js", import.meta.url), "utf8");
 const indexSource = readFileSync(new URL("../../public/index.html", import.meta.url), "utf8");
 
 test("recommendation workspace loads the tab adapter after the existing panel", () => {
@@ -13,10 +14,18 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   assert.match(indexSource, /recommendationTabs\.js\?v=3/);
 });
 
-test("recommendation workspace provides an isolation mode without the tab adapter", () => {
+test("recommendation workspace can be isolated without loading the tab adapter", () => {
   assert.match(indexSource, /noRecommendationTabs/);
-  assert.match(indexSource, /if \(!params\.has\("noRecommendationTabs"\)\)/);
   assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=3"\)/);
+});
+
+test("frontend runtime errors are exposed before application modules load", () => {
+  const diagnosticIndex = indexSource.indexOf('/runtimeDiagnostic.js?v=1');
+  const appIndex = indexSource.indexOf('/app.js');
+  assert.ok(diagnosticIndex >= 0);
+  assert.ok(appIndex > diagnosticIndex);
+  assert.match(diagnosticSource, /unhandledrejection/);
+  assert.match(diagnosticSource, /PulseHFT 브라우저 실행 오류/);
 });
 
 test("recommendation workspace converts the modal into persistent tabs", () => {
