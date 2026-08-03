@@ -72,6 +72,16 @@ if ([int]$replay.eventCount -le 0) {
   throw "재생할 이벤트가 없습니다."
 }
 
+$acceptedEventsAtStatus = [int64]$after.eventCount
+$queuedEventsAtStatus = [int64]$after.queuedEvents
+$flushedEventsAtStatus = $acceptedEventsAtStatus - $queuedEventsAtStatus
+if ($flushedEventsAtStatus -lt 0) {
+  throw "연구 기록 상태의 eventCount와 queuedEvents가 모순됩니다."
+}
+if ([int64]$replay.eventCount -lt $flushedEventsAtStatus) {
+  throw "상태 조회 시 이미 flush된 이벤트보다 재생된 이벤트가 적습니다. FlushedAtStatus=$flushedEventsAtStatus ReplayEvents=$($replay.eventCount)"
+}
+
 Write-Host "[5/5] 비밀정보 노출 여부 확인"
 $journalText = Get-Content -LiteralPath $filePath -Raw -Encoding utf8
 $forbidden = @(
@@ -91,4 +101,7 @@ foreach ($word in $forbidden) {
 }
 
 Write-Host "REALTIME RESEARCH VERIFICATION PASSED"
-Write-Host "File=$($after.fileName) Events=$($after.eventCount) Bytes=$($after.bytesWritten) ReplayEvents=$($replay.eventCount) Signals=$($replay.signals.Count)"
+Write-Host "File=$($after.fileName) AcceptedEvents=$acceptedEventsAtStatus QueuedAtStatus=$queuedEventsAtStatus FlushedAtStatus=$flushedEventsAtStatus Bytes=$($after.bytesWritten) ReplayEvents=$($replay.eventCount) Signals=$($replay.signals.Count)"
+if ([int64]$replay.eventCount -gt $flushedEventsAtStatus) {
+  Write-Host "ReplayEvents에는 상태 조회 후 추가로 flush된 실시간 이벤트가 포함되어 있습니다."
+}
