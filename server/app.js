@@ -6,6 +6,7 @@ import { ExecutionJournal } from "./domain/executionJournal.js";
 import { InstrumentCatalog } from "./domain/instrumentCatalog.js";
 import { RecommendationScanner } from "./domain/recommendationScanner.js";
 import { loadRecommendationSettings } from "./domain/recommendationSettings.js";
+import { createRealtimeResearchJournal } from "./domain/realtimeResearchJournal.js";
 import { MarketRuntime } from "./domain/runtime.js";
 import { SelectedInstrumentStore } from "./domain/selectedInstrumentStore.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
@@ -14,7 +15,7 @@ import {
   publicKisConfiguration,
 } from "./integrations/kis/kisConfig.js";
 import { KisProdReadOnlyClient } from "./integrations/kis/kisProdReadOnlyClient.js";
-import { KisRecommendationDataClient } from "./integrations/kis/kisRecommendationDataClient.js";
+import { KisRecommendationResearchDataClient } from "./integrations/kis/kisRecommendationResearchDataClient.js";
 import { createNaverApiHubClientFromEnv } from "./integrations/naver/naverApiHubClient.js";
 import { createOpenDartClientFromEnv } from "./integrations/opendart/openDartClient.js";
 import {
@@ -64,19 +65,34 @@ const kisClient = kisConfiguration.enabled
 if (kisClient) kisClient.status();
 const recommendationSettings = loadRecommendationSettings(process.env);
 const recommendationDataClient = kisClient
-  ? new KisRecommendationDataClient({
+  ? new KisRecommendationResearchDataClient({
     client: kisClient,
     instrumentCatalog,
     minimumIntervalMs: recommendationSettings.requestSpacingMs,
   })
   : null;
+const realtimeResearchJournal = createRealtimeResearchJournal({
+  dataDir,
+  enabled: recommendationDataClient ? undefined : false,
+  config: kisConfiguration,
+  env: process.env,
+});
 const openDartClient = createOpenDartClientFromEnv(process.env);
 const naverApiHubClient = createNaverApiHubClientFromEnv(process.env);
 const recommendationScanner = new RecommendationScanner({
   dataClient: recommendationDataClient,
   disclosureClient: openDartClient,
   socialClient: naverApiHubClient,
+  researchJournal: realtimeResearchJournal,
   settings: recommendationSettings,
+});
+realtimeResearchJournal.recordSessionStarted({
+  mode: "KIS_PROD_READ_ONLY_RESEARCH",
+  kisMode: kisConfiguration.mode,
+  recommendationScannerEnabled: Boolean(recommendationDataClient),
+  realtimeRecordingEnabled: realtimeResearchJournal.status().enabled,
+  maximumEnrichedCandidates: recommendationSettings.maxEnriched,
+  automaticOrderConnected: false,
 });
 
 const kisPaperConfiguration = loadKisPaperConfiguration(join(dataDir, "kis-paper.json"));
@@ -132,6 +148,7 @@ executionJournal.append("SESSION_STARTED", {
   recommendationScannerEnabled: Boolean(recommendationDataClient),
   recommendationDartEnabled: Boolean(openDartClient),
   recommendationNaverApiHubEnabled: Boolean(naverApiHubClient),
+  recommendationResearchRecordingEnabled: realtimeResearchJournal.status().enabled,
   recommendationAutomaticOrderConnected: false,
 });
 const eventClients = new Set();
@@ -146,7 +163,10 @@ const contentTypes = {
 };
 
 function json(response, status, body) {
-  response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  response.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
   response.end(JSON.stringify(body));
 }
 
@@ -154,20 +174,29 @@ async function readJson(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
   if (chunks.length === 0) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
-  catch { throw new Error("올바른 JSON 요청이 아닙니다."); }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new Error("올바른 JSON 요청이 아닙니다.");
+  }
 }
 
 function serveStatic(pathname, response) {
   const requested = pathname === "/" ? "/index.html" : pathname;
   const safePath = normalize(requested).replace(/^(\.\.(\/|\\|$))+/, "");
   let filePath = join(publicDir, safePath);
-  if (!filePath.startsWith(publicDir) || !existsSync(filePath) || statSync(filePath).isDirectory()) {
+  if (
+    !filePath.startsWith(publicDir)
+    || !existsSync(filePath)
+    || statSync(filePath).isDirectory()
+  ) {
     filePath = join(publicDir, "index.html");
   }
   response.writeHead(200, {
     "Content-Type": contentTypes[extname(filePath)] ?? "application/octet-stream",
-    "Cache-Control": filePath.endsWith("index.html") ? "no-store" : "public, max-age=300",
+    "Cache-Control": filePath.endsWith("index.html")
+      ? "no-store"
+      : "public, max-age=300",
   });
   createReadStream(filePath).pipe(response);
 }
@@ -244,7 +273,10 @@ function requireKisPaperService(response) {
 }
 
 const server = createServer(async (request, response) => {
-  const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+  const url = new URL(
+    request.url ?? "/",
+    `http://${request.headers.host ?? "localhost"}`,
+  );
   try {
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, {
@@ -308,14 +340,19 @@ const server = createServer(async (request, response) => {
         });
       }
       const searchResult = await instrumentCatalog.search(requestedSymbol, { limit: 20 });
-      const instrument = searchResult.results.find((item) => item.symbol === requestedSymbol);
+      const instrument = searchResult.results.find(
+        (item) => item.symbol === requestedSymbol,
+      );
       if (!instrument) {
         return json(response, 404, {
           error: "종목 마스터에서 요청한 종목을 찾을 수 없습니다.",
           code: "INSTRUMENT_NOT_FOUND",
         });
       }
-      const quote = await kisClient.getCurrentPrice({ symbol: instrument.symbol, market: "UN" });
+      const quote = await kisClient.getCurrentPrice({
+        symbol: instrument.symbol,
+        market: "UN",
+      });
       const currentPrice = Number(quote.currentPrice);
       const previousClose = Number(quote.basePrice);
       const tickSize = Number(quote.askUnit);
@@ -331,7 +368,9 @@ const server = createServer(async (request, response) => {
         market: instrument.market,
         securityType: instrument.securityType,
         initialPrice: currentPrice,
-        previousClose: Number.isFinite(previousClose) && previousClose > 0 ? previousClose : currentPrice,
+        previousClose: Number.isFinite(previousClose) && previousClose > 0
+          ? previousClose
+          : currentPrice,
         tickSize: Number.isFinite(tickSize) && tickSize > 0 ? tickSize : 100,
         priceSource: "KIS_PROD_READ_ONLY",
         quoteFetchedAt: quote.fetchedAt,
@@ -358,11 +397,29 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/recommendations") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
-      return json(response, 200, await recommendationScanner.get({ refreshIfStale: true }));
+      return json(
+        response,
+        200,
+        await recommendationScanner.get({ refreshIfStale: true }),
+      );
     }
-    if (request.method === "POST" && url.pathname === "/api/recommendations/refresh") {
+    if (
+      request.method === "POST"
+      && url.pathname === "/api/recommendations/refresh"
+    ) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
-      return json(response, 200, await recommendationScanner.refresh({ force: true }));
+      return json(
+        response,
+        200,
+        await recommendationScanner.refresh({ force: true }),
+      );
+    }
+    if (
+      request.method === "GET"
+      && url.pathname === "/api/recommendations/research/status"
+    ) {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, realtimeResearchJournal.status());
     }
     if (request.method === "GET" && url.pathname === "/api/kis/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
@@ -397,19 +454,28 @@ const server = createServer(async (request, response) => {
       if (!service) return;
       return json(response, 200, await service.submitOrder(await readJson(request)));
     }
-    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders/revise") {
+    if (
+      request.method === "POST"
+      && url.pathname === "/api/kis/paper/orders/revise"
+    ) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
       return json(response, 200, await service.reviseOrder(await readJson(request)));
     }
-    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders/cancel") {
+    if (
+      request.method === "POST"
+      && url.pathname === "/api/kis/paper/orders/cancel"
+    ) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
       return json(response, 200, await service.cancelOrder(await readJson(request)));
     }
-    if (request.method === "POST" && url.pathname === "/api/kis/paper/kill-switch") {
+    if (
+      request.method === "POST"
+      && url.pathname === "/api/kis/paper/kill-switch"
+    ) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
@@ -433,14 +499,24 @@ const server = createServer(async (request, response) => {
     if (request.method === "PUT" && url.pathname === "/api/strategy/settings") {
       return json(response, 200, runtime.setStrategySettings(await readJson(request)));
     }
-    if (request.method === "POST" && url.pathname === "/api/strategy/settings/reset") {
+    if (
+      request.method === "POST"
+      && url.pathname === "/api/strategy/settings/reset"
+    ) {
       return json(response, 200, runtime.resetStrategySettings());
     }
-    if (request.method === "POST" && url.pathname === "/api/verification/market-tick") {
+    if (
+      request.method === "POST"
+      && url.pathname === "/api/verification/market-tick"
+    ) {
       if (!verificationApiEnabled || !isLoopbackAddress(request.socket.remoteAddress)) {
         return json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
       }
-      return json(response, 200, applyVerificationMarketTick(runtime, await readJson(request)));
+      return json(
+        response,
+        200,
+        applyVerificationMarketTick(runtime, await readJson(request)),
+      );
     }
     if (request.method === "POST" && url.pathname === "/api/paper/orders") {
       const body = await readJson(request);
@@ -457,17 +533,28 @@ const server = createServer(async (request, response) => {
       ? url.pathname.match(/^\/api\/paper\/orders\/([^/]+)\/cancel$/)
       : null;
     if (cancelMatch) {
-      return json(response, 200, runtime.cancelOrder(decodeURIComponent(cancelMatch[1])));
+      return json(
+        response,
+        200,
+        runtime.cancelOrder(decodeURIComponent(cancelMatch[1])),
+      );
     }
-    if (request.method === "POST" && url.pathname === "/api/system/kill-switch") {
+    if (
+      request.method === "POST"
+      && url.pathname === "/api/system/kill-switch"
+    ) {
       const body = await readJson(request);
-      if (typeof body.enabled !== "boolean") return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
+      if (typeof body.enabled !== "boolean") {
+        return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
+      }
       runtime.setKillSwitch(body.enabled);
       return json(response, 200, runtime.snapshot());
     }
     if (request.method === "POST" && url.pathname === "/api/strategy/auto") {
       const body = await readJson(request);
-      if (typeof body.enabled !== "boolean") return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
+      if (typeof body.enabled !== "boolean") {
+        return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
+      }
       runtime.setAutoPaperTrading(body.enabled);
       return json(response, 200, runtime.snapshot());
     }
@@ -502,6 +589,7 @@ server.listen(port, "0.0.0.0", () => {
 
 function shutdown() {
   clearInterval(heartbeat);
+  recommendationScanner.stop();
   runtime.stop();
   for (const client of eventClients) client.end();
   server.close(() => process.exit(0));
