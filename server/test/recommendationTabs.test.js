@@ -20,11 +20,12 @@ test("recommendation workspace can be isolated without loading the tab adapter",
 });
 
 test("frontend runtime errors are exposed before application modules load", () => {
-  const diagnosticIndex = indexSource.indexOf('/runtimeDiagnostic.js?v=1');
+  const diagnosticIndex = indexSource.indexOf('/runtimeDiagnostic.js?v=2');
   const appIndex = indexSource.indexOf('/app.js');
   assert.ok(diagnosticIndex >= 0);
   assert.ok(appIndex > diagnosticIndex);
   assert.match(diagnosticSource, /unhandledrejection/);
+  assert.match(diagnosticSource, /startup-timeout/);
   assert.match(diagnosticSource, /PulseHFT 브라우저 실행 오류/);
 });
 
