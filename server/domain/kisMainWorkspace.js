@@ -30,6 +30,7 @@ export class KisMainWorkspace extends EventEmitter {
     now = Date.now,
     marketRefreshMs = 30_000,
     accountRefreshMs = 5_000,
+    orderHistoryRefreshMs = 15_000,
   } = {}) {
     super();
     if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
@@ -44,6 +45,7 @@ export class KisMainWorkspace extends EventEmitter {
     this.now = now;
     this.marketRefreshMs = positiveInteger(marketRefreshMs, "marketRefreshMs");
     this.accountRefreshMs = positiveInteger(accountRefreshMs, "accountRefreshMs");
+    this.orderHistoryRefreshMs = positiveInteger(orderHistoryRefreshMs, "orderHistoryRefreshMs");
     this.started = false;
     this.timer = null;
     this.marketRefreshPromise = null;
@@ -55,10 +57,13 @@ export class KisMainWorkspace extends EventEmitter {
     this.candles = [];
     this.balance = null;
     this.cancelableOrders = [];
+    this.orderHistory = null;
     this.marketError = null;
     this.accountError = null;
+    this.orderHistoryError = null;
     this.lastMarketRefreshAt = 0;
     this.lastAccountRefreshAt = 0;
+    this.lastOrderHistoryRefreshAt = 0;
     this.listeners = null;
     this.bindRealtime();
   }
@@ -108,8 +113,10 @@ export class KisMainWorkspace extends EventEmitter {
       balance: this.balance,
       symbol: this.selection.symbol,
       cancelableOrders: this.cancelableOrders,
+      orderHistory: this.orderHistory,
       paperEnabled: Boolean(this.paperService),
       accountError: this.accountError,
+      orderHistoryError: this.orderHistoryError,
     });
     account.commands = mapPaperCommands(this.paperService);
     const paperStatus = this.paperService?.status?.() ?? {
@@ -186,6 +193,7 @@ export class KisMainWorkspace extends EventEmitter {
         executionModel: "KIS_PAPER_MANUAL_ONLY",
         marketError: this.marketError,
         accountError: this.accountError,
+        orderHistoryError: this.orderHistoryError,
       },
     };
   }
@@ -205,7 +213,10 @@ export class KisMainWorkspace extends EventEmitter {
   }
 
   async refreshAll() {
-    await Promise.allSettled([this.refreshMarket(), this.refreshAccount()]);
+    await Promise.allSettled([
+      this.refreshMarket(),
+      this.refreshAccount({ forceOrderHistory: true }),
+    ]);
     return this.snapshot();
   }
 
@@ -253,15 +264,19 @@ export class KisMainWorkspace extends EventEmitter {
     }
   }
 
-  async refreshAccount() {
-    if (this.accountRefreshPromise) return this.accountRefreshPromise;
-    this.accountRefreshPromise = this.performAccountRefresh().finally(() => {
+  async refreshAccount({ forceOrderHistory = false } = {}) {
+    if (this.accountRefreshPromise) {
+      if (!forceOrderHistory) return this.accountRefreshPromise;
+      await this.accountRefreshPromise;
+      return this.refreshAccount({ forceOrderHistory: true });
+    }
+    this.accountRefreshPromise = this.performAccountRefresh({ forceOrderHistory }).finally(() => {
       this.accountRefreshPromise = null;
     });
     return this.accountRefreshPromise;
   }
 
-  async performAccountRefresh() {
+  async performAccountRefresh({ forceOrderHistory = false } = {}) {
     if (!this.paperService) {
       this.accountError = {
         code: "KIS_PAPER_DISABLED",
@@ -271,15 +286,35 @@ export class KisMainWorkspace extends EventEmitter {
       return this.snapshot();
     }
     try {
-      const [balanceResult, cancelableResult] = await Promise.allSettled([
+      const now = this.now();
+      const shouldRefreshOrderHistory = Boolean(this.paperClient?.getDailyOrders)
+        && (forceOrderHistory
+          || this.lastOrderHistoryRefreshAt === 0
+          || now - this.lastOrderHistoryRefreshAt >= this.orderHistoryRefreshMs);
+      const [balanceResult, cancelableResult, orderHistoryResult] = await Promise.allSettled([
         this.paperService.getBalance(),
         this.paperClient?.getCancelableOrders?.() ?? Promise.resolve([]),
+        shouldRefreshOrderHistory
+          ? this.paperClient.getDailyOrders()
+          : Promise.resolve(null),
       ]);
       if (balanceResult.status === "rejected") throw balanceResult.reason;
       this.balance = balanceResult.value;
       this.cancelableOrders = cancelableResult.status === "fulfilled"
         ? cancelableResult.value
         : this.cancelableOrders;
+      if (shouldRefreshOrderHistory) {
+        if (orderHistoryResult.status === "fulfilled") {
+          this.orderHistory = orderHistoryResult.value;
+          this.lastOrderHistoryRefreshAt = Number(orderHistoryResult.value?.fetchedAt) || this.now();
+          this.orderHistoryError = null;
+        } else {
+          this.orderHistoryError = safeError(
+            orderHistoryResult.reason,
+            "KIS_ORDER_HISTORY_REFRESH_FAILED",
+          );
+        }
+      }
       this.lastAccountRefreshAt = this.now();
       this.accountError = cancelableResult.status === "rejected"
         ? safeError(cancelableResult.reason, "KIS_CANCELABLE_ORDERS_REFRESH_FAILED")
@@ -305,21 +340,21 @@ export class KisMainWorkspace extends EventEmitter {
         : input?.referencePrice,
     };
     const result = await this.paperService.submitOrder(request);
-    await this.refreshAccount();
+    await this.refreshAccount({ forceOrderHistory: true });
     return result;
   }
 
   async reviseOrder(input) {
     if (!this.paperService) throw disabledPaperError();
     const result = await this.paperService.reviseOrder(input);
-    await this.refreshAccount();
+    await this.refreshAccount({ forceOrderHistory: true });
     return result;
   }
 
   async cancelOrder(input) {
     if (!this.paperService) throw disabledPaperError();
     const result = await this.paperService.cancelOrder(input);
-    await this.refreshAccount();
+    await this.refreshAccount({ forceOrderHistory: true });
     return result;
   }
 
@@ -401,7 +436,15 @@ export class KisMainWorkspace extends EventEmitter {
       existing.timestamp = timestamp;
       return;
     }
-    this.candles.push({ key, timestamp, open: price, high: price, low: price, close: price, volume: size });
+    this.candles.push({
+      key,
+      timestamp,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+      volume: size,
+    });
     this.candles.sort((a, b) => a.timestamp - b.timestamp);
     if (this.candles.length > 240) this.candles.splice(0, this.candles.length - 240);
   }
@@ -411,10 +454,19 @@ export class KisMainWorkspace extends EventEmitter {
   }
 }
 
-function mapPaperAccount({ balance, symbol, cancelableOrders, paperEnabled, accountError }) {
+function mapPaperAccount({
+  balance,
+  symbol,
+  cancelableOrders,
+  orderHistory,
+  paperEnabled,
+  accountError,
+  orderHistoryError,
+}) {
   const positions = Array.isArray(balance?.positions) ? balance.positions : [];
   const position = positions.find((item) => item.symbol === symbol) ?? null;
   const cancelable = Array.isArray(cancelableOrders) ? cancelableOrders : [];
+  const orders = Array.isArray(orderHistory?.orders) ? orderHistory.orders : [];
   const reservedCash = cancelable
     .filter((order) => order.side === "BUY")
     .reduce((sum, order) => sum + (Number(order.orderPrice) || 0) * (Number(order.cancelableQuantity) || 0), 0);
@@ -426,6 +478,7 @@ function mapPaperAccount({ balance, symbol, cancelableOrders, paperEnabled, acco
     mode: "PAPER_TRADING",
     available: paperEnabled && Boolean(balance),
     error: accountError,
+    orderHistoryError,
     equity: nullableNumber(balance?.summary?.totalEvaluationAmount),
     availableCash: nullableNumber(balance?.summary?.cash),
     reservedCash,
@@ -447,6 +500,9 @@ function mapPaperAccount({ balance, symbol, cancelableOrders, paperEnabled, acco
     reservedSellQuantity,
     cancelableOrders: structuredClone(cancelable),
     positions: structuredClone(positions),
+    orders: structuredClone(orders),
+    orderHistorySummary: orderHistory?.summary ? structuredClone(orderHistory.summary) : null,
+    orderHistoryFetchedAt: finiteNumberOr(orderHistory?.fetchedAt, null),
     fetchedAt: balance?.fetchedAt ?? null,
   };
 }
@@ -588,7 +644,12 @@ function koreaDateParts(timestamp) {
     day: "2-digit",
   }).formatToParts(new Date(timestamp));
   const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return { date: `${value.year}${value.month}${value.day}`, year: Number(value.year), month: Number(value.month), day: Number(value.day) };
+  return {
+    date: `${value.year}${value.month}${value.day}`,
+    year: Number(value.year),
+    month: Number(value.month),
+    day: Number(value.day),
+  };
 }
 
 function koreaTimestamp(today, rawTime, fallback) {
