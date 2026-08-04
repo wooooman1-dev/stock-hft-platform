@@ -55,6 +55,44 @@ test("execution journal appends durable JSONL events and restores the sequence",
   });
 });
 
+test("execution journal persists and restores reconciliation lifecycle events", () => {
+  withTemporaryDirectory((directory) => {
+    const filePath = join(directory, "execution-journal.jsonl");
+    const journal = new ExecutionJournal(filePath, {
+      now: () => 3_000,
+      sessionId: "reconciliation-session",
+      eventIdFactory: makeIdFactory("reconciliation"),
+    });
+    journal.append("BROKER_RECONCILIATION_BASELINE", {
+      day: "2026-08-04",
+      openingPositions: [],
+    });
+    journal.append("BROKER_RECONCILIATION_MISMATCH", {
+      day: "2026-08-04",
+      signature: "external-order",
+      issues: [],
+      summary: {},
+    }, 3_001);
+    journal.append("BROKER_RECONCILIATION_ACKNOWLEDGED", {
+      day: "2026-08-04",
+      acknowledgedAt: 3_002,
+      summary: {},
+    }, 3_002);
+
+    const restored = new ExecutionJournal(filePath, {
+      now: () => 4_000,
+      sessionId: "restored-reconciliation-session",
+      eventIdFactory: makeIdFactory("restored-reconciliation"),
+    });
+    assert.equal(restored.status().lastSequence, 3);
+    assert.deepEqual(restored.readAll().map((event) => event.type), [
+      "BROKER_RECONCILIATION_BASELINE",
+      "BROKER_RECONCILIATION_MISMATCH",
+      "BROKER_RECONCILIATION_ACKNOWLEDGED",
+    ]);
+  });
+});
+
 test("execution journal rejects corrupt JSON and broken sequence without truncating it", () => {
   withTemporaryDirectory((directory) => {
     const filePath = join(directory, "execution-journal.jsonl");
