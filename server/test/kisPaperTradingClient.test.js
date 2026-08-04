@@ -82,6 +82,9 @@ function paperClient(fetchImpl, options = {}) {
     tokenStore: tokenStore({ accessToken: "paper-token", issuedAt: 1, expiresAt: Date.now() + 60_000 }),
     fetchImpl,
     now: options.now ?? (() => Date.parse("2026-08-04T01:15:00Z")),
+    requestSpacingMs: options.requestSpacingMs ?? 0,
+    readRetryDelayMs: options.readRetryDelayMs ?? 0,
+    dailyOrdersCacheMs: options.dailyOrdersCacheMs ?? 1_000,
   });
 }
 
@@ -148,6 +151,62 @@ test("paper cancelable orders use supported VTTC0081R daily history and filter f
   assert.equal(orders[0].orderNumber, "0000012345");
   assert.equal(orders[0].cancelableQuantity, 1);
   assert.equal(orders[0].executedQuantity, 1);
+});
+
+test("concurrent order history consumers share one VTTC0081R request", async () => {
+  const calls = [];
+  const client = paperClient(async (url, options) => {
+    calls.push({ url: String(url), options });
+    await Promise.resolve();
+    return dailyHistoryResponse([
+      dailyOrder({ quantity: 2, executedQuantity: 1, remainingQuantity: 1 }),
+    ]);
+  });
+  const [history, cancelable] = await Promise.all([
+    client.getDailyOrders(),
+    client.getCancelableOrders(),
+  ]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.headers.tr_id, "VTTC0081R");
+  assert.equal(history.orders.length, 1);
+  assert.equal(cancelable.length, 1);
+  assert.equal(cancelable[0].cancelableQuantity, 1);
+});
+
+test("paper GET retries EGW00201 once without retrying a mutation", async () => {
+  let readCalls = 0;
+  const readClient = paperClient(async () => {
+    readCalls += 1;
+    if (readCalls === 1) {
+      return jsonResponse({
+        rt_cd: "1",
+        msg_cd: "EGW00201",
+        msg1: "초당 거래건수 를 초과하였습니다.",
+      });
+    }
+    return dailyHistoryResponse([]);
+  }, { dailyOrdersCacheMs: 0 });
+  const history = await readClient.getDailyOrders();
+  assert.equal(readCalls, 2);
+  assert.equal(history.orders.length, 0);
+
+  let mutationCalls = 0;
+  const mutationClient = paperClient(async () => {
+    mutationCalls += 1;
+    return jsonResponse({
+      rt_cd: "1",
+      msg_cd: "EGW00201",
+      msg1: "초당 거래건수 를 초과하였습니다.",
+    });
+  });
+  await assert.rejects(() => mutationClient.submitOrder({
+    side: "BUY",
+    symbol: "005930",
+    type: "MARKET",
+    quantity: 1,
+    exchange: "KRX",
+  }));
+  assert.equal(mutationCalls, 1);
 });
 
 test("cancel verifies daily-history remaining quantity before VTTC0013U mutation", async () => {
@@ -261,6 +320,8 @@ test("redaction tolerates a damaged token store without masking network error", 
     config: config(),
     tokenStore: brokenTokenStore,
     fetchImpl: async () => { throw new Error("paper-key 12345678 socket reset"); },
+    requestSpacingMs: 0,
+    readRetryDelayMs: 0,
   });
   await assert.rejects(
     () => client.rawRequest("테스트", new URL("https://openapivts.koreainvestment.com:29443/test"), { method: "GET", ambiguousOnFailure: false }),
