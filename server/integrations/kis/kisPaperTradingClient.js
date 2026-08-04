@@ -6,11 +6,9 @@ import {
   KisPaperApiError,
   apiFailure,
   assertSuccessfulPayload,
-  ensureArray,
   formatError,
   invalidInput,
   normalizeBalancePages,
-  normalizeCancelableOrder,
   normalizeDailyOrderHistory,
   normalizeOrderInput,
   normalizeOrderResponse,
@@ -27,13 +25,11 @@ const TOKEN_PATH = "/oauth2/tokenP";
 const BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance";
 const ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash";
 const ORDER_REVISE_CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl";
-const CANCELABLE_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl";
 const DAILY_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld";
 const BALANCE_TR_ID = "VTTC8434R";
 const BUY_TR_ID = "VTTC0012U";
 const SELL_TR_ID = "VTTC0011U";
 const REVISE_CANCEL_TR_ID = "VTTC0013U";
-const CANCELABLE_ORDERS_TR_ID = "VTTC0084R";
 const DAILY_ORDERS_TR_ID = "VTTC0081R";
 const CONTINUATION_HEADERS = new Set(["M", "F"]);
 const HISTORY_EXCHANGES = new Set(["KRX", "NXT", "SOR", "ALL"]);
@@ -70,6 +66,7 @@ export class KisPaperTradingClient {
       balanceApiAvailable: true,
       orderApiAvailable: true,
       orderHistoryApiAvailable: true,
+      cancelableOrderSource: "DAILY_ORDER_HISTORY",
     };
   }
 
@@ -116,40 +113,11 @@ export class KisPaperTradingClient {
   }
 
   async getCancelableOrders() {
-    const pages = [];
-    let fk100 = "";
-    let nk100 = "";
-    let trCont = "";
-    for (let page = 0; page < 10; page += 1) {
-      const url = new URL(CANCELABLE_ORDERS_PATH, this.config.baseUrl);
-      const params = {
-        CANO: this.config.accountNumber,
-        ACNT_PRDT_CD: this.config.accountProductCode,
-        INQR_DVSN_1: "0",
-        INQR_DVSN_2: "0",
-        CTX_AREA_FK100: fk100,
-        CTX_AREA_NK100: nk100,
-      };
-      for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
-      const { response, payload } = await this.authorizedRequest("정정취소 가능 주문 조회", url, {
-        method: "GET",
-        trId: CANCELABLE_ORDERS_TR_ID,
-        trCont,
-        ambiguousOnFailure: false,
-      });
-      assertSuccessfulPayload("정정취소 가능 주문 조회", response, payload, {
-        code: "KIS_PAPER_CANCELABLE_REJECTED",
-        secrets: this.secrets(),
-      });
-      pages.push(payload);
-      const continuation = continuationHeader(response);
-      if (!CONTINUATION_HEADERS.has(continuation)) break;
-      fk100 = textOrEmpty(payload?.ctx_area_fk100);
-      nk100 = textOrEmpty(payload?.ctx_area_nk100);
-      trCont = "N";
-      if (!fk100 && !nk100) break;
-    }
-    return pages.flatMap((payload) => ensureArray(payload?.output).map(normalizeCancelableOrder));
+    const history = await this.getDailyOrders({ execution: "ALL" });
+    return history.orders
+      .filter((order) => Number(order?.remainingQuantity) > 0
+        && !new Set(["FILLED", "CANCELED", "REJECTED"]).has(String(order?.status ?? "").toUpperCase()))
+      .map(cancelableOrderFromDailyHistory);
   }
 
   async getDailyOrders({
@@ -451,6 +419,24 @@ export class KisPaperTradingClient {
     }
     return values;
   }
+}
+
+function cancelableOrderFromDailyHistory(order) {
+  return {
+    source: "KIS",
+    mode: KIS_PAPER_MODE_TRADING,
+    environment: "PAPER",
+    orderOrganizationNumber: order?.orderOrganizationNumber ?? null,
+    orderNumber: order?.orderNumber ?? null,
+    symbol: order?.symbol ?? null,
+    name: order?.name ?? null,
+    side: order?.side ?? null,
+    orderQuantity: Number(order?.orderQuantity) || 0,
+    executedQuantity: Number(order?.executedQuantity) || 0,
+    cancelableQuantity: Number(order?.remainingQuantity) || 0,
+    orderPrice: Number(order?.orderPrice) || 0,
+    orderDivision: order?.orderDivisionCode ?? null,
+  };
 }
 
 function continuationHeader(response) {
