@@ -5,6 +5,7 @@ import test from "node:test";
 const tabsSource = readFileSync(new URL("../../public/recommendationTabs.js", import.meta.url), "utf8");
 const indexSource = readFileSync(new URL("../../public/index.html", import.meta.url), "utf8");
 const appSource = readFileSync(new URL("../../public/app.js", import.meta.url), "utf8");
+const orderHistorySource = readFileSync(new URL("../../public/kisOrderHistory.js", import.meta.url), "utf8");
 
 test("recommendation workspace loads the tab adapter after the existing panel", () => {
   const panelIndex = indexSource.indexOf('/recommendationPanel.js');
@@ -12,6 +13,7 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
   assert.match(indexSource, /app\.js\?v=2/);
+  assert.match(indexSource, /kisOrderHistory\.js\?v=1/);
   assert.match(indexSource, /recommendationTabs\.js\?v=7/);
 });
 
@@ -63,10 +65,15 @@ test("main dashboard uses KIS values and KIS paper order APIs", () => {
   assert.doesNotMatch(appSource, /data-action="auto"/);
 });
 
-test("main order list restores server journal commands instead of browser-only history", () => {
-  assert.match(appSource, /syncCommandsFromSnapshot/);
-  assert.match(appSource, /value\?\.account\?\.commands/);
-  assert.match(appSource, /서버 실행 저널 기준 최근 KIS 주문 명령/);
-  assert.match(appSource, /실행 저널에 저장된 KIS 주문 명령이 없습니다/);
-  assert.doesNotMatch(appSource, /이 브라우저에서 전송한 KIS 주문 명령이 없습니다/);
+test("main order list prioritizes KIS broker fill history with journal fallback", () => {
+  assert.match(orderHistorySource, /latestSnapshot\.account/);
+  assert.match(orderHistorySource, /orderHistoryFetchedAt/);
+  assert.match(orderHistorySource, /orderHistoryError/);
+  assert.match(orderHistorySource, /전량체결/);
+  assert.match(orderHistorySource, /부분체결/);
+  assert.match(orderHistorySource, /미체결/);
+  assert.match(orderHistorySource, /평균체결가/);
+  assert.match(orderHistorySource, /서버 실행 저널을 임시 표시/);
+  assert.match(orderHistorySource, /오늘 KIS 주문·체결내역이 없습니다/);
+  assert.match(orderHistorySource, /data-action="cancel-order"/);
 });
