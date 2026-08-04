@@ -33,6 +33,10 @@ const REVISE_CANCEL_TR_ID = "VTTC0013U";
 const DAILY_ORDERS_TR_ID = "VTTC0081R";
 const CONTINUATION_HEADERS = new Set(["M", "F"]);
 const HISTORY_EXCHANGES = new Set(["KRX", "NXT", "SOR", "ALL"]);
+const DEFAULT_REQUEST_SPACING_MS = 650;
+const DEFAULT_READ_RETRY_DELAY_MS = 1_200;
+const DEFAULT_DAILY_ORDERS_CACHE_MS = 1_000;
+const KIS_RATE_LIMIT_CODE = "EGW00201";
 
 export class KisPaperTradingClient {
   constructor({
@@ -41,6 +45,9 @@ export class KisPaperTradingClient {
     fetchImpl = globalThis.fetch,
     now = Date.now,
     timeoutMs = 10_000,
+    requestSpacingMs = DEFAULT_REQUEST_SPACING_MS,
+    readRetryDelayMs = DEFAULT_READ_RETRY_DELAY_MS,
+    dailyOrdersCacheMs = DEFAULT_DAILY_ORDERS_CACHE_MS,
   }) {
     if (config?.mode !== KIS_PAPER_MODE_TRADING || !config.enabled) {
       throw new TypeError("KIS PAPER_TRADING 설정이 필요합니다.");
@@ -56,7 +63,15 @@ export class KisPaperTradingClient {
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.timeoutMs = timeoutMs;
+    this.requestSpacingMs = nonNegativeInteger(requestSpacingMs, "requestSpacingMs");
+    this.readRetryDelayMs = nonNegativeInteger(readRetryDelayMs, "readRetryDelayMs");
+    this.dailyOrdersCacheMs = nonNegativeInteger(dailyOrdersCacheMs, "dailyOrdersCacheMs");
     this.tokenRequest = null;
+    this.requestQueue = Promise.resolve();
+    this.lastAuthorizedRequestStartedAt = 0;
+    this.dailyOrdersRequests = new Map();
+    this.dailyOrdersCache = new Map();
+    this.dailyOrdersCacheGeneration = 0;
   }
 
   status() {
@@ -67,6 +82,8 @@ export class KisPaperTradingClient {
       orderApiAvailable: true,
       orderHistoryApiAvailable: true,
       cancelableOrderSource: "DAILY_ORDER_HISTORY",
+      requestSpacingMs: this.requestSpacingMs,
+      readRateLimitRetry: true,
     };
   }
 
@@ -120,26 +137,48 @@ export class KisPaperTradingClient {
       .map(cancelableOrderFromDailyHistory);
   }
 
-  async getDailyOrders({
-    startDate = koreaDate(this.now()),
-    endDate = startDate,
-    side = "ALL",
-    execution = "ALL",
-    symbol = "",
-    orderOrganizationNumber = "",
-    orderNumber = "",
-    exchange = "ALL",
-  } = {}) {
+  async getDailyOrders(input = {}) {
+    const startDate = input.startDate ?? koreaDate(this.now());
     const query = normalizeOrderHistoryQuery({
       startDate,
-      endDate,
-      side,
-      execution,
-      symbol,
-      orderOrganizationNumber,
-      orderNumber,
-      exchange,
+      endDate: input.endDate ?? startDate,
+      side: input.side ?? "ALL",
+      execution: input.execution ?? "ALL",
+      symbol: input.symbol ?? "",
+      orderOrganizationNumber: input.orderOrganizationNumber ?? "",
+      orderNumber: input.orderNumber ?? "",
+      exchange: input.exchange ?? "ALL",
     });
+    const key = JSON.stringify(query);
+    const cached = this.dailyOrdersCache.get(key);
+    if (cached && this.dailyOrdersCacheMs > 0
+      && Date.now() - cached.cachedAt <= this.dailyOrdersCacheMs) {
+      return structuredClone(cached.value);
+    }
+    const pending = this.dailyOrdersRequests.get(key);
+    if (pending) return structuredClone(await pending);
+
+    const generation = this.dailyOrdersCacheGeneration;
+    const request = this.fetchDailyOrders(query)
+      .then((history) => {
+        if (generation === this.dailyOrdersCacheGeneration && this.dailyOrdersCacheMs > 0) {
+          this.dailyOrdersCache.set(key, {
+            cachedAt: Date.now(),
+            value: structuredClone(history),
+          });
+        }
+        return history;
+      })
+      .finally(() => {
+        if (this.dailyOrdersRequests.get(key) === request) {
+          this.dailyOrdersRequests.delete(key);
+        }
+      });
+    this.dailyOrdersRequests.set(key, request);
+    return structuredClone(await request);
+  }
+
+  async fetchDailyOrders(query) {
     const pages = [];
     let fk100 = "";
     let nk100 = "";
@@ -210,6 +249,7 @@ export class KisPaperTradingClient {
       secrets: this.secrets(),
       ambiguousHttp5xx: true,
     });
+    this.invalidateDailyOrdersCache();
     return normalizeOrderResponse(payload.output, {
       operation: "SUBMIT",
       side: order.side,
@@ -295,6 +335,7 @@ export class KisPaperTradingClient {
       secrets: this.secrets(),
       ambiguousHttp5xx: true,
     });
+    this.invalidateDailyOrdersCache();
     return normalizeOrderResponse(payload.output, {
       operation: request.operation,
       originalOrderNumber: request.originalOrderNumber,
@@ -374,14 +415,44 @@ export class KisPaperTradingClient {
       tr_cont: trCont,
       custtype: "P",
     };
-    const response = await this.rawRequest(operation, url, {
+    const requestOptions = {
       method,
       headers,
       body: body === null ? undefined : JSON.stringify(body),
       ambiguousOnFailure,
+    };
+    const attempts = String(method).toUpperCase() === "GET" ? 2 : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const result = await this.enqueueAuthorizedRequest(async () => {
+        const response = await this.rawRequest(operation, url, requestOptions);
+        const payload = await parseJson(response, operation, Boolean(ambiguousOnFailure));
+        return { response, payload };
+      });
+      if (attempt + 1 < attempts && isRateLimited(result.response, result.payload)) {
+        await delay(this.readRetryDelayMs);
+        continue;
+      }
+      return result;
+    }
+    throw new Error("KIS authorized request retry loop ended unexpectedly.");
+  }
+
+  async enqueueAuthorizedRequest(task) {
+    const run = this.requestQueue.then(async () => {
+      const elapsed = Date.now() - this.lastAuthorizedRequestStartedAt;
+      const waitMs = Math.max(0, this.requestSpacingMs - elapsed);
+      if (waitMs > 0) await delay(waitMs);
+      this.lastAuthorizedRequestStartedAt = Date.now();
+      return task();
     });
-    const payload = await parseJson(response, operation, Boolean(ambiguousOnFailure));
-    return { response, payload };
+    this.requestQueue = run.catch(() => {});
+    return run;
+  }
+
+  invalidateDailyOrdersCache() {
+    this.dailyOrdersCacheGeneration += 1;
+    this.dailyOrdersCache.clear();
+    this.dailyOrdersRequests.clear();
   }
 
   async rawRequest(operation, url, options) {
@@ -443,6 +514,19 @@ function continuationHeader(response) {
   return String(response.headers.get("tr_cont") ?? "").trim().toUpperCase();
 }
 
+function isRateLimited(response, payload) {
+  const code = String(payload?.msg_cd ?? payload?.msgCode ?? payload?.code ?? "").trim().toUpperCase();
+  const message = String(payload?.msg1 ?? payload?.message ?? payload?.msg ?? "").trim();
+  return response?.status === 429
+    || code === KIS_RATE_LIMIT_CODE
+    || message.includes("초당 거래건수");
+}
+
+function delay(milliseconds) {
+  if (!milliseconds) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 function koreaDate(timestamp) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Seoul",
@@ -495,4 +579,12 @@ function optionalDigits(value, field) {
   if (!text) return "";
   if (!/^\d+$/.test(text)) throw invalidInput(`${field}는 숫자 문자열이어야 합니다.`);
   return text;
+}
+
+function nonNegativeInteger(value, field) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 0) {
+    throw new TypeError(`${field}는 0 이상의 정수여야 합니다.`);
+  }
+  return number;
 }
