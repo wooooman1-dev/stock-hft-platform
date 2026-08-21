@@ -25,7 +25,8 @@ test("execution journal persists broker command/result events with continuous se
     journal.append("BROKER_ORDER_COMMAND", { clientOrderId: "paper-1", operation: "SUBMIT" }, 1001);
     journal.append("BROKER_ORDER_RESULT", { clientOrderId: "paper-1", status: "ACCEPTED" }, 1002);
     journal.append("BROKER_ORDER_UNKNOWN", { clientOrderId: "paper-2", status: "UNKNOWN_RESULT" }, 1003);
-    journal.append("BROKER_RISK_BASELINE", { day: "2026-08-01", totalEvaluationAmount: 1000000, capturedAt: 1004 }, 1004);
+    journal.append("BROKER_ORDER_UNKNOWN_RESOLVED", { clientOrderId: "paper-2", resolution: "ACCEPTED" }, 1004);
+    journal.append("BROKER_RISK_BASELINE", { day: "2026-08-01", totalEvaluationAmount: 1000000, capturedAt: 1005 }, 1005);
 
     const reopened = new ExecutionJournal(temp.path, {
       now: () => 2000,
@@ -36,10 +37,11 @@ test("execution journal persists broker command/result events with continuous se
       [1, "BROKER_ORDER_COMMAND"],
       [2, "BROKER_ORDER_RESULT"],
       [3, "BROKER_ORDER_UNKNOWN"],
-      [4, "BROKER_RISK_BASELINE"],
+      [4, "BROKER_ORDER_UNKNOWN_RESOLVED"],
+      [5, "BROKER_RISK_BASELINE"],
     ]);
     const next = reopened.append("SESSION_STARTED", { mode: "SIMULATION" }, 2001);
-    assert.equal(next.sequence, 5);
+    assert.equal(next.sequence, 6);
   } finally {
     temp.cleanup();
   }

@@ -1,6 +1,7 @@
 const app = document.querySelector("#app");
 
 let reconciliation = null;
+let unknownCommands = [];
 let signature = "";
 let scheduled = false;
 let stopped = false;
@@ -33,6 +34,8 @@ function injectStyles() {
     .kis-reconciliation-banner.pending{border-color:#66542d;background:#17150f;color:#ffe19a}
     .kis-reconciliation-banner strong{display:block;margin-bottom:5px;font-size:12px}
     .kis-reconciliation-banner ul{margin:5px 0 0;padding-left:18px}.kis-reconciliation-banner li{margin:2px 0}
+    .kis-reconciliation-banner p{margin:7px 0 0;color:#ffd0dc}
+    .kis-reconciliation-banner code{font-size:10px;color:#ffe19a}
   `;
   document.head.append(style);
 }
@@ -55,6 +58,16 @@ function statusMeta(value) {
     return { label: "계좌 대조 불가", detail: "KIS 주문내역과 잔고를 모두 확인할 때까지 주문이 차단됩니다.", className: "danger" };
   }
   return { label: "계좌 대조 비활성", detail: "KIS 모의투자 대조 기능이 비활성화되어 있습니다.", className: "" };
+}
+
+function unknownResolutionHint(commands) {
+  if (!Array.isArray(commands) || commands.length === 0) return "";
+  const ids = commands
+    .map((command) => String(command?.clientOrderId ?? "").trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .join(", ");
+  return `<p>주문 결과 불명 ${commands.length}건(${escapeHtml(ids)})은 KIS 모의계좌 주문내역과 직접 대조한 뒤 <code>npm run resolve:kis:paper-unknown</code>으로 접수·미접수를 확정해야 차단이 풀립니다.</p>`;
 }
 
 function issueMessages(value) {
@@ -105,7 +118,7 @@ function render() {
   const messages = issueMessages(reconciliation);
   const banner = existingBanner ?? document.createElement("div");
   banner.className = `kis-reconciliation-banner ${meta.className === "pending" ? "pending" : ""}`.trim();
-  banner.innerHTML = `<strong>${escapeHtml(meta.label)}</strong>${escapeHtml(meta.detail)}${messages.length > 0 ? `<ul>${messages.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}</ul>` : ""}`;
+  banner.innerHTML = `<strong>${escapeHtml(meta.label)}</strong>${escapeHtml(meta.detail)}${messages.length > 0 ? `<ul>${messages.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}</ul>` : ""}${unknownResolutionHint(unknownCommands)}`;
   if (!existingBanner) {
     const killBanner = app.querySelector(".kill-banner");
     const topbar = app.querySelector(".topbar");
@@ -126,8 +139,12 @@ async function refresh() {
     if (!response.ok) return;
     const payload = await response.json();
     const next = payload?.service?.reconciliation ?? null;
-    const nextSignature = JSON.stringify(next);
+    const nextUnknownCommands = Array.isArray(payload?.service?.unknownCommands)
+      ? payload.service.unknownCommands
+      : [];
+    const nextSignature = JSON.stringify({ next, nextUnknownCommands });
     reconciliation = next;
+    unknownCommands = nextUnknownCommands;
     if (nextSignature !== signature) {
       signature = nextSignature;
       scheduleRender();

@@ -283,6 +283,8 @@ function getKisPaperStatus() {
       : {
         killSwitch: false,
         unknownResult: false,
+        unknownCommands: [],
+        trackedOrderNumbers: [],
         commandCount: 0,
         todayCommandCount: 0,
         limits: publicConfig.limits,
@@ -505,6 +507,12 @@ const server = createServer(async (request, response) => {
       const service = requireKisPaperService(response);
       if (!service) return;
       return json(response, 200, await mainWorkspace.cancelOrder(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/orders/resolve-unknown") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, await mainWorkspace.resolveUnknownOrder(await readJson(request)));
     }
     if (request.method === "POST" && url.pathname === "/api/kis/paper/kill-switch") {
       if (rejectNonLoopbackKisRequest(request, response)) return;

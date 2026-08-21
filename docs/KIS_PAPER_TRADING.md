@@ -13,7 +13,7 @@ PulseHFT의 한국투자증권 모의투자 계좌 연동입니다. 이 모드�
 - 실전 계좌 주문·정정·취소 코드는 존재하지 않습니다.
 - 주문 명령을 실행 저널에 먼저 `fsync`한 뒤 증권사 요청을 보냅니다.
 - 네트워크 단절·시간초과·5xx·비정상 응답으로 결과를 확정할 수 없으면 `UNKNOWN_RESULT`로 고정하고 킬 스위치를 켭니다.
-- `UNKNOWN_RESULT`는 자동 해제하거나 자동 재주문하지 않습니다.
+- `UNKNOWN_RESULT`는 자동 해제하거나 자동 재주문하지 않습니다. 사용자가 증권사 주문내역과 대조해 접수 여부를 확정해야만 풀립니다.
 - 킬 스위치 상태에서도 미체결 주문 취소는 허용합니다.
 
 ## 공식 환경
@@ -95,6 +95,7 @@ GET  /api/kis/paper/balance
 POST /api/kis/paper/orders
 POST /api/kis/paper/orders/revise
 POST /api/kis/paper/orders/cancel
+POST /api/kis/paper/orders/resolve-unknown
 POST /api/kis/paper/kill-switch
 ```
 
@@ -167,11 +168,48 @@ BROKER_RISK_BASELINE
 BROKER_ORDER_COMMAND
 BROKER_ORDER_RESULT
 BROKER_ORDER_UNKNOWN
+BROKER_ORDER_UNKNOWN_RESOLVED
 ```
 
 `clientOrderId`는 1~80자의 영문·숫자·점·밑줄·콜론·하이픈만 허용합니다. 이미 처리한 `clientOrderId`가 다시 들어오면 증권사 요청을 재전송하지 않고 저장된 결과를 반환합니다.
 
 프로세스가 `BROKER_ORDER_COMMAND` 이후 종료되고 결과 이벤트가 없으면 다음 시작 시 해당 명령을 `UNKNOWN_RESULT`로 기록합니다. 사용자는 한국투자 모의계좌 주문내역과 직접 대조하기 전 킬 스위치를 해제할 수 없습니다.
+
+## 주문 결과 불명 해소 절차
+
+`UNKNOWN_RESULT`는 증권사 주문내역과 대조한 사용자의 확정 없이는 풀리지 않습니다. 확정 결과는 `BROKER_ORDER_UNKNOWN_RESOLVED` 이벤트로 실행 저널에 남고, 재시작 후에도 같은 결론이 재생됩니다.
+
+1. `/api/kis/paper/status`의 `service.unknownCommands`에서 해소해야 할 `clientOrderId`와 원래 주문 요청을 확인합니다.
+2. 대조 대상을 정리합니다.
+
+```powershell
+npm run resolve:kis:paper-unknown
+```
+
+   인자 없이 실행하면 결과 불명 명령과 같은 조건의 KIS 당일 주문내역 후보만 읽어서 보여주고 아무것도 바꾸지 않습니다.
+
+3. 한국투자 모의계좌 주문내역에서 해당 주문의 접수 여부를 직접 확인합니다.
+4. 접수된 것으로 확인되면 주문번호를 함께 확정합니다.
+
+```powershell
+$env:PULSEHFT_RESOLVE_KIS_PAPER_UNKNOWN="YES"
+npm run resolve:kis:paper-unknown -- --client-order-id=... --resolution=ACCEPTED --broker-order-number=... --order-organization-number=... --note="주문내역 대조 완료"
+```
+
+5. 접수되지 않은 것으로 확인되면 `--resolution=NOT_ACCEPTED`로 확정합니다.
+
+서버는 사용자의 확정을 그대로 믿지 않고 KIS 당일 주문내역으로 교차검증합니다.
+
+- `ACCEPTED`는 지정한 주문번호가 당일 주문내역에 있어야 하고, 종목코드·매매구분·주문수량이 실행 저널 명령과 같아야 합니다.
+- 이미 다른 실행 저널 명령의 결과로 기록된 주문번호는 다시 연결할 수 없습니다.
+- `NOT_ACCEPTED`는 같은 조건의 미추적 주문이 당일 주문내역에 남아 있으면 거부합니다.
+- 대조 근거를 읽지 못하면 확정하지 않고 그대로 차단을 유지합니다.
+
+확정 이후 동작:
+
+- `ACCEPTED`로 확정한 명령은 같은 `clientOrderId`로 재요청해도 증권사 재주문 없이 확정된 주문번호를 반환합니다.
+- `NOT_ACCEPTED`로 확정한 명령은 같은 `clientOrderId`로 재요청하면 거절 결과를 재생합니다. 다시 주문하려면 새 `clientOrderId`를 사용합니다.
+- 결과 불명 명령이 모두 해소되면 킬 스위치를 해제할 수 있습니다. 해제 시점에 계좌 대조가 정상이어야 하며 확인 기록이 실행 저널에 남습니다.
 
 ## 수동 검증 순서
 
@@ -183,7 +221,22 @@ BROKER_ORDER_UNKNOWN
 6. 동일 `clientOrderId`를 다시 보내 증권사 주문이 중복되지 않는지 확인합니다.
 7. 주문번호와 주문조직번호를 사용해 정정·취소를 확인합니다.
 8. 서버 재시작 후 같은 `clientOrderId` 결과가 재생되는지 확인합니다.
-9. 테스트 중 강제 종료로 `UNKNOWN_RESULT`를 만들었다면 모의계좌 주문내역과 대조하고 새 주문이 차단되는지 확인합니다.
+9. 테스트 중 강제 종료로 `UNKNOWN_RESULT`를 만들었다면 모의계좌 주문내역과 대조하고 새 주문이 차단되는지 확인합니다. 대조를 마친 뒤 `npm run resolve:kis:paper-unknown`으로 접수·미접수를 확정하고 킬 스위치를 해제합니다.
 10. `npm run check`를 실행합니다.
 
 실전 App Key로 위 검증을 수행하지 않습니다.
+
+## 검증 이력
+
+### 2026-08-21 — 모의투자 전용 키·계좌 실계정 검증
+
+장중(KST 10:29~11:18)에 모의투자 전용 키와 모의계좌로 위 수동 검증 순서 6~10번을 모두 실행했습니다.
+
+- **6. 멱등성**: 동일 `clientOrderId` 재전송 시 `replayed:true`, 주문번호 동일, 저널에 COMMAND/RESULT 1쌍만 기록되고 증권사 재요청이 발생하지 않음을 확인.
+- **7. 정정·취소**: 지정가 매수 1주 → 정정 → 취소까지 확인. 취소 전 정정취소 가능수량 선조회가 정상 통과했고, 취소 후 미체결 0건·현금과 포지션이 원복됨을 확인.
+- **8. 재시작 재생**: 서버 재시작 후 동일 `clientOrderId` 재전송 시 `replayed:true`로 저널에서 복원되고 증권사 재요청이 없음을 확인.
+- **9. 강제 종료 → `UNKNOWN_RESULT`**: `BROKER_ORDER_COMMAND` 기록 직후 프로세스를 강제 종료해 재시작 시 `BROKER_ORDER_UNKNOWN`이 기록되고 킬 스위치가 래치됨을 확인. 신규 주문은 423으로 차단되고 킬 스위치 해제는 409로 거부되는 반면 미체결 취소는 허용됨을 확인. 계좌 대조가 `BROKER_ORDER_NOT_IN_JOURNAL`로 실제 증권사 미체결 주문을 정확히 탐지해 취소 완료.
+  - 이 과정에서 `UNKNOWN_RESULT`를 해소할 절차가 코드에 없다는 공백을 발견해 **주문 결과 불명 해소 절차**(`BROKER_ORDER_UNKNOWN_RESOLVED` 이벤트, `/api/kis/paper/orders/resolve-unknown`, `npm run resolve:kis:paper-unknown`)를 구현했습니다. 구현한 절차로 실제 발생한 `UNKNOWN_RESULT`를 해소해 검증했습니다: 목록 모드가 결과 불명 명령과 일치하는 증권사 주문번호 1건만 정확히 후보로 좁혔고, `ACCEPTED`로 확정한 뒤 킬 스위치를 해제하자 계좌 대조가 `CONSISTENT`로 돌아왔습니다. 이후 신규 주문 제출·취소가 정상 동작했고, 서버 재시작 후에도 해소 상태가 재생되어 킬 스위치가 다시 래치되지 않음을 확인했습니다.
+- **10. `npm run check`**: 212 tests / 0 fail.
+
+검증 종료 시점 계좌 상태: 미체결 0건, 포지션 0, 현금 9,998,390원(변동 없음).

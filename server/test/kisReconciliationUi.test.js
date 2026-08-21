@@ -6,7 +6,7 @@ const indexSource = readFileSync(new URL("../../public/index.html", import.meta.
 const source = readFileSync(new URL("../../public/kisReconciliation.js", import.meta.url), "utf8");
 
 test("dashboard loads the KIS reconciliation status adapter", () => {
-  assert.match(indexSource, /kisReconciliation\.js\?v=1/);
+  assert.match(indexSource, /kisReconciliation\.js\?v=2/);
   assert.match(source, /\/api\/kis\/paper\/status/);
   assert.match(source, /KIS ACCOUNT RECONCILIATION/);
 });
@@ -17,4 +17,10 @@ test("reconciliation UI explains mismatch blocking and acknowledgement through t
   assert.match(source, /취소 주문만 허용/);
   assert.match(source, /킬 스위치를 끄면 대조 확인/);
   assert.match(source, /RESOLVED_AWAITING_ACK/);
+});
+
+test("reconciliation UI names the unknown result commands and the resolution command", () => {
+  assert.match(source, /unknownCommands/);
+  assert.match(source, /주문 결과 불명/);
+  assert.match(source, /npm run resolve:kis:paper-unknown/);
 });

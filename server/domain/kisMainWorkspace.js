@@ -358,6 +358,13 @@ export class KisMainWorkspace extends EventEmitter {
     return result;
   }
 
+  async resolveUnknownOrder(input) {
+    if (!this.paperService) throw disabledPaperError();
+    const result = await this.paperService.resolveUnknownResult(input);
+    await this.refreshAccount({ forceOrderHistory: true });
+    return result;
+  }
+
   setKillSwitch(enabled) {
     if (!this.paperService) throw disabledPaperError();
     const status = this.paperService.setKillSwitch(enabled);

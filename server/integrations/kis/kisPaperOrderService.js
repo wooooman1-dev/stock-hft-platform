@@ -18,6 +18,8 @@ export { KisPaperOrderServiceError } from "./kisPaperOrderSupport.js";
 const COMMAND_EVENT = "BROKER_ORDER_COMMAND";
 const RESULT_EVENT = "BROKER_ORDER_RESULT";
 const UNKNOWN_EVENT = "BROKER_ORDER_UNKNOWN";
+const UNKNOWN_RESOLVED_EVENT = "BROKER_ORDER_UNKNOWN_RESOLVED";
+const UNKNOWN_RESOLUTIONS = new Set(["ACCEPTED", "NOT_ACCEPTED"]);
 const RISK_BASELINE_EVENT = "BROKER_RISK_BASELINE";
 
 export class KisPaperOrderService {
@@ -85,6 +87,8 @@ export class KisPaperOrderService {
       killSwitch: this.killSwitch || this.unknownResult || reconciliation.blocked,
       manualKillSwitch: this.killSwitch,
       unknownResult: this.unknownResult,
+      unknownCommands: this.unknownCommands(),
+      trackedOrderNumbers: [...trackedBrokerOrderNumbers(this.commands, null)],
       commandCount: this.commands.size,
       todayCommandCount: todayCommands,
       limits: structuredClone(this.limits),
@@ -359,6 +363,122 @@ export class KisPaperOrderService {
     }
   }
 
+  unknownCommands() {
+    return [...this.commands.values()]
+      .filter((state) => state.state === "UNKNOWN")
+      .map((state) => ({
+        clientOrderId: state.clientOrderId,
+        commandId: state.commandId,
+        operation: state.operation,
+        day: state.day,
+        timestamp: state.timestamp,
+        request: structuredClone(state.request ?? null),
+        error: state.error ? structuredClone(state.error) : null,
+      }));
+  }
+
+  async resolveUnknownResult(input) {
+    return this.enqueue(() => this.executeUnknownResolution(input));
+  }
+
+  async executeUnknownResolution(input) {
+    const clientOrderId = normalizeClientOrderId(input?.clientOrderId);
+    const resolution = upper(input?.resolution);
+    if (!UNKNOWN_RESOLUTIONS.has(resolution)) {
+      throw new KisPaperOrderServiceError(
+        "resolution은 증권사 주문내역 대조 결과에 따라 ACCEPTED 또는 NOT_ACCEPTED여야 합니다.",
+        { code: "KIS_PAPER_UNKNOWN_RESOLUTION_INVALID", statusCode: 400 },
+      );
+    }
+    const state = this.commands.get(clientOrderId);
+    if (!state) {
+      throw new KisPaperOrderServiceError(
+        `실행 저널에 clientOrderId ${clientOrderId} 주문 명령이 없습니다.`,
+        { code: "KIS_PAPER_UNKNOWN_COMMAND_NOT_FOUND", statusCode: 404 },
+      );
+    }
+    if (state.state !== "UNKNOWN") {
+      throw new KisPaperOrderServiceError(
+        `clientOrderId ${clientOrderId} 주문은 결과 불명 상태가 아니어서 해소할 수 없습니다.`,
+        { code: "KIS_PAPER_COMMAND_NOT_UNKNOWN", statusCode: 409 },
+      );
+    }
+
+    const note = optionalNote(input?.note);
+    const history = await this.loadUnknownResolutionEvidence();
+    const tracked = trackedBrokerOrderNumbers(this.commands, clientOrderId);
+    const matchedOrder = resolution === "ACCEPTED"
+      ? matchAcceptedBrokerOrder({ state, input, history, tracked })
+      : assertNoBrokerCandidate({ state, history, tracked });
+    const response = unknownResolutionResponse({ state, resolution, matchedOrder, now: this.now });
+    const resolvedAt = this.now();
+    const payload = {
+      commandId: state.commandId,
+      clientOrderId,
+      operation: state.operation,
+      resolution,
+      note,
+      resolvedAt,
+      evidence: {
+        orderHistoryFetchedAt: finiteNumberOrNull(history.fetchedAt),
+        brokerOrderCount: history.orders.length,
+        matchedOrder: matchedOrder ? structuredClone(matchedOrder) : null,
+      },
+      result: response,
+    };
+    try {
+      this.journal.append(UNKNOWN_RESOLVED_EVENT, payload, resolvedAt);
+    } catch {
+      throw new KisPaperOrderServiceError(
+        "주문 결과 불명 해소 기록을 실행 저널에 남기지 못해 기존 차단 상태를 유지합니다.",
+        { code: "KIS_PAPER_UNKNOWN_RESOLUTION_JOURNAL_FAILED", statusCode: 500 },
+      );
+    }
+    Object.assign(state, {
+      state: "RESULT",
+      result: structuredClone(response),
+      error: response.error ? structuredClone(response.error) : null,
+    });
+    this.unknownResult = hasUnknownCommand(this.commands);
+    this.lastReconciliationRefreshAt = 0;
+    const reconciliation = await this.refreshReconciliation({ force: true });
+    return {
+      clientOrderId,
+      operation: state.operation,
+      resolution,
+      resolvedAt,
+      note,
+      matchedOrder: matchedOrder ? structuredClone(matchedOrder) : null,
+      reconciliation: reconciliation ? structuredClone(reconciliation) : null,
+      status: this.status(),
+    };
+  }
+
+  async loadUnknownResolutionEvidence() {
+    if (typeof this.client.getDailyOrders !== "function") {
+      throw new KisPaperOrderServiceError(
+        "KIS 당일 주문내역 조회를 사용할 수 없어 주문 결과 불명 상태를 대조할 수 없습니다.",
+        { code: "KIS_PAPER_UNKNOWN_RESOLUTION_EVIDENCE_UNAVAILABLE", statusCode: 503 },
+      );
+    }
+    let history = null;
+    try {
+      history = await this.client.getDailyOrders();
+    } catch (error) {
+      throw new KisPaperOrderServiceError(
+        `KIS 당일 주문내역을 조회하지 못해 주문 결과 불명 상태를 대조할 수 없습니다: ${safeError(error).message}`,
+        { code: "KIS_PAPER_UNKNOWN_RESOLUTION_EVIDENCE_UNAVAILABLE", statusCode: 503 },
+      );
+    }
+    if (!Array.isArray(history?.orders)) {
+      throw new KisPaperOrderServiceError(
+        "KIS 당일 주문내역 응답에 주문 목록이 없어 주문 결과 불명 상태를 대조할 수 없습니다.",
+        { code: "KIS_PAPER_UNKNOWN_RESOLUTION_EVIDENCE_UNAVAILABLE", statusCode: 503 },
+      );
+    }
+    return history;
+  }
+
   enterUnknownResult({ command, error, resultKnownButNotDurable = false }) {
     const payload = {
       commandId: command.commandId,
@@ -455,10 +575,18 @@ export class KisPaperOrderService {
         state.state = "UNKNOWN";
         state.result = unknownResponse(state, payload.error, false);
         state.error = payload.error ? structuredClone(payload.error) : null;
-        this.unknownResult = true;
-        this.killSwitch = true;
+      } else if (event.type === UNKNOWN_RESOLVED_EVENT) {
+        const payload = event.payload;
+        const state = this.commands.get(payload?.clientOrderId);
+        if (!state) continue;
+        state.state = "RESULT";
+        state.result = payload?.result ? structuredClone(payload.result) : null;
+        state.error = payload?.result?.error ? structuredClone(payload.result.error) : null;
       }
     }
+    // 사용자가 증권사 주문내역과 대조해 해소하지 않은 명령이 남아 있으면 재시작 후에도 킬 스위치를 유지합니다.
+    this.unknownResult = hasUnknownCommand(this.commands);
+    this.killSwitch = this.unknownResult;
   }
 
   markInterruptedCommandsUnknown() {
@@ -487,6 +615,183 @@ export class KisPaperOrderService {
       }
     }
   }
+}
+
+function hasUnknownCommand(commands) {
+  for (const state of commands.values()) {
+    if (state.state === "UNKNOWN") return true;
+  }
+  return false;
+}
+
+function trackedBrokerOrderNumbers(commands, exceptClientOrderId) {
+  const numbers = new Set();
+  for (const state of commands.values()) {
+    if (state.clientOrderId === exceptClientOrderId) continue;
+    const orderNumber = text(state?.result?.result?.orderNumber);
+    if (orderNumber) numbers.add(orderNumber);
+  }
+  return numbers;
+}
+
+function matchAcceptedBrokerOrder({ state, input, history, tracked }) {
+  const orderNumber = text(input?.brokerOrderNumber);
+  if (!orderNumber) {
+    throw new KisPaperOrderServiceError(
+      "증권사 접수로 확정하려면 KIS 주문내역에서 확인한 주문번호가 필요합니다.",
+      { code: "KIS_PAPER_UNKNOWN_RESOLUTION_ORDER_NUMBER_REQUIRED", statusCode: 400 },
+    );
+  }
+  const organizationNumber = text(input?.orderOrganizationNumber);
+  const matched = history.orders.find((order) => text(order?.orderNumber) === orderNumber
+    && (!organizationNumber || text(order?.orderOrganizationNumber) === organizationNumber));
+  if (!matched) {
+    throw new KisPaperOrderServiceError(
+      `KIS 당일 주문내역에서 주문번호 ${orderNumber}를 찾을 수 없습니다.`,
+      { code: "KIS_PAPER_UNKNOWN_RESOLUTION_ORDER_NOT_FOUND", statusCode: 409 },
+    );
+  }
+  if (tracked.has(orderNumber)) {
+    throw new KisPaperOrderServiceError(
+      `주문번호 ${orderNumber}는 이미 다른 실행 저널 명령의 결과로 기록돼 있습니다.`,
+      { code: "KIS_PAPER_UNKNOWN_RESOLUTION_ORDER_ALREADY_TRACKED", statusCode: 409 },
+    );
+  }
+  const conflicts = commandOrderConflicts(state, matched);
+  if (conflicts.length > 0) {
+    throw new KisPaperOrderServiceError(
+      `주문번호 ${orderNumber}가 실행 저널 명령과 일치하지 않습니다: ${conflicts
+        .map((item) => `${item.field} 저널 ${item.expected} · KIS ${item.actual}`)
+        .join(", ")}`,
+      { code: "KIS_PAPER_UNKNOWN_RESOLUTION_ORDER_CONFLICT", statusCode: 409 },
+    );
+  }
+  return matched;
+}
+
+function assertNoBrokerCandidate({ state, history, tracked }) {
+  const candidates = history.orders.filter((order) => {
+    const orderNumber = text(order?.orderNumber);
+    if (!orderNumber || tracked.has(orderNumber)) return false;
+    return brokerOrderMatchesCommand(state, order);
+  });
+  if (candidates.length > 0) {
+    throw new KisPaperOrderServiceError(
+      `KIS 당일 주문내역에 같은 조건의 주문 ${candidates
+        .map((order) => order.orderNumber)
+        .join(", ")}이(가) 남아 있어 미접수로 확정할 수 없습니다.`,
+      { code: "KIS_PAPER_UNKNOWN_RESOLUTION_CANDIDATE_EXISTS", statusCode: 409 },
+    );
+  }
+  return null;
+}
+
+function brokerOrderMatchesCommand(state, order) {
+  const request = state?.request ?? {};
+  if (upper(state?.operation) === "SUBMIT") {
+    const symbol = text(request.symbol);
+    return symbol !== null
+      && symbol === text(order?.symbol)
+      && upper(request.side) === upper(order?.side)
+      && finiteNumberOrNull(request.quantity) === finiteNumberOrNull(order?.orderQuantity);
+  }
+  const originalOrderNumber = text(request.originalOrderNumber);
+  return originalOrderNumber !== null && originalOrderNumber === text(order?.originalOrderNumber);
+}
+
+function commandOrderConflicts(state, order) {
+  const request = state?.request ?? {};
+  const conflicts = [];
+  if (upper(state?.operation) === "SUBMIT") {
+    compareResolutionField(conflicts, "종목코드", text(request.symbol), text(order?.symbol));
+    compareResolutionField(conflicts, "매매구분", upper(request.side), upper(order?.side));
+    compareResolutionField(
+      conflicts,
+      "주문수량",
+      finiteNumberOrNull(request.quantity),
+      finiteNumberOrNull(order?.orderQuantity),
+    );
+    return conflicts;
+  }
+  compareResolutionField(
+    conflicts,
+    "원주문번호",
+    text(request.originalOrderNumber),
+    text(order?.originalOrderNumber),
+  );
+  return conflicts;
+}
+
+function compareResolutionField(conflicts, field, expected, actual) {
+  if (expected === null || actual === null) return;
+  if (expected !== actual) conflicts.push({ field, expected, actual });
+}
+
+function unknownResolutionResponse({ state, resolution, matchedOrder, now }) {
+  const clientOrderId = state.clientOrderId;
+  const operation = state.operation;
+  if (resolution === "NOT_ACCEPTED") {
+    return {
+      clientOrderId,
+      operation,
+      status: "REJECTED",
+      replayed: false,
+      error: {
+        code: "KIS_PAPER_UNKNOWN_RESOLVED_NOT_ACCEPTED",
+        message: "KIS 당일 주문내역 대조 결과 증권사에 접수되지 않은 명령으로 확정했습니다.",
+      },
+    };
+  }
+  const request = state.request ?? {};
+  const originalOrderNumber = text(request.originalOrderNumber) ?? text(matchedOrder?.originalOrderNumber);
+  return {
+    clientOrderId,
+    operation,
+    status: "ACCEPTED",
+    replayed: false,
+    result: {
+      source: matchedOrder?.source ?? "KIS",
+      mode: matchedOrder?.mode ?? "PAPER_TRADING",
+      environment: matchedOrder?.environment ?? "PAPER",
+      status: "ACCEPTED",
+      orderNumber: text(matchedOrder?.orderNumber),
+      orderOrganizationNumber: text(matchedOrder?.orderOrganizationNumber),
+      orderTime: text(matchedOrder?.orderTime),
+      operation,
+      ...(originalOrderNumber ? { originalOrderNumber } : {}),
+      side: upper(request.side) ?? upper(matchedOrder?.side),
+      symbol: text(request.symbol) ?? text(matchedOrder?.symbol),
+      type: upper(request.type) ?? upper(matchedOrder?.type),
+      quantity: finiteNumberOrNull(request.quantity) ?? finiteNumberOrNull(matchedOrder?.orderQuantity),
+      limitPrice: finiteNumberOrNull(request.limitPrice),
+      exchange: upper(request.exchange),
+      acceptedAt: finiteNumberOrNull(matchedOrder?.orderedAt) ?? now(),
+      resolvedFromBrokerHistory: true,
+    },
+  };
+}
+
+function optionalNote(value) {
+  const note = text(value);
+  if (note === null) return null;
+  if (note.length > 500) {
+    throw new KisPaperOrderServiceError("대조 메모는 500자 이하여야 합니다.", {
+      code: "KIS_PAPER_UNKNOWN_RESOLUTION_NOTE_TOO_LONG",
+      statusCode: 400,
+    });
+  }
+  return note;
+}
+
+function text(value) {
+  if (value === null || value === undefined) return null;
+  const result = String(value).trim();
+  return result || null;
+}
+
+function upper(value) {
+  const result = text(value);
+  return result === null ? null : result.toUpperCase();
 }
 
 function reconciliationErrorCode(reconciliation) {
