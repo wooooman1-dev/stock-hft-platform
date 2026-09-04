@@ -91,7 +91,20 @@ POST /api/kis/paper/orders/cancel
 POST /api/kis/paper/kill-switch
 ```
 
-실전 주문은 존재하지 않으며 한국투자 모의주문은 자동전략에 연결되지 않습니다. 상세 설정, 요청 형식, 수동 검증 절차는 `docs/KIS_PAPER_TRADING.md`를 확인하세요.
+한국투자 모의주문은 자동전략에 연결되지 않습니다. 상세 설정, 요청 형식, 수동 검증 절차는 `docs/KIS_PAPER_TRADING.md`를 확인하세요.
+
+실전 주문은 사용자가 명시적으로 승인한 1주 카나리 단계로만 존재하며, `PULSEHFT_KIS_LIVE_MODE`와 `PULSEHFT_KIS_LIVE_ORDER_ENABLED`를 모두 켜야 동작하고 자동전략에는 연결되지 않습니다. 상세 내용은 `docs/KIS_LIVE_TRADING.md`를 확인하세요.
+
+```text
+GET  /api/kis/live/status
+GET  /api/kis/live/balance
+GET  /api/kis/live/performance
+POST /api/kis/live/orders
+POST /api/kis/live/orders/revise
+POST /api/kis/live/orders/cancel
+POST /api/kis/live/orders/resolve-unknown
+POST /api/kis/live/kill-switch
+```
 
 `GET /api/kis/paper/fill-comparison`은 주문 제출 시점에 캡처한 KIS 10단계 호가를 내부 `SIMULATION` 체결 엔진에 그대로 통과시켜 계산한 가상 체결가·체결량을, 이후 KIS가 보고한 실제 체결과 비교합니다. 예측이나 자동 판정이 아니라 두 체결모델의 차이를 확인하는 진단 전용 리포트입니다.
 
@@ -151,6 +164,14 @@ POST /api/kis/paper/orders
 POST /api/kis/paper/orders/revise
 POST /api/kis/paper/orders/cancel
 POST /api/kis/paper/kill-switch
+GET  /api/kis/live/status
+GET  /api/kis/live/balance
+GET  /api/kis/live/performance
+POST /api/kis/live/orders
+POST /api/kis/live/orders/revise
+POST /api/kis/live/orders/cancel
+POST /api/kis/live/orders/resolve-unknown
+POST /api/kis/live/kill-switch
 GET  /api/strategy/settings
 PUT  /api/strategy/settings
 POST /api/strategy/settings/reset

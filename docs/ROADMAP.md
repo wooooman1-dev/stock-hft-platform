@@ -65,3 +65,16 @@
 - 충분한 모의투자 기간 — 코드로 자동 판정하지 않음. `GET /api/kis/paper/performance`의 `operational.daysSinceLastIncident`로 마지막 사고 이후 경과일수를 참고 지표로만 노출하며, 실전 전환 가능 여부는 사용자가 직접 판단
 - 사용자 별도 승인 전 실전 주문 구현 금지
 - 사용자 별도 승인 후에도 최소금액 카나리부터 별도 설계
+
+## Phase 6 — 실전 카나리 완료
+
+- 사용자가 실계좌 자격정보 준비 완료·1주 카나리·모의투자와 동일한 리스크 한도 로직 재사용·이중 안전플래그를 명시적으로 승인한 뒤 구현
+- 실전 시세 읽기 전용(`kisConfig.js`)·모의투자(`kisPaperConfig.js`)와 완전히 분리된 형제 파일 세트(`kisLiveConfig.js`, `kisLiveTradingClient.js`, `kisLiveOrderService.js` 등) — 매개변수화 대신 의도적 복제, 구조적 패리티 테스트(`kisLiveOrderServiceParity.test.js`)로 드리프트 방지
+- 이중 안전플래그: `PULSEHFT_KIS_LIVE_MODE`(연결)와 `PULSEHFT_KIS_LIVE_ORDER_ENABLED`(주문 제출)를 분리해 둘 다 켜야만 실제 주문 가능
+- 1주 하드 상한을 설정 로드 시점과 주문 처리 시점 두 곳에서 각각 강제
+- 모의투자와 물리적으로 분리된 실행 저널(`execution-journal-live.jsonl`)과 토큰 파일(`kis-live-token.json`)로 두 계좌의 주문 상태·킬 스위치가 서로 섞이지 않음(`kisJournalIsolation.test.js`로 검증)
+- 실전 TR ID(`TTTC*`)는 한국투자증권 공식 GitHub(`koreainvestment/open-trading-api`)의 `env_dv === "real"` 분기 값을 직접 확인해 채움(추정 금지)
+- 모의투자와 동일한 대사(`KisLiveReconciler`)·성과 통계(`KisLivePerformanceTracker`)·장애 주입 검증(`kisLiveFaultInjection.test.js`)을 실전 계좌 전용으로 재구현
+- `KisMainWorkspace`(모의투자 전용 오케스트레이터)를 거치지 않고 `app.js`에서 `/api/kis/live/*`로 직접 배선 — 종목 자동 선택·자동전략 연결 없음, API·테스트 전용, 대시보드 UI 없음
+- 진단 전용 기능(`fill-comparison`)은 이번 카나리 범위에서 제외
+- 실계좌 수동 검증은 아직 수행되지 않음 — `docs/KIS_LIVE_TRADING.md`의 검증 이력에 사용자가 직접 기록 예정

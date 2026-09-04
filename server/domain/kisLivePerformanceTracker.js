@@ -1,0 +1,255 @@
+const EQUITY_EVENT = "BROKER_EQUITY_SNAPSHOT";
+const FILL_EVENT = "BROKER_FILL_OBSERVED";
+
+/**
+ * 한국투자 실전계좌 잔고·주문내역을 실행 저널에 원시 이벤트(평가금액 스냅샷, 신규 체결 증분)로
+ * 기록하고, 저장된 이벤트만으로 성과 통계·최대 낙폭·연속 손실을 계산한다.
+ * FIFO 매칭 대상 매수 로트가 없는 매도 체결(추적 시작 이전 보유수량)은 실현손익 계산에서 제외되고
+ * costBasisIncompleteQuantity로 별도 집계된다.
+ */
+export class KisLivePerformanceTracker {
+  constructor({ journal, now = Date.now } = {}) {
+    if (!journal || typeof journal.append !== "function" || typeof journal.readAll !== "function") {
+      throw new TypeError("append/readAll을 제공하는 실행 저널이 필요합니다.");
+    }
+    if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
+    this.journal = journal;
+    this.now = now;
+    this.observedExecutedQuantity = new Map();
+    this.replayJournal();
+  }
+
+  replayJournal() {
+    for (const event of this.journal.readAll()) {
+      if (event.type !== FILL_EVENT) continue;
+      const payload = event?.payload ?? {};
+      const key = fillKey(payload.orderOrganizationNumber, payload.orderNumber);
+      const cumulative = number(payload.cumulativeExecutedQuantity);
+      const previous = this.observedExecutedQuantity.get(key) ?? 0;
+      if (cumulative > previous) this.observedExecutedQuantity.set(key, cumulative);
+    }
+  }
+
+  record({ balance, orderHistory } = {}) {
+    const capturedAt = this.now();
+    const day = koreaDateKey(capturedAt);
+    const summary = balance?.summary ?? {};
+    const totalEvaluationAmount = finiteOrNull(summary.totalEvaluationAmount);
+    if (totalEvaluationAmount !== null) {
+      this.journal.append(EQUITY_EVENT, {
+        day,
+        capturedAt,
+        totalEvaluationAmount,
+        evaluationProfitLoss: finiteOrNull(summary.evaluationProfitLoss) ?? 0,
+        cash: finiteOrNull(summary.cash),
+      }, capturedAt);
+    }
+
+    const orders = Array.isArray(orderHistory?.orders) ? orderHistory.orders : [];
+    for (const order of orders) {
+      const orderNumber = text(order?.orderNumber);
+      if (!orderNumber) continue;
+      const executedQuantity = number(order?.executedQuantity);
+      if (executedQuantity <= 0) continue;
+      const key = fillKey(order?.orderOrganizationNumber, orderNumber);
+      const previous = this.observedExecutedQuantity.get(key) ?? 0;
+      const delta = executedQuantity - previous;
+      if (delta <= 0) continue;
+      this.observedExecutedQuantity.set(key, executedQuantity);
+      this.journal.append(FILL_EVENT, {
+        day,
+        capturedAt,
+        orderedAt: finiteOrNull(order?.orderedAt),
+        orderNumber,
+        orderOrganizationNumber: text(order?.orderOrganizationNumber),
+        symbol: text(order?.symbol),
+        side: text(order?.side)?.toUpperCase() ?? null,
+        deltaQuantity: delta,
+        executedPrice: number(order?.averageExecutedPrice),
+        cumulativeExecutedQuantity: executedQuantity,
+      }, capturedAt);
+    }
+  }
+
+  report() {
+    return computePerformanceReport(this.journal.readAll(), { now: this.now() });
+  }
+}
+
+const INCIDENT_EVENT_TYPES = new Set(["BROKER_ORDER_UNKNOWN", "BROKER_RECONCILIATION_MISMATCH"]);
+const DAY_MS = 24 * 60 * 60 * 1_000;
+
+export function computePerformanceReport(events, { now = Date.now() } = {}) {
+  const operational = computeOperationalStats(events, now);
+  const equitySnapshots = events
+    .filter((event) => event.type === EQUITY_EVENT)
+    .map((event) => event.payload)
+    .sort((left, right) => left.capturedAt - right.capturedAt);
+
+  const fillEvents = events
+    .filter((event) => event.type === FILL_EVENT)
+    .map((event) => event.payload)
+    .sort((left, right) => (left.orderedAt ?? left.capturedAt) - (right.orderedAt ?? right.capturedAt));
+
+  let peak = null;
+  let maxDrawdownAmount = 0;
+  let maxDrawdownPct = 0;
+  for (const snapshot of equitySnapshots) {
+    const equity = snapshot.totalEvaluationAmount;
+    if (peak === null || equity > peak) peak = equity;
+    if (peak !== null && peak > 0) {
+      const drawdown = peak - equity;
+      const drawdownPct = drawdown / peak;
+      if (drawdown > maxDrawdownAmount) maxDrawdownAmount = drawdown;
+      if (drawdownPct > maxDrawdownPct) maxDrawdownPct = drawdownPct;
+    }
+  }
+  const latestEquity = equitySnapshots.at(-1) ?? null;
+  const currentDrawdownAmount = latestEquity && peak !== null
+    ? Math.max(0, peak - latestEquity.totalEvaluationAmount)
+    : 0;
+  const currentDrawdownPct = peak && peak > 0 ? currentDrawdownAmount / peak : 0;
+
+  const lotsBySymbol = new Map();
+  const realizedTrades = [];
+  let costBasisIncompleteQuantity = 0;
+  for (const fill of fillEvents) {
+    const symbol = fill.symbol;
+    if (!symbol || !fill.side || fill.deltaQuantity <= 0) continue;
+    if (fill.side === "BUY") {
+      const lots = lotsBySymbol.get(symbol) ?? [];
+      lots.push({ quantity: fill.deltaQuantity, price: fill.executedPrice });
+      lotsBySymbol.set(symbol, lots);
+      continue;
+    }
+    if (fill.side !== "SELL") continue;
+    const lots = lotsBySymbol.get(symbol) ?? [];
+    let remaining = fill.deltaQuantity;
+    let matchedQuantity = 0;
+    let costBasis = 0;
+    while (remaining > 0 && lots.length > 0) {
+      const lot = lots[0];
+      const take = Math.min(lot.quantity, remaining);
+      matchedQuantity += take;
+      costBasis += take * lot.price;
+      lot.quantity -= take;
+      remaining -= take;
+      if (lot.quantity <= 0) lots.shift();
+    }
+    if (remaining > 0) costBasisIncompleteQuantity += remaining;
+    if (matchedQuantity > 0) {
+      const proceeds = matchedQuantity * fill.executedPrice;
+      realizedTrades.push({
+        symbol,
+        quantity: matchedQuantity,
+        buyAveragePrice: costBasis / matchedQuantity,
+        sellPrice: fill.executedPrice,
+        realizedPnl: proceeds - costBasis,
+        closedAt: fill.orderedAt ?? fill.capturedAt,
+        orderNumber: fill.orderNumber,
+        costBasisIncomplete: remaining > 0,
+      });
+    }
+  }
+
+  const wins = realizedTrades.filter((trade) => trade.realizedPnl > 0);
+  const losses = realizedTrades.filter((trade) => trade.realizedPnl < 0);
+  const totalRealizedPnl = realizedTrades.reduce((sum, trade) => sum + trade.realizedPnl, 0);
+
+  let consecutiveLossStreak = 0;
+  for (let index = realizedTrades.length - 1; index >= 0; index -= 1) {
+    if (realizedTrades[index].realizedPnl < 0) consecutiveLossStreak += 1;
+    else break;
+  }
+  let maxConsecutiveLossStreak = 0;
+  let running = 0;
+  for (const trade of realizedTrades) {
+    if (trade.realizedPnl < 0) {
+      running += 1;
+      maxConsecutiveLossStreak = Math.max(maxConsecutiveLossStreak, running);
+    } else {
+      running = 0;
+    }
+  }
+
+  return {
+    generatedAt: now,
+    operational,
+    equity: {
+      snapshotCount: equitySnapshots.length,
+      current: latestEquity?.totalEvaluationAmount ?? null,
+      peak,
+      maxDrawdownAmount,
+      maxDrawdownPct,
+      currentDrawdownAmount,
+      currentDrawdownPct,
+    },
+    trades: {
+      realizedCount: realizedTrades.length,
+      wins: wins.length,
+      losses: losses.length,
+      winRate: realizedTrades.length > 0 ? wins.length / realizedTrades.length : null,
+      totalRealizedPnl,
+      averageWin: wins.length > 0 ? wins.reduce((sum, trade) => sum + trade.realizedPnl, 0) / wins.length : null,
+      averageLoss: losses.length > 0 ? losses.reduce((sum, trade) => sum + trade.realizedPnl, 0) / losses.length : null,
+      consecutiveLossStreak,
+      maxConsecutiveLossStreak,
+      costBasisIncompleteQuantity,
+      recent: realizedTrades.slice(-20),
+    },
+  };
+}
+
+// "충분한 실전투자 기간"은 자동으로 판정하지 않는다. 사고(UNKNOWN_RESULT, 계좌 대사 불일치) 발생
+// 이후 경과일수를 노출해, 카나리 단계 확장 여부를 사용자가 직접 판단할 수 있는 참고 지표만 제공한다.
+function computeOperationalStats(events, now) {
+  const timestamps = events.map((event) => number(event?.timestamp)).filter((value) => value > 0);
+  const trackingStartedAt = timestamps.length > 0 ? Math.min(...timestamps) : null;
+  const incidentTimestamps = events
+    .filter((event) => INCIDENT_EVENT_TYPES.has(event.type))
+    .map((event) => number(event?.timestamp))
+    .filter((value) => value > 0);
+  const lastIncidentAt = incidentTimestamps.length > 0 ? Math.max(...incidentTimestamps) : null;
+  const daysSinceLastIncident = lastIncidentAt !== null
+    ? Math.floor((now - lastIncidentAt) / DAY_MS)
+    : trackingStartedAt !== null
+      ? Math.floor((now - trackingStartedAt) / DAY_MS)
+      : null;
+  return {
+    trackingStartedAt,
+    lastIncidentAt,
+    daysSinceLastIncident,
+    note: "카나리 확장 게이트가 아닌 참고 지표입니다. 충분한 관찰 기간인지는 사용자가 직접 판단해야 합니다.",
+  };
+}
+
+function fillKey(organizationNumber, orderNumber) {
+  return `${text(organizationNumber) ?? "*"}:${text(orderNumber) ?? ""}`;
+}
+
+function koreaDateKey(timestamp) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function text(value) {
+  if (value === null || value === undefined) return null;
+  const result = String(value).trim();
+  return result || null;
+}
+
+function number(value) {
+  const result = Number(value);
+  return Number.isFinite(result) ? result : 0;
+}
+
+function finiteOrNull(value) {
+  const result = Number(value);
+  return Number.isFinite(result) ? result : null;
+}

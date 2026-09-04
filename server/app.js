@@ -28,6 +28,12 @@ import {
 } from "./integrations/kis/kisPaperConfig.js";
 import { KisPaperOrderService } from "./integrations/kis/kisPaperOrderService.js";
 import { KisPaperTradingClient } from "./integrations/kis/kisPaperTradingClient.js";
+import {
+  loadKisLiveConfiguration,
+  publicKisLiveConfiguration,
+} from "./integrations/kis/kisLiveConfig.js";
+import { KisLiveOrderService } from "./integrations/kis/kisLiveOrderService.js";
+import { KisLiveTradingClient } from "./integrations/kis/kisLiveTradingClient.js";
 import { KisTokenStore } from "./integrations/kis/kisTokenStore.js";
 import {
   applyVerificationMarketTick,
@@ -131,6 +137,19 @@ const kisPaperClient = kisPaperConfiguration.enabled
   : null;
 if (kisPaperClient) kisPaperClient.status();
 
+// 실전투자 카나리: 모의투자와 물리적으로 분리된 저널·토큰 파일을 사용해 두 계좌의 주문 상태가
+// 섞이지 않게 한다(docs/KIS_LIVE_TRADING.md 참고). PULSEHFT_KIS_LIVE_MODE만으로는 주문을 낼 수
+// 없고, PULSEHFT_KIS_LIVE_ORDER_ENABLED까지 별도로 켜야만 KisLiveOrderService가 생성된다.
+const kisLiveConfiguration = loadKisLiveConfiguration(join(dataDir, "kis-live.json"));
+const kisLiveJournal = new ExecutionJournal(join(dataDir, "execution-journal-live.jsonl"));
+const kisLiveTokenStore = kisLiveConfiguration.enabled
+  ? new KisTokenStore(join(dataDir, "kis-live-token.json"))
+  : null;
+const kisLiveClient = kisLiveConfiguration.enabled
+  ? new KisLiveTradingClient({ config: kisLiveConfiguration, tokenStore: kisLiveTokenStore })
+  : null;
+if (kisLiveClient) kisLiveClient.status();
+
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 
@@ -163,6 +182,15 @@ const kisPaperOrderService = kisPaperClient
   })
   : null;
 
+const kisLiveOrderService = kisLiveClient && kisLiveConfiguration.orderEnabled
+  ? new KisLiveOrderService({
+    client: kisLiveClient,
+    journal: kisLiveJournal,
+    limits: kisLiveConfiguration.limits,
+    onUnknownResult: () => runtime.setKillSwitch(true),
+  })
+  : null;
+
 const mainWorkspace = new KisMainWorkspace({
   selection: selectedInstrument,
   quoteClient: kisClient,
@@ -188,6 +216,10 @@ executionJournal.append("SESSION_STARTED", {
   kisPaperBalanceEnabled: Boolean(kisPaperClient),
   kisPaperOrderEnabled: Boolean(kisPaperOrderService),
   kisPaperAutomaticStrategyConnected: false,
+  kisLiveMode: kisLiveConfiguration.mode,
+  kisLiveBalanceEnabled: Boolean(kisLiveClient),
+  kisLiveOrderEnabled: Boolean(kisLiveOrderService),
+  kisLiveAutomaticStrategyConnected: false,
   internalSimulationConnectedToMainUi: false,
   instrumentSearchEnabled: true,
   recommendationScannerEnabled: Boolean(recommendationDataClient),
@@ -324,6 +356,53 @@ function requireKisPaperService(response) {
   return null;
 }
 
+function getKisLiveStatus() {
+  const publicConfig = publicKisLiveConfiguration(kisLiveConfiguration);
+  return {
+    ...(kisLiveClient
+      ? kisLiveClient.status()
+      : {
+        ...publicConfig,
+        token: { state: "MISSING", expiresAt: null },
+      }),
+    service: kisLiveOrderService
+      ? kisLiveOrderService.status()
+      : {
+        killSwitch: false,
+        unknownResult: false,
+        unknownCommands: [],
+        trackedOrderNumbers: [],
+        commandCount: 0,
+        todayCommandCount: 0,
+        limits: publicConfig.limits,
+        dailyRiskBaseline: null,
+        automaticStrategyConnected: false,
+      },
+  };
+}
+
+function getKisLiveHealthStatus() {
+  const publicConfig = publicKisLiveConfiguration(kisLiveConfiguration);
+  return {
+    enabled: publicConfig.enabled,
+    mode: publicConfig.mode,
+    balanceApiAvailable: Boolean(kisLiveClient),
+    orderApiAvailable: Boolean(kisLiveOrderService),
+    automaticStrategyConnected: false,
+    killSwitch: kisLiveOrderService?.status().killSwitch ?? false,
+    unknownResult: kisLiveOrderService?.status().unknownResult ?? false,
+  };
+}
+
+function requireKisLiveService(response) {
+  if (kisLiveOrderService) return kisLiveOrderService;
+  json(response, 503, {
+    error: "한국투자 실전투자 주문 모드가 비활성화되어 있습니다(PULSEHFT_KIS_LIVE_MODE, PULSEHFT_KIS_LIVE_ORDER_ENABLED 모두 필요).",
+    code: "KIS_LIVE_DISABLED",
+  });
+  return null;
+}
+
 function broadcastSnapshot(snapshot) {
   const payload = `event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`;
   for (const client of eventClients) client.write(payload);
@@ -343,6 +422,7 @@ const server = createServer(async (request, response) => {
         main: mainWorkspace.snapshot().system,
         kis: getKisHealthStatus(),
         kisPaper: getKisPaperHealthStatus(),
+        kisLive: getKisLiveHealthStatus(),
         instruments: instrumentCatalog.status(),
         recommendations: recommendationScanner.status(),
       });
@@ -538,6 +618,56 @@ const server = createServer(async (request, response) => {
       }
       if (body.enabled) runtime.setKillSwitch(true);
       return json(response, 200, mainWorkspace.setKillSwitch(body.enabled));
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/live/status") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, getKisLiveStatus());
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/live/balance") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      return json(response, 200, await service.getBalance());
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/live/performance") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      return json(response, 200, service.getPerformance());
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/live/orders") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      return json(response, 200, await service.submitOrder(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/live/orders/revise") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      return json(response, 200, await service.reviseOrder(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/live/orders/cancel") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      return json(response, 200, await service.cancelOrder(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/live/orders/resolve-unknown") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      return json(response, 200, await service.resolveUnknownResult(await readJson(request)));
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/live/kill-switch") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      const body = await readJson(request);
+      if (typeof body.enabled !== "boolean") {
+        return json(response, 400, { error: "enabled(boolean)가 필요합니다." });
+      }
+      return json(response, 200, service.setKillSwitch(body.enabled));
     }
     if (url.pathname === "/api/kis" || url.pathname.startsWith("/api/kis/")) {
       if (rejectNonLoopbackKisRequest(request, response)) return;
