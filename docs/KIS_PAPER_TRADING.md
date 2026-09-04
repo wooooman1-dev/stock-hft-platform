@@ -80,24 +80,41 @@ PULSEHFT_KIS_PAPER_MAX_ORDER_QUANTITY=10
 PULSEHFT_KIS_PAPER_MAX_ORDER_VALUE=1000000
 PULSEHFT_KIS_PAPER_MAX_DAILY_ORDERS=20
 PULSEHFT_KIS_PAPER_MAX_DAILY_LOSS=100000
+PULSEHFT_KIS_PAPER_MAX_CONSECUTIVE_LOSSES=3
 ```
 
 - 시장가 주문은 `referencePrice`로 주문 추정금액을 계산합니다.
 - 일일 손실은 한국시간 날짜별 최초 잔고의 총평가금액을 실행 저널에 기준값으로 저장하고 현재 총평가금액과 비교합니다.
 - 현재 평가손익이 더 큰 손실을 나타내면 더 보수적인 값을 적용합니다.
 - 기준값과 주문 명령은 재시작 후에도 같은 append-only 저널에서 복원됩니다.
+- 연속 손실 한도는 실행 저널의 체결 이벤트로 FIFO 매칭한 실현손익 기준 연속 손실 거래 횟수가 한도에 도달하면 킬 스위치를 켭니다. `0`으로 설정하면 비활성화됩니다.
+- 장 종료(정규장 09:00-15:30 KST, 한국 공휴일 미반영) 이후 보유 포지션이 남아 있으면 `/api/kis/paper/status`의 `marketSession.afterHoursPositionsOpen`이 `true`가 됩니다. 이는 대시보드 알림 전용이며 시스템이 자동으로 청산 주문을 내지 않습니다.
 
 ## 로컬 API
 
 ```text
 GET  /api/kis/paper/status
 GET  /api/kis/paper/balance
+GET  /api/kis/paper/performance
+GET  /api/kis/paper/fill-comparison
 POST /api/kis/paper/orders
 POST /api/kis/paper/orders/revise
 POST /api/kis/paper/orders/cancel
 POST /api/kis/paper/orders/resolve-unknown
 POST /api/kis/paper/kill-switch
 ```
+
+`GET /api/kis/paper/performance`는 실행 저널의 `BROKER_EQUITY_SNAPSHOT`(평가금액 스냅샷)과 `BROKER_FILL_OBSERVED`(신규 체결 증분) 이벤트만으로 평가금액 최고점 대비 최대 낙폭, 심볼별 FIFO 매칭 실현손익, 승률, 현재·역대 최대 연속 손실 횟수를 계산합니다. 매수 로트가 없는 매도 체결(추적 시작 이전 보유수량)은 실현손익 계산에서 제외되고 `trades.costBasisIncompleteQuantity`로 별도 집계됩니다.
+
+응답의 `operational` 필드는 `BROKER_ORDER_UNKNOWN`(주문 결과 불명)과 `BROKER_RECONCILIATION_MISMATCH`(계좌 대사 불일치) 이벤트 중 가장 최근 발생 시각(`lastIncidentAt`)과 그 이후 경과일수(`daysSinceLastIncident`)를 보여줍니다. **이는 실전 전환을 자동으로 허용·차단하는 게이트가 아니라, "충분한 모의투자 기간"이 얼마나 지났는지 사용자가 직접 판단하기 위한 참고 지표입니다.**
+
+## 내부 체결모델과 KIS 모의체결 비교
+
+`GET /api/kis/paper/fill-comparison`은 주문 제출 시점의 KIS 10단계 호가(`orderBookSnapshot`, 최대 10단계)를 실행 저널의 `BROKER_ORDER_COMMAND`에 함께 기록해두고, 그 스냅샷을 내부 `SIMULATION`과 동일한 `PaperTrader` 매칭 엔진에 그대로 통과시켜 가상 체결가·체결량을 계산합니다. 이후 KIS가 보고한 실제 체결(`BROKER_FILL_OBSERVED`의 최신 누적값)과 가격(bps)·수량 차이를 비교합니다.
+
+- 리스크 한도는 두 체결모델의 매칭 로직 자체만 비교하기 위해 비교용 인스턴스에서는 사실상 무제한으로 둡니다(실제 주문 리스크 한도와 무관).
+- 스냅샷이 없는(이 기능 이전에 제출된) 주문이나 아직 KIS 체결이 관찰되지 않은 주문은 비교 대상에서 제외되거나 `comparable: false`로 표시됩니다.
+- 자동 판정이나 실전 전환 게이트가 아니라 진단 전용 리포트입니다.
 
 지정가 매수 예시:
 

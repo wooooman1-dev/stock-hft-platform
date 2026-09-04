@@ -26,6 +26,12 @@ const EVENT_TYPES = new Set([
   "BROKER_RECONCILIATION_BASELINE",
   "BROKER_RECONCILIATION_MISMATCH",
   "BROKER_RECONCILIATION_ACKNOWLEDGED",
+  "BROKER_EQUITY_SNAPSHOT",
+  "BROKER_FILL_OBSERVED",
+  "STRATEGY_APPROVAL_REQUESTED",
+  "STRATEGY_APPROVAL_APPROVED",
+  "STRATEGY_APPROVAL_REJECTED",
+  "STRATEGY_APPROVAL_EXPIRED",
 ]);
 
 export class ExecutionJournalError extends Error {
@@ -187,6 +193,11 @@ export class ExecutionJournalRecorder {
   recordSessionStarted(payload, timestamp) {
     if (!this.journal) return null;
     return this.journal.append("SESSION_STARTED", payload, timestamp);
+  }
+
+  recordStrategyApproval(type, payload, timestamp) {
+    if (!this.journal) return null;
+    return this.journal.append(type, payload, timestamp);
   }
 
   capture(account) {

@@ -48,19 +48,20 @@
 
 ## Phase 4 — 모의계좌 주문 상태 대사
 
-- 주문내역·체결내역 조회
-- 접수·부분체결·전량체결·거절 상태 지속 동기화
+- 주문내역·체결내역 조회 완료
+- 접수·부분체결·전량체결·거절 상태 지속 동기화 완료 — 조회형(주문 제출·조회 시점) 갱신, 상시 백그라운드 폴러는 아님
 - `UNKNOWN_RESULT` 수동 해소 절차 완료 — `BROKER_ORDER_UNKNOWN_RESOLVED` 이벤트와 주문내역 교차검증
-- 주문 정정·취소 후 최종 상태 대사
-- 내부 체결모델과 증권사 모의체결 비교
-- 장 종료 정책과 연속 손실 제한
-- 실행 저널 기반 성과 통계·최대 낙폭
+- 주문 정정·취소 후 최종 상태 대사 완료 — 정정 수량·지정가, 취소 반영 여부를 대사 프레임워크로 확장
+- 내부 체결모델과 증권사 모의체결 비교 완료 — 주문 제출 시점 KIS 10단계 호가 스냅샷을 내부 `PaperTrader` 매칭 엔진에 통과시켜 가상 체결과 실제 KIS 체결을 비교하는 진단 리포트(`GET /api/kis/paper/fill-comparison`). 예측·자동판정 아님, 두 시스템은 여전히 분리 운영
+- 장 종료 정책과 연속 손실 제한 완료 — 연속 손실은 `BROKER_FILL_OBSERVED` 기반 FIFO 실현손익으로 킬 스위치 차단, 장 종료 보유포지션은 대시보드 알림 전용(자동 청산 없음, 사용자 결정)
+- 실행 저널 기반 성과 통계·최대 낙폭 완료 — `BROKER_EQUITY_SNAPSHOT`·`BROKER_FILL_OBSERVED` 이벤트와 `GET /api/kis/paper/performance`
 
 ## Phase 5 — 검증과 실전 경계
 
-- 수수료·세금·슬리피지 모델
-- 전략 버전 관리와 워크포워드 테스트
-- 반자동 승인 모드
-- 충분한 모의투자 기간과 장애 주입 검증
+- 수수료·세금·슬리피지 모델 완료 — 내부 `SIMULATION`(`PaperTrader`) 대상, 환경변수로 구성 가능한 참고 추정치. KIS 모의계좌는 브로커 응답의 `estimatedFeesAndTaxes`로 이미 실비용 반영됨
+- 전략 버전 관리와 워크포워드 테스트 완료 — 설정 저장마다 append-only 이력(`GET /api/strategy/settings/history`, `POST /api/strategy/settings/restore/:version`) 기록, `scripts/walk-forward-backtest.js`가 실제 기록된 시장 데이터로 여러 설정 버전의 구간별 상대 성과를 비교(수동 실행, 실전 판정 아님)
+- 반자동 승인 모드 완료 — `approvalMode: SEMI_AUTO`에서 신규 진입만 승인 대기(`GET/POST /api/strategy/pending-approvals`), 보호 청산·일반 매도는 항상 즉시 실행, 만료시간·중복요청 방지·실행저널 기록 포함. 내부 `SIMULATION`이 대시보드(`public/`)에 연결되지 않은 기존 설계(`strategySettingsPanel.js` 포함)와 동일하게 API·테스트로만 완결, 별도 UI 없음
+- 장애 주입 검증 완료 — `server/test/kisPaperFaultInjection.test.js`가 실제 HTTP 계층(타임아웃·5xx·잘못된 JSON·명확한 거절 응답)을 주입해 UNKNOWN_RESULT 판정·킬 스위치·재시작 멱등 복원을 종단 간 검증
+- 충분한 모의투자 기간 — 코드로 자동 판정하지 않음. `GET /api/kis/paper/performance`의 `operational.daysSinceLastIncident`로 마지막 사고 이후 경과일수를 참고 지표로만 노출하며, 실전 전환 가능 여부는 사용자가 직접 판단
 - 사용자 별도 승인 전 실전 주문 구현 금지
 - 사용자 별도 승인 후에도 최소금액 카나리부터 별도 설계

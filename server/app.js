@@ -9,6 +9,7 @@ import { RecommendationScanner } from "./domain/recommendationScanner.js";
 import { loadRecommendationSettings } from "./domain/recommendationSettings.js";
 import { createRealtimeResearchJournal } from "./domain/realtimeResearchJournal.js";
 import { MarketRuntime } from "./domain/runtime.js";
+import { loadPaperCostModel } from "./domain/paperTrader.js";
 import { SelectedInstrumentStore } from "./domain/selectedInstrumentStore.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
 import {
@@ -149,6 +150,7 @@ const runtime = new MarketRuntime(
     instrumentPriceSource: selectedInstrument.priceSource,
     instrumentQuoteFetchedAt: selectedInstrument.quoteFetchedAt,
     instrumentSelectedAt: selectedInstrument.selectedAt,
+    costModel: loadPaperCostModel(process.env),
   },
 );
 
@@ -490,6 +492,18 @@ const server = createServer(async (request, response) => {
       if (!service) return;
       return json(response, 200, await service.getBalance());
     }
+    if (request.method === "GET" && url.pathname === "/api/kis/paper/performance") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, service.getPerformance());
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/paper/fill-comparison") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, service.getFillComparison());
+    }
     if (request.method === "POST" && url.pathname === "/api/kis/paper/orders") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
@@ -542,6 +556,30 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "POST" && url.pathname === "/api/strategy/settings/reset") {
       return json(response, 200, runtime.resetStrategySettings());
+    }
+    if (request.method === "GET" && url.pathname === "/api/strategy/settings/history") {
+      return json(response, 200, { history: runtime.getStrategySettingsHistory() });
+    }
+    const restoreMatch = request.method === "POST"
+      ? url.pathname.match(/^\/api\/strategy\/settings\/restore\/(\d+)$/)
+      : null;
+    if (restoreMatch) {
+      return json(response, 200, runtime.restoreStrategySettings(Number(restoreMatch[1])));
+    }
+    if (request.method === "GET" && url.pathname === "/api/strategy/pending-approvals") {
+      return json(response, 200, { pendingApprovals: runtime.getPendingApprovals() });
+    }
+    const approveMatch = request.method === "POST"
+      ? url.pathname.match(/^\/api\/strategy\/pending-approvals\/([^/]+)\/approve$/)
+      : null;
+    if (approveMatch) {
+      return json(response, 200, runtime.approveOrder(decodeURIComponent(approveMatch[1])));
+    }
+    const rejectMatch = request.method === "POST"
+      ? url.pathname.match(/^\/api\/strategy\/pending-approvals\/([^/]+)\/reject$/)
+      : null;
+    if (rejectMatch) {
+      return json(response, 200, runtime.rejectOrder(decodeURIComponent(rejectMatch[1])));
     }
     if (request.method === "POST" && url.pathname === "/api/verification/market-tick") {
       if (!verificationApiEnabled || !isLoopbackAddress(request.socket.remoteAddress)) {

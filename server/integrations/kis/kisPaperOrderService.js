@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { KisPaperReconciler } from "../../domain/kisPaperReconciler.js";
+import { KisPaperPerformanceTracker } from "../../domain/kisPaperPerformance.js";
+import { computeFillModelComparison } from "../../domain/fillModelComparison.js";
 import {
   KisPaperOrderServiceError,
   finiteNumberOrNull,
   koreaDateKey,
   normalizeClientOrderId,
+  normalizeOrderBookSnapshot,
   normalizeReviseCancelRequest,
   normalizeSubmitRequest,
   replayExisting,
@@ -59,11 +62,15 @@ export class KisPaperOrderService {
     this.queue = Promise.resolve();
     this.reconciliationPromise = null;
     this.lastReconciliationRefreshAt = 0;
+    this.lastKnownPositionQuantity = null;
     this.replayJournal();
     this.markInterruptedCommandsUnknown();
     this.reconciler = typeof client.getDailyOrders === "function"
       && typeof client.getCancelableOrders === "function"
       ? new KisPaperReconciler({ journal, now })
+      : null;
+    this.performanceTracker = typeof client.getDailyOrders === "function"
+      ? new KisPaperPerformanceTracker({ journal, now })
       : null;
   }
 
@@ -83,6 +90,11 @@ export class KisPaperOrderService {
       checkedAt: null,
       day: today,
     };
+    const marketSession = {
+      regularSessionOpen: isKoreaRegularSession(this.now()),
+      afterHoursPositionsOpen: !isKoreaRegularSession(this.now()) && (this.lastKnownPositionQuantity ?? 0) > 0,
+      note: "정규장(09:00-15:30 KST, 한국 공휴일 미반영) 기준 알림 전용 표시이며 자동 청산은 없습니다.",
+    };
     return {
       killSwitch: this.killSwitch || this.unknownResult || reconciliation.blocked,
       manualKillSwitch: this.killSwitch,
@@ -94,6 +106,7 @@ export class KisPaperOrderService {
       limits: structuredClone(this.limits),
       dailyRiskBaseline: structuredClone(this.dailyRiskBaselines.get(today) ?? null),
       reconciliation,
+      marketSession,
       automaticStrategyConnected: false,
     };
   }
@@ -136,6 +149,7 @@ export class KisPaperOrderService {
       operation: "SUBMIT",
       clientOrderId: normalizeClientOrderId(input?.clientOrderId),
       request: normalizeSubmitRequest(input),
+      orderBookSnapshot: normalizeOrderBookSnapshot(input?.orderBookSnapshot),
       call: (request) => this.client.submitOrder(request),
     }));
   }
@@ -164,7 +178,7 @@ export class KisPaperOrderService {
     return next;
   }
 
-  async execute({ operation, clientOrderId, request, call }) {
+  async execute({ operation, clientOrderId, request, call, orderBookSnapshot = null }) {
     const existing = this.commands.get(clientOrderId);
     if (existing) return replayExisting(existing);
     await this.enforceSafety(operation, request);
@@ -174,6 +188,7 @@ export class KisPaperOrderService {
       clientOrderId,
       operation,
       request: safeRequest(request),
+      orderBookSnapshot: orderBookSnapshot ? structuredClone(orderBookSnapshot) : null,
       timestamp,
       day: koreaDateKey(timestamp),
     };
@@ -326,6 +341,16 @@ export class KisPaperOrderService {
         );
       }
     }
+    if (this.limits.maxConsecutiveLosses > 0 && this.performanceTracker) {
+      const streak = this.performanceTracker.report().trades.consecutiveLossStreak;
+      if (streak >= this.limits.maxConsecutiveLosses) {
+        this.killSwitch = true;
+        throw new KisPaperOrderServiceError(
+          `실현손실 거래가 ${streak}회 연속 발생해 연속 손실 한도 ${this.limits.maxConsecutiveLosses}회에 도달했습니다.`,
+          { code: "KIS_PAPER_CONSECUTIVE_LOSS_LIMIT", statusCode: 423 },
+        );
+      }
+    }
   }
 
   async refreshReconciliation({ balance = null, force = false } = {}) {
@@ -355,12 +380,27 @@ export class KisPaperOrderService {
         balance: balanceResult,
         cancelableOrders,
       });
+      this.performanceTracker?.record({ balance: balanceResult, orderHistory });
+      this.lastKnownPositionQuantity = Array.isArray(balanceResult?.positions)
+        ? balanceResult.positions.reduce((sum, position) => sum + (Number(position?.quantity) || 0), 0)
+        : this.lastKnownPositionQuantity;
       this.lastReconciliationRefreshAt = this.now();
       return report;
     } catch (error) {
       this.lastReconciliationRefreshAt = this.now();
       return this.reconciler.markUnavailable(error);
     }
+  }
+
+  getPerformance() {
+    if (!this.performanceTracker) {
+      return { available: false, reason: "KIS 당일 주문내역 조회를 사용할 수 없어 성과 통계를 계산할 수 없습니다." };
+    }
+    return { available: true, ...this.performanceTracker.report() };
+  }
+
+  getFillComparison() {
+    return computeFillModelComparison(this.journal.readAll(), { now: this.now });
   }
 
   unknownCommands() {
@@ -615,6 +655,20 @@ export class KisPaperOrderService {
       }
     }
   }
+}
+
+function isKoreaRegularSession(timestamp) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Seoul",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  if (values.weekday === "Sat" || values.weekday === "Sun") return false;
+  const minutesSinceMidnight = Number(values.hour) * 60 + Number(values.minute);
+  return minutesSinceMidnight >= 9 * 60 && minutesSinceMidnight <= 15 * 60 + 30;
 }
 
 function hasUnknownCommand(commands) {

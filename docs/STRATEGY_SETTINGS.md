@@ -78,9 +78,48 @@ API와 저장 파일에서는 손절·익절·트레일링 스톱을 정수 basi
 GET  /api/strategy/settings
 PUT  /api/strategy/settings
 POST /api/strategy/settings/reset
+GET  /api/strategy/settings/history
+POST /api/strategy/settings/restore/:version
+GET  /api/strategy/pending-approvals
+POST /api/strategy/pending-approvals/:id/approve
+POST /api/strategy/pending-approvals/:id/reject
 ```
 
 `PUT`은 전체 또는 일부 설정을 받을 수 있으며 알 수 없는 필드와 허용범위를 벗어난 값은 HTTP 400으로 거절합니다.
+
+## 반자동 승인 모드
+
+`approvalMode`를 `SEMI_AUTO`로 설정하면 자동전략의 **신규 진입(매수)** 신호는 즉시 주문을 내지 않고 대기 승인 요청으로 전환됩니다. `approvalExpiryMs`(기본 15,000ms, 3,000~300,000ms)가 지나면 자동 만료됩니다.
+
+- 손절·익절·트레일링 스톱·최대 보유시간 같은 **보호 청산과 일반 매도신호는 승인 모드와 무관하게 항상 즉시 실행**됩니다. 위험을 새로 늘리는 진입만 사람이 확인하고, 위험을 줄이는 청산은 지연시키지 않습니다.
+- 대기 요청이 하나라도 `PENDING`이면 같은 진입 신호가 다시 나와도 중복 요청을 만들지 않습니다.
+- 승인(`approve`)은 요청 시점이 아니라 **승인 시점의 현재 시세·호가**로 시장가 주문을 제출합니다.
+- 모든 상태 전이(`STRATEGY_APPROVAL_REQUESTED`·`APPROVED`·`REJECTED`·`EXPIRED`)는 실행 저널에 기록됩니다.
+- 이 기능은 API·도메인 로직·테스트로 완결되어 있습니다. `server/domain/runtime.js`(내부 `SIMULATION`) 자체가 `strategySettingsPanel.js`를 포함해 실제 대시보드(`public/`)에 연결되지 않은 검증·회귀테스트 전용 시스템이므로, 이 기능도 같은 이유로 별도 UI를 추가하지 않았습니다.
+
+## 버전 관리
+
+`PUT`·`reset`으로 설정이 바뀔 때마다 append-only 이력 파일(`<저장 파일>.history.jsonl`)에 `{version, timestamp, previous, next}` 레코드를 추가합니다. 버전 번호는 1부터 순차 증가하며 기존 레코드를 덮어쓰거나 삭제하지 않습니다.
+
+`GET /api/strategy/settings/history`는 전체 이력을 반환합니다. `POST /api/strategy/settings/restore/:version`은 과거 버전의 설정값을 현재 설정으로 다시 저장합니다 — 이력을 되감는 것이 아니라 그 값을 **새 버전으로 한 번 더 저장**하므로 이력은 항상 선형으로 증가합니다. 이력 파일이 손상되면 조용히 건너뛰지 않고 오류를 던집니다.
+
+## 워크포워드 백테스트
+
+`scripts/walk-forward-backtest.js`는 `docs/REALTIME_RESEARCH_RECORD_REPLAY.md`로 기록한 실제 KIS 호가·체결 JSONL과, 위 버전 이력에 저장된 여러 전략 설정을 같은 기록 데이터에 시간 구간(윈도우)별로 순차 적용해 `server/domain/analysis.js`(지표) + `server/domain/strategyPolicy.js`(진입·청산 판단) + `server/domain/paperTrader.js`(내부 체결 엔진)를 그대로 재사용한 가상 성과(실현손익, 최대 낙폭, 주문·체결 수)를 계산합니다.
+
+```powershell
+node scripts/walk-forward-backtest.js <research.jsonl> `
+  --strategy-settings-path=.pulsehft/strategy-settings.json `
+  --versions=1,3,5 `
+  --window-count=4 `
+  --realistic-costs `
+  --output=result.json
+```
+
+- 자동 스케줄링이나 실거래·모의투자 연동이 없는 수동 실행 스크립트입니다.
+- 각 (설정 버전 × 윈도우) 조합의 상대 성과만 비교하는 진단 도구이며, 실전 전환 여부를 판정하지 않습니다.
+- 기록된 호가·체결만 재생하므로 숨은 유동성, 실제 주문 큐 순서, 지연은 반영하지 않습니다.
+- `--realistic-costs`를 주면 `PULSEHFT_PAPER_*` 환경변수의 수수료·세금·슬리피지 모델을 적용하고, 기본값은 무비용입니다.
 
 ## 결정적 위험청산 검증 API
 

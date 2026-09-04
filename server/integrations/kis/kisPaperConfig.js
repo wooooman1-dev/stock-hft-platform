@@ -145,6 +145,7 @@ function defaultLimits(env) {
     maxOrderValue: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_ORDER_VALUE, 1_000_000, 1, 10_000_000_000),
     maxDailyOrders: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_DAILY_ORDERS, 20, 1, 10_000),
     maxDailyLoss: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_DAILY_LOSS, 100_000, 0, 10_000_000_000),
+    maxConsecutiveLosses: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_CONSECUTIVE_LOSSES, 3, 0, 100),
   });
 }
 

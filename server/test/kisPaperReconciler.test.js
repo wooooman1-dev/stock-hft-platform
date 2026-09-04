@@ -242,3 +242,180 @@ test("order service blocks submit on reconciliation mismatch but still permits c
   assert.equal(cancel.status, "ACCEPTED");
   assert.equal(client.cancelCalls, 1);
 });
+
+function acceptedReviseCommand({
+  clientOrderId = "ui-revise-1",
+  orderNumber = "0000010400",
+  organizationNumber = "00950",
+  quantity = 2,
+  limitPrice = 236_000,
+  timestamp = NOW - 60_000,
+} = {}) {
+  return {
+    commandId: `command-${clientOrderId}`,
+    clientOrderId,
+    operation: "REVISE",
+    request: {
+      originalOrderNumber: "0000010300",
+      orderOrganizationNumber: organizationNumber,
+      type: "LIMIT",
+      quantity,
+      limitPrice,
+      allQuantity: false,
+    },
+    timestamp,
+    day: DAY,
+    state: "RESULT",
+    result: {
+      clientOrderId,
+      operation: "REVISE",
+      status: "ACCEPTED",
+      replayed: false,
+      result: { orderNumber, orderOrganizationNumber: organizationNumber },
+    },
+    error: null,
+  };
+}
+
+function acceptedCancelCommand({
+  clientOrderId = "ui-cancel-1",
+  orderNumber = "0000010500",
+  organizationNumber = "00950",
+  quantity = 1,
+  timestamp = NOW - 60_000,
+} = {}) {
+  return {
+    commandId: `command-${clientOrderId}`,
+    clientOrderId,
+    operation: "CANCEL",
+    request: {
+      originalOrderNumber: "0000010300",
+      orderOrganizationNumber: organizationNumber,
+      quantity,
+      allQuantity: true,
+    },
+    timestamp,
+    day: DAY,
+    state: "RESULT",
+    result: {
+      clientOrderId,
+      operation: "CANCEL",
+      status: "ACCEPTED",
+      replayed: false,
+      result: { orderNumber, orderOrganizationNumber: organizationNumber },
+    },
+    error: null,
+  };
+}
+
+test("a revise whose broker quantity or price diverges from the journal is a mismatch", () => {
+  const journal = new MemoryJournal();
+  const reconciler = new KisPaperReconciler({ journal, now: () => NOW });
+  const command = acceptedReviseCommand();
+  const revisedOrder = {
+    orderDate: "20260804",
+    orderTime: "100500",
+    orderNumber: "0000010400",
+    orderOrganizationNumber: "00950",
+    symbol: "005930",
+    name: "삼성전자",
+    side: "BUY",
+    type: "LIMIT",
+    orderQuantity: 3,
+    orderPrice: 236_000,
+    executedQuantity: 0,
+    remainingQuantity: 3,
+    canceledQuantity: 0,
+    rejectedQuantity: 0,
+    canceled: false,
+    status: "OPEN",
+  };
+  const report = reconciler.reconcile(reconcileInput({ commands: [command], orders: [revisedOrder], quantity: 0 }));
+  assert.equal(report.status, "MISMATCH");
+  assert.ok(report.issues.some((item) => item.code === "ORDER_REVISE_QUANTITY_MISMATCH"));
+});
+
+test("a revise whose broker quantity and price match the journal is consistent", () => {
+  const journal = new MemoryJournal();
+  const reconciler = new KisPaperReconciler({ journal, now: () => NOW });
+  const command = acceptedReviseCommand();
+  const revisedOrder = {
+    orderDate: "20260804",
+    orderTime: "100500",
+    orderNumber: "0000010400",
+    orderOrganizationNumber: "00950",
+    symbol: "005930",
+    name: "삼성전자",
+    side: "BUY",
+    type: "LIMIT",
+    orderQuantity: 2,
+    orderPrice: 236_000,
+    executedQuantity: 0,
+    remainingQuantity: 2,
+    canceledQuantity: 0,
+    rejectedQuantity: 0,
+    canceled: false,
+    status: "OPEN",
+  };
+  const report = reconciler.reconcile(reconcileInput({ commands: [command], orders: [revisedOrder], quantity: 0 }));
+  assert.equal(report.status, "CONSISTENT");
+});
+
+test("an accepted cancel not yet reflected as canceled at the broker is pending, then a mismatch after the grace period", () => {
+  let clock = NOW;
+  const journal = new MemoryJournal();
+  const reconciler = new KisPaperReconciler({ journal, now: () => clock, brokerVisibilityGraceMs: 30_000 });
+  const command = acceptedCancelCommand({ timestamp: NOW - 5_000 });
+  const openOrder = {
+    orderDate: "20260804",
+    orderTime: "100500",
+    orderNumber: "0000010500",
+    orderOrganizationNumber: "00950",
+    symbol: "005930",
+    name: "삼성전자",
+    side: "BUY",
+    type: "LIMIT",
+    orderQuantity: 1,
+    orderPrice: 235_000,
+    executedQuantity: 0,
+    remainingQuantity: 1,
+    canceledQuantity: 0,
+    rejectedQuantity: 0,
+    canceled: false,
+    status: "OPEN",
+  };
+  const pending = reconciler.reconcile(reconcileInput({ commands: [command], orders: [openOrder], quantity: 0 }));
+  assert.equal(pending.status, "PENDING");
+  assert.ok(pending.pending.some((item) => item.code === "ORDER_CANCEL_NOT_YET_REFLECTED"));
+
+  clock += 40_000;
+  const mismatch = reconciler.reconcile(reconcileInput({ commands: [command], orders: [openOrder], quantity: 0 }));
+  assert.equal(mismatch.status, "MISMATCH");
+  assert.ok(mismatch.issues.some((item) => item.code === "ORDER_CANCEL_NOT_REFLECTED"));
+});
+
+test("a cancel confirmed as canceled at the broker is consistent", () => {
+  const journal = new MemoryJournal();
+  const reconciler = new KisPaperReconciler({ journal, now: () => NOW });
+  const command = acceptedCancelCommand();
+  const canceledOrder = {
+    orderDate: "20260804",
+    orderTime: "100500",
+    orderNumber: "0000010500",
+    orderOrganizationNumber: "00950",
+    symbol: "005930",
+    name: "삼성전자",
+    side: "BUY",
+    type: "LIMIT",
+    orderQuantity: 1,
+    orderPrice: 235_000,
+    executedQuantity: 0,
+    remainingQuantity: 0,
+    canceledQuantity: 1,
+    rejectedQuantity: 0,
+    canceled: true,
+    status: "CANCELED",
+  };
+  const report = reconciler.reconcile(reconcileInput({ commands: [command], orders: [canceledOrder], quantity: 0 }));
+  assert.equal(report.status, "CONSISTENT");
+});

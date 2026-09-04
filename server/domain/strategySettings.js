@@ -9,6 +9,8 @@ export const DEFAULT_STRATEGY_SETTINGS = Object.freeze({
   takeProfitBps: null,
   trailingStopBps: null,
   maxHoldingMs: null,
+  approvalMode: "AUTO",
+  approvalExpiryMs: 15_000,
 });
 
 const EDITABLE_KEYS = Object.freeze([
@@ -21,7 +23,11 @@ const EDITABLE_KEYS = Object.freeze([
   "takeProfitBps",
   "trailingStopBps",
   "maxHoldingMs",
+  "approvalMode",
+  "approvalExpiryMs",
 ]);
+
+const APPROVAL_MODES = new Set(["AUTO", "SEMI_AUTO"]);
 
 export class StrategySettingsError extends Error {
   constructor(message, code = "INVALID_STRATEGY_SETTINGS") {
@@ -112,6 +118,13 @@ export function normalizeStrategySettings(
       1_000,
       "최대 보유시간",
     ),
+    approvalMode: approvalModeValue(merged.approvalMode),
+    approvalExpiryMs: integerInRange(
+      merged.approvalExpiryMs,
+      3_000,
+      300_000,
+      "승인 대기 만료시간",
+    ),
   });
 }
 
@@ -131,6 +144,14 @@ function integerInRange(value, minimum, maximum, label) {
 function optionalIntegerInRange(value, minimum, maximum, label) {
   if (value === null) return null;
   return integerInRange(value, minimum, maximum, label);
+}
+
+function approvalModeValue(value) {
+  const text = String(value ?? "").trim().toUpperCase();
+  if (!APPROVAL_MODES.has(text)) {
+    throw new StrategySettingsError("승인 모드는 AUTO 또는 SEMI_AUTO여야 합니다.");
+  }
+  return text;
 }
 
 function optionalSafeIntegerAtLeast(value, minimum, label) {

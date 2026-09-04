@@ -331,13 +331,21 @@ export class KisMainWorkspace extends EventEmitter {
   async submitOrder(input) {
     if (!this.paperService) throw disabledPaperError();
     const type = String(input?.type ?? "MARKET").trim().toUpperCase();
+    const marketSnapshot = this.snapshot();
     const request = {
       ...input,
       symbol: this.selection.symbol,
       type,
       referencePrice: type === "MARKET"
-        ? positiveNumberOr(input?.referencePrice, this.snapshot().lastPrice)
+        ? positiveNumberOr(input?.referencePrice, marketSnapshot.lastPrice)
         : input?.referencePrice,
+      orderBookSnapshot: {
+        capturedAt: marketSnapshot.timestamp,
+        tickSize: marketSnapshot.tickSize,
+        referencePrice: marketSnapshot.lastPrice,
+        bids: marketSnapshot.book?.bids ?? [],
+        asks: marketSnapshot.book?.asks ?? [],
+      },
     };
     const result = await this.paperService.submitOrder(request);
     await this.refreshAccount({ forceOrderHistory: true });

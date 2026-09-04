@@ -240,8 +240,13 @@ function evaluateState({
       }
       continue;
     }
-    if (String(state?.operation ?? "").toUpperCase() === "SUBMIT") {
+    const operation = String(state?.operation ?? "").toUpperCase();
+    if (operation === "SUBMIT") {
       compareSubmitFields(state?.request ?? {}, brokerOrder, issues);
+    } else if (operation === "REVISE") {
+      compareReviseFields(state?.request ?? {}, brokerOrder, issues);
+    } else if (operation === "CANCEL") {
+      compareCancelFields({ order: brokerOrder, ageMs, graceMs, issues, pending });
     }
   }
 
@@ -308,6 +313,47 @@ function compareSubmitFields(request, order, issues) {
       "ORDER_QUANTITY_MISMATCH",
       `주문번호 ${order.orderNumber}의 주문수량이 실행 저널 ${requestQuantity}주, KIS ${brokerQuantity}주로 다릅니다.`,
       { orderNumber: order.orderNumber, journalQuantity: requestQuantity, brokerQuantity },
+    ));
+  }
+}
+
+function compareReviseFields(request, order, issues) {
+  const requestQuantity = number(request?.quantity);
+  const brokerQuantity = number(order?.orderQuantity);
+  if (requestQuantity > 0 && brokerQuantity > 0 && requestQuantity !== brokerQuantity) {
+    issues.push(issue(
+      "ORDER_REVISE_QUANTITY_MISMATCH",
+      `주문번호 ${order.orderNumber}의 정정 수량이 실행 저널 ${requestQuantity}주, KIS ${brokerQuantity}주로 다릅니다.`,
+      { orderNumber: order.orderNumber, journalQuantity: requestQuantity, brokerQuantity },
+    ));
+  }
+  const requestType = text(request?.type)?.toUpperCase() ?? null;
+  if (requestType === "LIMIT") {
+    const requestPrice = number(request?.limitPrice);
+    const brokerPrice = number(order?.orderPrice);
+    if (requestPrice > 0 && brokerPrice > 0 && requestPrice !== brokerPrice) {
+      issues.push(issue(
+        "ORDER_REVISE_PRICE_MISMATCH",
+        `주문번호 ${order.orderNumber}의 정정 지정가가 실행 저널 ${requestPrice}원, KIS ${brokerPrice}원으로 다릅니다.`,
+        { orderNumber: order.orderNumber, journalPrice: requestPrice, brokerPrice },
+      ));
+    }
+  }
+}
+
+function compareCancelFields({ order, ageMs, graceMs, issues, pending }) {
+  if (order.canceled) return;
+  if (ageMs <= graceMs) {
+    pending.push(issue(
+      "ORDER_CANCEL_NOT_YET_REFLECTED",
+      `주문번호 ${order.orderNumber}의 취소 반영을 기다리는 중입니다.`,
+      { orderNumber: order.orderNumber, ageMs },
+    ));
+  } else {
+    issues.push(issue(
+      "ORDER_CANCEL_NOT_REFLECTED",
+      `취소가 접수된 주문번호 ${order.orderNumber}가 KIS 당일 주문내역에서 취소로 표시되지 않았습니다.`,
+      { orderNumber: order.orderNumber, ageMs },
     ));
   }
 }

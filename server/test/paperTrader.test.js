@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PaperOrderError, PaperTrader } from "../domain/paperTrader.js";
+import { PaperOrderError, PaperTrader, loadPaperCostModel } from "../domain/paperTrader.js";
 
 const book = ({ asks = [], bids = [] } = {}) => ({ asks, bids });
 const base = {
@@ -357,4 +357,118 @@ test("omitted timestamp uses the injected clock for order and fill events", () =
   assert.equal(order.createdAt, 55_000);
   assert.equal(order.fills[0].timestamp, 55_000);
   assert.ok(order.events.every((event) => event.timestamp === 55_000));
+});
+
+test("PaperTrader defaults to a zero-cost model when none is provided", () => {
+  const trader = new PaperTrader();
+  assert.deepEqual(trader.costModel, {
+    buyCommissionBps: 0,
+    sellCommissionBps: 0,
+    sellTaxBps: 0,
+    slippageTicks: 0,
+  });
+});
+
+test("buy commission is charged on top of fill value and folded into the cost basis", () => {
+  const trader = new PaperTrader(10_000_000, { now: () => 1_000, costModel: { buyCommissionBps: 100 } });
+  const order = trader.submit({
+    ...base,
+    side: "BUY",
+    type: "MARKET",
+    quantity: 10,
+    clientOrderId: "fee-buy-1",
+    book: book({ asks: [{ price: 70_000, size: 10 }] }),
+  });
+  assert.equal(order.fills[0].fee, 7_000);
+  assert.equal(order.fills[0].tax, 0);
+  const account = trader.snapshot(70_000);
+  assert.equal(account.cash, 10_000_000 - 700_000 - 7_000);
+  assert.equal(account.position.averagePrice, 70_700);
+  assert.equal(account.totalFeesPaid, 7_000);
+  assert.equal(account.totalTaxPaid, 0);
+});
+
+test("sell commission and tax reduce proceeds and realized pnl", () => {
+  const trader = new PaperTrader(10_000_000, {
+    now: () => 1_000,
+    costModel: { sellCommissionBps: 50, sellTaxBps: 20 },
+  });
+  trader.submit({
+    ...base,
+    side: "BUY",
+    type: "MARKET",
+    quantity: 10,
+    clientOrderId: "fee-sell-buy",
+    book: book({ asks: [{ price: 70_000, size: 10 }] }),
+  });
+  const sell = trader.submit({
+    ...base,
+    timestamp: 2_000,
+    referencePrice: 71_000,
+    side: "SELL",
+    type: "MARKET",
+    quantity: 4,
+    clientOrderId: "fee-sell-1",
+    book: book({ bids: [{ price: 71_000, size: 4 }] }),
+  });
+  assert.equal(sell.fills[0].fee, 1_420);
+  assert.equal(sell.fills[0].tax, 568);
+  const account = trader.snapshot(71_000);
+  assert.equal(account.cash, 10_000_000 - 700_000 + (284_000 - 1_420 - 568));
+  assert.equal(account.realizedPnl, (71_000 - 70_000) * 4 - 1_420 - 568);
+  assert.equal(account.totalFeesPaid, 1_420);
+  assert.equal(account.totalTaxPaid, 568);
+});
+
+test("slippage moves the executed price against the trader for market orders only", () => {
+  const trader = new PaperTrader(10_000_000, { now: () => 1_000, costModel: { slippageTicks: 2 } });
+  const marketBuy = trader.submit({
+    ...base,
+    side: "BUY",
+    type: "MARKET",
+    quantity: 5,
+    clientOrderId: "slippage-market-buy",
+    book: book({ asks: [{ price: 70_000, size: 5 }] }),
+  });
+  assert.equal(marketBuy.fills[0].bookPrice, 70_000);
+  assert.equal(marketBuy.fills[0].price, 70_200);
+  assert.equal(marketBuy.averageFilledPrice, 70_200);
+
+  const limitBuy = trader.submit({
+    ...base,
+    timestamp: 2_000,
+    side: "BUY",
+    type: "LIMIT",
+    quantity: 5,
+    limitPrice: 70_000,
+    clientOrderId: "slippage-limit-buy",
+    book: book({ asks: [{ price: 70_000, size: 5 }] }),
+  });
+  assert.equal(limitBuy.fills[0].bookPrice, 70_000);
+  assert.equal(limitBuy.fills[0].price, 70_000);
+});
+
+test("loadPaperCostModel falls back to reference defaults and honors env overrides", () => {
+  assert.deepEqual(loadPaperCostModel({}), {
+    buyCommissionBps: 1.40527,
+    sellCommissionBps: 1.40527,
+    sellTaxBps: 20,
+    slippageTicks: 1,
+  });
+  assert.deepEqual(loadPaperCostModel({
+    PULSEHFT_PAPER_BUY_COMMISSION_BPS: "5",
+    PULSEHFT_PAPER_SELL_COMMISSION_BPS: "5",
+    PULSEHFT_PAPER_SELL_TAX_BPS: "10",
+    PULSEHFT_PAPER_SLIPPAGE_TICKS: "0",
+  }), {
+    buyCommissionBps: 5,
+    sellCommissionBps: 5,
+    sellTaxBps: 10,
+    slippageTicks: 0,
+  });
+});
+
+test("an invalid cost model is rejected at construction time", () => {
+  assert.throws(() => new PaperTrader(10_000_000, { costModel: { buyCommissionBps: -1 } }), TypeError);
+  assert.throws(() => new PaperTrader(10_000_000, { costModel: { slippageTicks: 1.5 } }), TypeError);
 });
