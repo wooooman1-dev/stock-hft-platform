@@ -150,6 +150,20 @@ const kisLiveClient = kisLiveConfiguration.enabled
   : null;
 if (kisLiveClient) kisLiveClient.status();
 
+// 시세용과 주문용 자격정보를 공유하도록 명시적으로 옵트인한 상태는 조용히 넘어가지 않는다.
+if (kisLiveConfiguration.enabled && kisLiveConfiguration.sharedQuoteCredential) {
+  console.warn(
+    "[KIS-LIVE] 경고: 실전 시세 조회와 실전 주문이 같은 App Key를 사용합니다 "
+    + "(PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL=true). "
+    + "시세 조회 경로의 오류가 주문 권한을 가진 자격정보에 영향을 줄 수 있습니다.",
+  );
+  kisLiveJournal.append("LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED", {
+    processId: process.pid,
+    orderEnabled: kisLiveConfiguration.orderEnabled,
+    credentialSource: kisLiveConfiguration.credentialSource,
+  });
+}
+
 const verificationApiEnabled = isVerificationApiEnabled(process.env);
 const port = Number(process.env.PORT ?? 8787);
 

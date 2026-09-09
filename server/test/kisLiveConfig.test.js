@@ -141,3 +141,64 @@ test("KIS live config's env var namespace never collides with the read-only quot
   assert.doesNotThrow(() => loadKisConfiguration(null, { env }));
   assert.doesNotThrow(() => loadKisLiveConfiguration(null, { env }));
 });
+
+test("KIS live config allows shared quote credential only with explicit opt-in", () => {
+  const env = {
+    PULSEHFT_KIS_MODE: "PROD_READ_ONLY",
+    PULSEHFT_KIS_APP_KEY: "same-key",
+    PULSEHFT_KIS_APP_SECRET: "same-secret",
+    PULSEHFT_KIS_LIVE_MODE: "LIVE_TRADING",
+    PULSEHFT_KIS_LIVE_APP_KEY: "same-key",
+    PULSEHFT_KIS_LIVE_APP_SECRET: "same-secret",
+    PULSEHFT_KIS_LIVE_ACCOUNT_NUMBER: "12345678",
+    PULSEHFT_KIS_LIVE_ACCOUNT_PRODUCT_CODE: "01",
+    PULSEHFT_KIS_LIVE_ORDER_ENABLED: "true",
+  };
+
+  // 옵트인이 없으면 기존과 동일하게 거부한다.
+  assert.throws(
+    () => loadKisLiveConfiguration(null, { env }),
+    (error) => error.code === "KIS_LIVE_QUOTE_CREDENTIAL_REUSE",
+  );
+
+  // 옵트인하면 통과하되 공유 사실이 설정과 상태 API에 드러나야 한다.
+  const config = loadKisLiveConfiguration(null, {
+    env: { ...env, PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL: "true" },
+  });
+  assert.equal(config.enabled, true);
+  assert.equal(config.sharedQuoteCredential, true);
+  assert.equal(publicKisLiveConfiguration(config).sharedQuoteCredential, true);
+});
+
+test("KIS live config keeps sharedQuoteCredential false when credentials differ", () => {
+  const config = loadKisLiveConfiguration(null, {
+    env: {
+      PULSEHFT_KIS_MODE: "PROD_READ_ONLY",
+      PULSEHFT_KIS_APP_KEY: "quote-key",
+      PULSEHFT_KIS_APP_SECRET: "quote-secret",
+      PULSEHFT_KIS_LIVE_MODE: "LIVE_TRADING",
+      PULSEHFT_KIS_LIVE_APP_KEY: "live-key",
+      PULSEHFT_KIS_LIVE_APP_SECRET: "live-secret",
+      PULSEHFT_KIS_LIVE_ACCOUNT_NUMBER: "12345678",
+      PULSEHFT_KIS_LIVE_ACCOUNT_PRODUCT_CODE: "01",
+      PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL: "true",
+    },
+  });
+  assert.equal(config.sharedQuoteCredential, false);
+  assert.equal(publicKisLiveConfiguration(config).sharedQuoteCredential, false);
+});
+
+test("KIS live config never allows paper credential reuse even with opt-in", () => {
+  assert.throws(() => loadKisLiveConfiguration(null, {
+    env: {
+      PULSEHFT_KIS_PAPER_APP_KEY: "paper-key",
+      PULSEHFT_KIS_PAPER_APP_SECRET: "paper-secret",
+      PULSEHFT_KIS_LIVE_MODE: "LIVE_TRADING",
+      PULSEHFT_KIS_LIVE_APP_KEY: "paper-key",
+      PULSEHFT_KIS_LIVE_APP_SECRET: "live-secret",
+      PULSEHFT_KIS_LIVE_ACCOUNT_NUMBER: "12345678",
+      PULSEHFT_KIS_LIVE_ACCOUNT_PRODUCT_CODE: "01",
+      PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL: "true",
+    },
+  }), (error) => error.code === "KIS_LIVE_PAPER_CREDENTIAL_REUSE");
+});

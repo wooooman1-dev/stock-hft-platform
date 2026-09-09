@@ -137,3 +137,28 @@ BROKER_FILL_OBSERVED
 ## 검증 이력
 
 _아직 실계좌 수동 검증이 수행되지 않았습니다. 위 절차를 실제로 완료한 뒤, `docs/KIS_PAPER_TRADING.md`의 검증 이력과 같은 형식(날짜, 수행한 단계, 확인한 결과, 발견한 문제와 조치)으로 이 섹션을 채우세요._
+
+## 시세용 자격정보 공유 (2026-09-07)
+
+원래 설계는 실전 시세 조회용 App Key와 실전 주문용 App Key를 서로 다른 계좌에서 발급받아 분리하는 것이다. `kisLiveConfig.js`의 `rejectPaperAndProdCredentialReuse()`가 부팅 시점에 이를 강제한다.
+
+KIS는 App Key를 계좌 단위로 발급하고 실전투자계좌는 최대 89개까지 API 신청이 가능하므로, 계좌를 추가 등록하면 분리를 유지할 수 있다. 같은 계좌의 신청을 갱신하면 기존 App Key가 무효화된다.
+
+실전 계좌를 하나만 운용해 분리가 불가능한 경우에 한해 `PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL=true`로 명시적으로 옵트인할 수 있다. 기본값은 `false`이며, 플래그가 없으면 종전과 동일하게 `KIS_LIVE_QUOTE_CREDENTIAL_REUSE`로 기동을 거부한다.
+
+옵트인 시 다음이 남는다.
+
+- `kisLiveConfiguration.sharedQuoteCredential = true`
+- `publicKisLiveConfiguration()`의 `sharedQuoteCredential` 필드로 상태 API 노출
+- 기동 시 `[KIS-LIVE]` 경고 로그
+- 실전 저널(`execution-journal-live.jsonl`)에 `LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED` 이벤트
+
+### 수용한 위험
+
+시세 조회 경로의 결함이 주문 제출 권한을 가진 자격정보에 도달할 수 있다. KIS 실전 App Key는 원래 시세와 주문 권한을 모두 가지므로 이 경계는 증권사 차원의 권한 분리가 아니라 저장소 내부의 격리 장치였고, 옵트인은 그 내부 격리를 포기하는 것이다.
+
+1주 하드 상한과 `PULSEHFT_KIS_LIVE_MODE`/`PULSEHFT_KIS_LIVE_ORDER_ENABLED` 이중 플래그는 영향을 받지 않는다.
+
+### 옵트인 대상이 아닌 것
+
+모의투자 자격정보 재사용(`KIS_LIVE_PAPER_CREDENTIAL_REUSE`)은 이 플래그와 무관하게 항상 거부한다. 모의투자는 도메인(`openapivts…:29443`)이 달라 실전 주문에 쓸 수 없으므로 언제나 설정 오류다.

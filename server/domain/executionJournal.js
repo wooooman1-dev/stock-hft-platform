@@ -32,6 +32,7 @@ const EVENT_TYPES = new Set([
   "STRATEGY_APPROVAL_APPROVED",
   "STRATEGY_APPROVAL_REJECTED",
   "STRATEGY_APPROVAL_EXPIRED",
+  "LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED",
 ]);
 
 export class ExecutionJournalError extends Error {

@@ -107,7 +107,12 @@ export function loadKisLiveConfiguration(filePath, { env = process.env } = {}) {
   }
 
   validateAccount(credentials.accountNumber, credentials.accountProductCode);
-  rejectPaperAndProdCredentialReuse(credentials, env);
+  const allowSharedQuoteCredential = String(
+    env.PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL ?? "false",
+  ).trim().toLowerCase() === "true";
+  const sharedQuoteCredential = rejectPaperAndProdCredentialReuse(credentials, env, {
+    allowSharedQuoteCredential,
+  });
 
   const orderEnabled = String(env.PULSEHFT_KIS_LIVE_ORDER_ENABLED ?? "false").trim().toLowerCase() === "true";
 
@@ -124,6 +129,7 @@ export function loadKisLiveConfiguration(filePath, { env = process.env } = {}) {
     accountNumber: credentials.accountNumber,
     accountProductCode: credentials.accountProductCode,
     orderEnabled,
+    sharedQuoteCredential,
     limits: defaultLimits(env),
   });
 }
@@ -139,6 +145,7 @@ export function publicKisLiveConfiguration(config) {
     accountNumberMasked: config?.accountNumber ? maskAccount(config.accountNumber) : null,
     balanceApiAvailable: Boolean(config?.enabled),
     orderApiAvailable: Boolean(config?.enabled && config?.orderEnabled),
+    sharedQuoteCredential: Boolean(config?.sharedQuoteCredential),
     limits: config?.limits ? structuredClone(config.limits) : null,
   };
 }
@@ -153,18 +160,27 @@ function defaultLimits(env) {
   });
 }
 
-function rejectPaperAndProdCredentialReuse(credentials, env) {
+// 실전 시세용 자격정보 공유는 기본적으로 금지한다. KIS는 계좌마다 App Key를 발급하므로 시세용과
+// 주문용을 다른 계좌로 분리하는 것이 원래 설계다(docs/KIS_LIVE_TRADING.md).
+// 실전 계좌를 하나만 쓰는 등 분리가 불가능한 경우에 한해
+// PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL=true로 명시적으로 옵트인할 수 있으며,
+// 이때 공유 사실은 설정 객체·상태 API·기동 경고·실행 저널에 남는다.
+// 모의투자 자격정보 재사용은 옵트인 대상이 아니며 항상 거부한다(도메인이 달라 항상 설정 오류다).
+function rejectPaperAndProdCredentialReuse(credentials, env, { allowSharedQuoteCredential = false } = {}) {
   const prodAppKey = optionalSecret(env.PULSEHFT_KIS_APP_KEY);
   const prodAppSecret = optionalSecret(env.PULSEHFT_KIS_APP_SECRET);
   const paperAppKey = optionalSecret(env.PULSEHFT_KIS_PAPER_APP_KEY);
   const paperAppSecret = optionalSecret(env.PULSEHFT_KIS_PAPER_APP_SECRET);
 
-  if (
+  const quoteCredentialShared = Boolean(
     (prodAppKey && prodAppKey === credentials.appKey)
-    || (prodAppSecret && prodAppSecret === credentials.appSecret)
-  ) {
+    || (prodAppSecret && prodAppSecret === credentials.appSecret),
+  );
+
+  if (quoteCredentialShared && !allowSharedQuoteCredential) {
     throw new KisLiveConfigurationError(
-      "한국투자 실전 시세 전용 App Key 또는 App Secret을 실전투자 자격정보로 재사용할 수 없습니다.",
+      "한국투자 실전 시세 전용 App Key 또는 App Secret을 실전투자 자격정보로 재사용할 수 없습니다. "
+      + "분리가 불가능하면 PULSEHFT_KIS_LIVE_ALLOW_SHARED_QUOTE_CREDENTIAL=true로 명시적으로 허용하세요.",
       "KIS_LIVE_QUOTE_CREDENTIAL_REUSE",
     );
   }
@@ -178,6 +194,8 @@ function rejectPaperAndProdCredentialReuse(credentials, env) {
       "KIS_LIVE_PAPER_CREDENTIAL_REUSE",
     );
   }
+
+  return quoteCredentialShared;
 }
 
 function validateAccount(accountNumber, accountProductCode) {

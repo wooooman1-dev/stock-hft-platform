@@ -220,3 +220,39 @@ test("runtime enables the kill switch when execution journal capture fails", () 
   assert.equal(runtime.snapshot().system.killSwitch, true);
   assert.equal(runtime.snapshot().system.autoPaperTrading, false);
 });
+
+// 회귀 방지: app.js가 기록하는 이벤트 타입이 EVENT_TYPES 화이트리스트에 빠지면
+// 서버가 기동 중 죽는다(2026-09-07 LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED 사고).
+// 테스트가 소스를 직접 훑어 새 이벤트 등록 누락을 잡는다.
+test("every journal event appended by app.js is a registered event type", () => {
+  const appSource = readFileSync(new URL("../app.js", import.meta.url), "utf8");
+  const appended = [...appSource.matchAll(/(?:Journal|journal)\.append\(\s*"([A-Z_]+)"/g)]
+    .map((match) => match[1]);
+  assert.ok(appended.length > 0, "app.js에서 저널 append 호출을 찾지 못했습니다.");
+
+  withTemporaryDirectory((directory) => {
+    const journal = new ExecutionJournal(join(directory, "event-type-check.jsonl"));
+    for (const type of new Set(appended)) {
+      assert.doesNotThrow(
+        () => journal.append(type, {}),
+        `app.js가 기록하는 ${type}이 EVENT_TYPES에 등록되지 않았습니다.`,
+      );
+    }
+  });
+});
+
+test("journal accepts the shared quote credential opt-in event", () => {
+  withTemporaryDirectory((directory) => {
+    const path = join(directory, "shared-credential.jsonl");
+    const journal = new ExecutionJournal(path);
+    journal.append("LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED", {
+      processId: 1234,
+      orderEnabled: true,
+      credentialSource: "ENV",
+    });
+    const written = readFileSync(path, "utf8").trim().split("\n");
+    const last = JSON.parse(written[written.length - 1]);
+    assert.equal(last.type, "LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED");
+    assert.equal(last.payload.orderEnabled, true);
+  });
+});
