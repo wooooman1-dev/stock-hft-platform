@@ -194,3 +194,119 @@ function response(payload, status = 200) {
 function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
+
+// 2026-08-04 사고 회귀 방지: KIS는 핸드셰이크를 통과시킨 뒤 구독 응답에서 거절한다.
+// open 시점에 백오프를 리셋하면 거절 루프가 최소 지연으로 무한 반복된다(225분 13,057회).
+test("소켓 open만으로는 백오프를 리셋하지 않고 구독 성공에서만 리셋한다", async () => {
+  FakeWebSocket.instances = [];
+  const client = new KisRealtimeMarketDataClient({
+    config,
+    fetchImpl: async () => response({ approval_key: "APPROVAL-TOKEN" }),
+    WebSocketImpl: FakeWebSocket,
+    setTimeoutImpl: () => null,
+    clearTimeoutImpl: () => {},
+  });
+  client.watchSymbols([{ symbol: "005930", venue: "KRX" }]);
+  await flush();
+  client.reconnectAttempt = 4;
+
+  FakeWebSocket.instances[0].open();
+  await flush();
+  assert.equal(client.reconnectAttempt, 4, "open만으로 리셋되면 안 된다");
+  assert.equal(client.status().subscriptionEstablished, false);
+
+  await client.handleMessage(JSON.stringify({
+    header: { tr_id: "H0STASP0" },
+    body: { rt_cd: "0", msg1: "SUBSCRIBE SUCCESS" },
+  }));
+  assert.equal(client.reconnectAttempt, 0, "구독 성공에서 리셋되어야 한다");
+  assert.equal(client.status().subscriptionEstablished, true);
+  client.stop();
+});
+
+test("백오프가 재시도마다 지수적으로 늘고 상한에서 멈춘다", async () => {
+  const delays = [];
+  const client = new KisRealtimeMarketDataClient({
+    config,
+    fetchImpl: async () => response({ approval_key: "APPROVAL-TOKEN" }),
+    WebSocketImpl: FakeWebSocket,
+    reconnectBaseMs: 1_000,
+    reconnectMaxMs: 30_000,
+    setTimeoutImpl: (fn, delay) => { delays.push(delay); return delays.length; },
+    clearTimeoutImpl: () => {},
+  });
+  client.started = true;
+  client.desired = new Map([["005930", { symbol: "005930", venue: "KRX" }]]);
+  for (let i = 0; i < 8; i += 1) {
+    client.reconnectTimer = null;
+    client.scheduleReconnect();
+  }
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  client.stop();
+});
+
+test("ALREADY IN USE appkey는 재연결을 멈추고 BLOCKED 상태로 원인을 노출한다", async () => {
+  FakeWebSocket.instances = [];
+  const scheduled = [];
+  const client = new KisRealtimeMarketDataClient({
+    config,
+    fetchImpl: async () => response({ approval_key: "APPROVAL-TOKEN" }),
+    WebSocketImpl: FakeWebSocket,
+    setTimeoutImpl: (fn, delay) => { scheduled.push(delay); return scheduled.length; },
+    clearTimeoutImpl: () => {},
+  });
+  client.watchSymbols([{ symbol: "005930", venue: "KRX" }]);
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await flush();
+  scheduled.length = 0;
+
+  await client.handleMessage(JSON.stringify({
+    header: { tr_id: "H0STASP0" },
+    body: { rt_cd: "1", msg1: "ALREADY IN USE appkey" },
+  }));
+
+  const status = client.status();
+  assert.equal(status.state, "BLOCKED");
+  assert.equal(status.blocked, true);
+  assert.equal(status.blockedReason.code, "KIS_REALTIME_APPKEY_IN_USE");
+  assert.match(status.blockedReason.message, /ALREADY IN USE/i);
+
+  // 소켓이 닫혀도 재연결을 예약하지 않아야 한다.
+  socket.close();
+  await flush();
+  client.scheduleReconnect();
+  assert.deepEqual(scheduled, [], "차단 상태에서는 재연결을 예약하면 안 된다");
+
+  // 운영자가 점유 세션을 정리한 뒤 해제할 수 있어야 한다.
+  client.clearBlock();
+  assert.equal(client.status().blocked, false);
+  client.stop();
+});
+
+test("같은 에러 반복은 억제하되 발생 횟수는 유지한다", async () => {
+  let now = 1_000_000;
+  const emitted = [];
+  const client = new KisRealtimeMarketDataClient({
+    config,
+    fetchImpl: async () => response({ approval_key: "APPROVAL-TOKEN" }),
+    WebSocketImpl: FakeWebSocket,
+    now: () => now,
+    errorRepeatIntervalMs: 60_000,
+  });
+  client.on("errorState", (item) => emitted.push({ ...item }));
+
+  for (let i = 0; i < 500; i += 1) {
+    client.recordError(new Error("WebSocket 오류가 발생했습니다."), "KIS_REALTIME_SOCKET_ERROR");
+    now += 100;
+  }
+  assert.equal(client.lastError.repeatCount, 500);
+  assert.ok(emitted.length <= 2, `500건이 ${emitted.length}건으로 접혀야 한다`);
+
+  // 다른 에러는 즉시 나가야 한다.
+  client.recordError(new Error("다른 오류"), "KIS_REALTIME_OTHER");
+  assert.equal(emitted.at(-1).code, "KIS_REALTIME_OTHER");
+  assert.equal(emitted.at(-1).repeatCount, 1);
+  client.stop();
+});
