@@ -310,3 +310,42 @@ test("같은 에러 반복은 억제하되 발생 횟수는 유지한다", async
   assert.equal(emitted.at(-1).repeatCount, 1);
   client.stop();
 });
+
+// 2026-09-10 실전 발견: 구독 해제에 tr_type "0"을 보내 KIS가
+// "JSON PARSING ERROR : invalid tr_type"으로 거절했다. 해제가 실패해도 클라이언트는
+// activeSubscriptions에서 지워버려, 서버 쪽 구독만 남아 누적된다.
+test("후보에서 빠진 종목은 tr_type 2로 구독을 해지한다", async () => {
+  FakeWebSocket.instances = [];
+  const client = new KisRealtimeMarketDataClient({
+    config,
+    fetchImpl: async () => response({ approval_key: "APPROVAL-TOKEN" }),
+    WebSocketImpl: FakeWebSocket,
+    setTimeoutImpl: () => null,
+    clearTimeoutImpl: () => {},
+  });
+  client.watchSymbols([{ symbol: "005930", venue: "KRX" }]);
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await flush();
+  socket.sent.length = 0;
+
+  // 005930을 빼고 000660을 넣는다.
+  client.watchSymbols([{ symbol: "000660", venue: "KRX" }]);
+  const frames = socket.sent.map((item) => JSON.parse(item));
+
+  const unsubscribed = frames.filter((f) => f.body.input.tr_key === "005930");
+  const subscribed = frames.filter((f) => f.body.input.tr_key === "000660");
+  assert.equal(unsubscribed.length, 2, "빠진 종목의 호가·체결 둘 다 해지해야 한다");
+  assert.equal(subscribed.length, 2, "새 종목의 호가·체결 둘 다 등록해야 한다");
+  assert.ok(
+    unsubscribed.every((f) => f.header.tr_type === "2"),
+    `해지는 tr_type "2"여야 한다 (받은 값: ${unsubscribed.map((f) => f.header.tr_type).join(",")})`,
+  );
+  assert.ok(subscribed.every((f) => f.header.tr_type === "1"));
+  assert.ok(
+    frames.every((f) => ["1", "2"].includes(f.header.tr_type)),
+    "KIS는 tr_type 1과 2만 허용한다",
+  );
+  client.stop();
+});

@@ -7,6 +7,9 @@ const APPROVAL_MAX_AGE_MS = 23 * 60 * 60 * 1_000;
 // KIS는 App Key당 WebSocket 세션을 하나만 허용한다. 다른 세션이 점유 중이면
 // 핸드셰이크는 통과시키고 구독 응답에서 이 메시지로 거절한다. 재시도로는 절대 풀리지 않는다.
 const APPKEY_IN_USE_PATTERN = /ALREADY\s+IN\s+USE/i;
+// KIS WebSocket header.tr_type — 등록과 해지만 유효하다.
+const KIS_TR_TYPE_SUBSCRIBE = "1";
+const KIS_TR_TYPE_UNSUBSCRIBE = "2";
 
 export const KIS_REALTIME_TR = Object.freeze({
   KRX: Object.freeze({ orderBook: "H0STASP0", trade: "H0STCNT0" }),
@@ -151,8 +154,14 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
     const previous = this.desired;
     this.desired = next;
     if (isOpen(this.socket)) {
-      for (const [key, item] of previous) if (!next.has(key)) this.sendVenueSubscriptions(item, "0");
-      for (const [key, item] of next) if (!previous.has(key)) this.sendVenueSubscriptions(item, "1");
+      // KIS 규격: tr_type "1" = 등록, "2" = 해지. "0"은 유효하지 않아
+      // "JSON PARSING ERROR : invalid tr_type"으로 거절되고 구독이 해제되지 않는다.
+      for (const [key, item] of previous) {
+        if (!next.has(key)) this.sendVenueSubscriptions(item, KIS_TR_TYPE_UNSUBSCRIBE);
+      }
+      for (const [key, item] of next) {
+        if (!previous.has(key)) this.sendVenueSubscriptions(item, KIS_TR_TYPE_SUBSCRIBE);
+      }
     }
     if (!this.started) this.start();
     else void this.ensureConnected();
@@ -258,7 +267,7 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
         this.lastConnectedAt = this.now();
         this.lastError = null;
         this.setState("CONNECTED");
-        for (const item of this.desired.values()) this.sendVenueSubscriptions(item, "1", approvalKey);
+        for (const item of this.desired.values()) this.sendVenueSubscriptions(item, KIS_TR_TYPE_SUBSCRIBE, approvalKey);
         finish();
       });
       addSocketListener(socket, "message", (event) => {
@@ -346,7 +355,7 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
         body: { input: { tr_id: trId, tr_key: symbol } },
       }));
       const key = `${trId}:${symbol}`;
-      if (trType === "1") this.activeSubscriptions.add(key);
+      if (trType === KIS_TR_TYPE_SUBSCRIBE) this.activeSubscriptions.add(key);
       else this.activeSubscriptions.delete(key);
     } catch (error) {
       this.recordError(error, "KIS_REALTIME_SUBSCRIPTION_SEND_FAILED");

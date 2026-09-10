@@ -4,9 +4,10 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   const settings = normalizeRecommendationSettings(settingsInput);
   const candidate = normalizeCandidate(input);
   const bars = normalizeBars(candidate.minuteBars);
+  const barSupply = describeBarSupply(candidate.minuteBars, bars);
   const orderBook = normalizeOrderBook(candidate.orderBook, candidate.tickSize);
   const derived = calculateDerived(candidate, bars, orderBook);
-  const blockReasons = buildBlockReasons(candidate, bars, orderBook, derived, settings);
+  const blockReasons = buildBlockReasons(candidate, bars, orderBook, derived, settings, barSupply);
   const reversal = scoreReversal(candidate, derived, orderBook);
   const pullback = scorePullback(candidate, derived, orderBook);
   const selected = pullback.score >= reversal.score ? pullback : reversal;
@@ -145,14 +146,33 @@ function scorePullback(candidate, derived, orderBook) {
   return { type: "PULLBACK", score: Math.min(100, score), reasons };
 }
 
-function buildBlockReasons(candidate, bars, orderBook, derived, settings) {
+// 데이터 공급 결함과 전략 판정을 구분한다. 응답이 통째로 비어 있는 것과
+// 분봉이 실제로 모자란 것은 원인도 대응도 다르다.
+function describeBarSupply(rawValue, bars) {
+  const rawCount = Array.isArray(rawValue) ? rawValue.length : 0;
+  return {
+    rawCount,
+    usableCount: bars.length,
+    emptyResponse: rawCount > 0 && bars.length === 0,
+  };
+}
+
+function buildBlockReasons(candidate, bars, orderBook, derived, settings, barSupply) {
   const reasons = [];
   if (candidate.tradingHalted) reasons.push("거래정지 또는 일시정지 상태");
   if (candidate.currentPrice === null) reasons.push("현재가 없음");
   if (candidate.accumulatedTradingValue < settings.minimumTradingValue) {
     reasons.push(`누적 거래대금 ${formatWon(settings.minimumTradingValue)} 미만`);
   }
-  if (bars.length < 8) reasons.push("당일 분봉 데이터 8개 미만");
+  if (barSupply.emptyResponse) {
+    reasons.push(`분봉 응답 ${barSupply.rawCount}건이 모두 빈 값 — 시세 데이터 결함`);
+  } else if (bars.length < 8) {
+    reasons.push("당일 분봉 데이터 8개 미만");
+  }
+  // REST 체결강도 결측은 차단 사유가 아니다. ENTRY_READY의 체결강도 게이트는
+  // 실시간 체결(H0STCNT0)이 판정하며 그쪽은 종목 전량 수신된다
+  // (realtimeConfirmationEngine.js). REST 값은 예비 점수에만 쓰이므로,
+  // 없으면 powerScore가 0이 될 뿐이고 결측 자체는 dataCompleteness로 드러난다.
   if (orderBook.bestBid === null || orderBook.bestAsk === null) reasons.push("최우선 호가 없음");
   if (orderBook.spreadTicks !== null && orderBook.spreadTicks > 3) reasons.push("스프레드 3틱 초과");
   if (candidate.changePercent !== null && candidate.changePercent > settings.maximumDailyRisePercent) {

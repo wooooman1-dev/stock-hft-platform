@@ -138,6 +138,7 @@ test("KIS quote client issues a production token and sends the official current-
           stck_llam: "48300",
           stck_sdpr: "69000",
           aspr_unit: "100",
+          cttr: "118.42",
           temp_stop_yn: "N",
         },
       });
@@ -184,6 +185,7 @@ test("KIS quote client issues a production token and sends the official current-
       lowerLimitPrice: 48300,
       basePrice: 69000,
       askUnit: 100,
+      executionStrength: 118.42,
       tradingHalted: false,
     });
     assert.equal(client.status().orderApiAvailable, false);

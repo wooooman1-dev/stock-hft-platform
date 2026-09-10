@@ -220,6 +220,8 @@ export class RecommendationScanner {
           accumulatedTradingValue: quote.accumulatedTradingValue
             ?? base.accumulatedTradingValue,
           tradingHalted: quote.tradingHalted,
+          // 체결강도는 순위 API가 아니라 현재가 응답을 신뢰한다(순위별로 필드가 달라 단위가 섞인다).
+          executionStrength: quote.executionStrength ?? base.executionStrength ?? null,
           tickSize: quote.askUnit ?? 1,
           orderBook,
           minuteBars: details.minuteBars,
