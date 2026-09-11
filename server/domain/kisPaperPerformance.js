@@ -8,13 +8,14 @@ const FILL_EVENT = "BROKER_FILL_OBSERVED";
  * costBasisIncompleteQuantity로 별도 집계된다.
  */
 export class KisPaperPerformanceTracker {
-  constructor({ journal, now = Date.now } = {}) {
+  constructor({ journal, now = Date.now, costModel = {} } = {}) {
     if (!journal || typeof journal.append !== "function" || typeof journal.readAll !== "function") {
       throw new TypeError("append/readAll을 제공하는 실행 저널이 필요합니다.");
     }
     if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
     this.journal = journal;
     this.now = now;
+    this.costModel = { ...costModel };
     this.observedExecutedQuantity = new Map();
     this.replayJournal();
   }
@@ -72,14 +73,34 @@ export class KisPaperPerformanceTracker {
   }
 
   report() {
-    return computePerformanceReport(this.journal.readAll(), { now: this.now() });
+    return computePerformanceReport(this.journal.readAll(), {
+      now: this.now(),
+      costModel: this.costModel,
+    });
+  }
+
+  // 비용 모델은 추천 스캐너와 자동매매가 쓰는 값과 같아야 한다. 어긋나면 판정이 흔들린다.
+  setCostModel(costModel) {
+    this.costModel = { ...costModel };
+    return this.costModel;
   }
 }
 
 const INCIDENT_EVENT_TYPES = new Set(["BROKER_ORDER_UNKNOWN", "BROKER_RECONCILIATION_MISMATCH"]);
 const DAY_MS = 24 * 60 * 60 * 1_000;
 
-export function computePerformanceReport(events, { now = Date.now() } = {}) {
+// 왕복 비용(매수 수수료 + 매도 수수료 + 거래세)은 실현손익에 반드시 반영해야 한다.
+// 반영하지 않으면 총이익 +0.1%짜리 전략이 실제로는 손실인데 플러스로 보인다.
+// KIS 응답의 estimatedFeesAndTaxes는 일별 합계만 제공하므로 거래별 귀속은 모델로 계산하고,
+// 그 값은 추정치임을 명시한다(실제 정산내역과 대사 필요).
+const DEFAULT_COST_MODEL = Object.freeze({
+  buyCommissionBps: 1.40527,
+  sellCommissionBps: 1.40527,
+  sellTaxBps: 20,
+});
+
+export function computePerformanceReport(events, { now = Date.now(), costModel = {} } = {}) {
+  const costs = { ...DEFAULT_COST_MODEL, ...costModel };
   const operational = computeOperationalStats(events, now);
   const equitySnapshots = events
     .filter((event) => event.type === EQUITY_EVENT)
@@ -139,12 +160,24 @@ export function computePerformanceReport(events, { now = Date.now() } = {}) {
     if (remaining > 0) costBasisIncompleteQuantity += remaining;
     if (matchedQuantity > 0) {
       const proceeds = matchedQuantity * fill.executedPrice;
+      const buyCost = costBasis * (costs.buyCommissionBps / 10_000);
+      const sellCost = proceeds * (costs.sellCommissionBps / 10_000);
+      const taxCost = proceeds * (costs.sellTaxBps / 10_000);
+      const totalCost = buyCost + sellCost + taxCost;
+      const grossPnl = proceeds - costBasis;
       realizedTrades.push({
         symbol,
         quantity: matchedQuantity,
         buyAveragePrice: costBasis / matchedQuantity,
         sellPrice: fill.executedPrice,
-        realizedPnl: proceeds - costBasis,
+        // realizedPnl은 기존 계약을 유지한다(총손익). 비용 차감 후 값은 netPnl이다.
+        realizedPnl: grossPnl,
+        grossPnl,
+        buyCost,
+        sellCost,
+        taxCost,
+        totalCost,
+        netPnl: grossPnl - totalCost,
         closedAt: fill.orderedAt ?? fill.capturedAt,
         orderNumber: fill.orderNumber,
         costBasisIncomplete: remaining > 0,
@@ -155,6 +188,11 @@ export function computePerformanceReport(events, { now = Date.now() } = {}) {
   const wins = realizedTrades.filter((trade) => trade.realizedPnl > 0);
   const losses = realizedTrades.filter((trade) => trade.realizedPnl < 0);
   const totalRealizedPnl = realizedTrades.reduce((sum, trade) => sum + trade.realizedPnl, 0);
+  // 판정은 비용 차감 후 기준으로 한다(docs/AUTO_TRADING_PAPER_DESIGN.md §8).
+  const netWins = realizedTrades.filter((trade) => trade.netPnl > 0);
+  const netLosses = realizedTrades.filter((trade) => trade.netPnl < 0);
+  const totalNetPnl = realizedTrades.reduce((sum, trade) => sum + trade.netPnl, 0);
+  const totalCost = realizedTrades.reduce((sum, trade) => sum + trade.totalCost, 0);
 
   let consecutiveLossStreak = 0;
   for (let index = realizedTrades.length - 1; index >= 0; index -= 1) {
@@ -175,6 +213,11 @@ export function computePerformanceReport(events, { now = Date.now() } = {}) {
   return {
     generatedAt: now,
     operational,
+    costModel: {
+      ...costs,
+      source: "CONFIGURED_ESTIMATE",
+      warning: "거래별 비용은 설정값 기반 추정치입니다. 실제 계좌 정산내역과 반드시 대사하세요.",
+    },
     equity: {
       snapshotCount: equitySnapshots.length,
       current: latestEquity?.totalEvaluationAmount ?? null,
@@ -190,6 +233,15 @@ export function computePerformanceReport(events, { now = Date.now() } = {}) {
       losses: losses.length,
       winRate: realizedTrades.length > 0 ? wins.length / realizedTrades.length : null,
       totalRealizedPnl,
+      netWins: netWins.length,
+      netLosses: netLosses.length,
+      netWinRate: realizedTrades.length > 0 ? netWins.length / realizedTrades.length : null,
+      totalNetPnl,
+      totalCost,
+      averageNetWin: netWins.length > 0
+        ? netWins.reduce((sum, trade) => sum + trade.netPnl, 0) / netWins.length : null,
+      averageNetLoss: netLosses.length > 0
+        ? netLosses.reduce((sum, trade) => sum + trade.netPnl, 0) / netLosses.length : null,
       averageWin: wins.length > 0 ? wins.reduce((sum, trade) => sum + trade.realizedPnl, 0) / wins.length : null,
       averageLoss: losses.length > 0 ? losses.reduce((sum, trade) => sum + trade.realizedPnl, 0) / losses.length : null,
       consecutiveLossStreak,

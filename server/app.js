@@ -27,6 +27,12 @@ import {
   publicKisPaperConfiguration,
 } from "./integrations/kis/kisPaperConfig.js";
 import { KisPaperOrderService } from "./integrations/kis/kisPaperOrderService.js";
+import { KisPaperAutoTrader } from "./domain/kisPaperAutoTrader.js";
+import {
+  assertTradeableConfiguration,
+  loadAutoTradingSettings,
+  normalizeAutoTradingSettings,
+} from "./domain/autoTradingSettings.js";
 import { KisPaperTradingClient } from "./integrations/kis/kisPaperTradingClient.js";
 import {
   loadKisLiveConfiguration,
@@ -193,8 +199,24 @@ const kisPaperOrderService = kisPaperClient
     journal: executionJournal,
     limits: kisPaperConfiguration.limits,
     onUnknownResult: () => runtime.setKillSwitch(true),
+    costModel: loadPaperCostModel(process.env),
   })
   : null;
+
+// 모의계좌 자동매매(docs/AUTO_TRADING_PAPER_DESIGN.md). 실전 경로와 무관하며
+// 기본은 꺼져 있다. 비용 모델은 내부 시뮬레이터·성과 지표와 같은 값을 공유한다.
+const autoTradingCostModel = loadPaperCostModel(process.env);
+const autoTradingSettings = loadAutoTradingSettings(process.env);
+// 익절 목표가 문턱과 고정비용의 합을 넘지 못하면 조용히 거래 0건이 된다. 기동 시점에 막는다.
+assertTradeableConfiguration(autoTradingSettings, autoTradingCostModel);
+const kisPaperAutoTrader = kisPaperOrderService
+  ? new KisPaperAutoTrader({
+    orderService: kisPaperOrderService,
+    settings: autoTradingSettings,
+    costModel: autoTradingCostModel,
+  })
+  : null;
+let autoTradingTimer = null;
 
 const kisLiveOrderService = kisLiveClient && kisLiveConfiguration.orderEnabled
   ? new KisLiveOrderService({
@@ -229,7 +251,8 @@ executionJournal.append("SESSION_STARTED", {
   kisPaperMode: kisPaperConfiguration.mode,
   kisPaperBalanceEnabled: Boolean(kisPaperClient),
   kisPaperOrderEnabled: Boolean(kisPaperOrderService),
-  kisPaperAutomaticStrategyConnected: false,
+  kisPaperAutomaticStrategyConnected: Boolean(kisPaperAutoTrader),
+  kisPaperAutoTradingEnabled: Boolean(kisPaperAutoTrader?.settings.enabled),
   kisLiveMode: kisLiveConfiguration.mode,
   kisLiveBalanceEnabled: Boolean(kisLiveClient),
   kisLiveOrderEnabled: Boolean(kisLiveOrderService),
@@ -359,6 +382,15 @@ function rejectNonLoopbackKisRequest(request, response) {
   if (isLoopbackAddress(request.socket.remoteAddress)) return false;
   json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
   return true;
+}
+
+function requireKisPaperAutoTrader(response) {
+  if (kisPaperAutoTrader) return kisPaperAutoTrader;
+  json(response, 503, {
+    error: "한국투자 모의투자 주문 모드가 비활성화되어 자동매매를 쓸 수 없습니다.",
+    code: "KIS_PAPER_AUTO_TRADING_DISABLED",
+  });
+  return null;
 }
 
 function requireKisPaperService(response) {
@@ -586,6 +618,38 @@ const server = createServer(async (request, response) => {
       if (!service) return;
       return json(response, 200, await service.getBalance());
     }
+    // 자동매매 상태·설정. 실전 경로와 분리된 모의계좌 전용 엔드포인트다.
+    if (request.method === "GET" && url.pathname === "/api/kis/paper/auto-trading") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const trader = requireKisPaperAutoTrader(response);
+      if (!trader) return;
+      return json(response, 200, trader.status());
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/auto-trading") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const trader = requireKisPaperAutoTrader(response);
+      if (!trader) return;
+      const body = await readJson(request);
+      let next;
+      try {
+        next = normalizeAutoTradingSettings({ ...trader.settings, ...body });
+        assertTradeableConfiguration(next, autoTradingCostModel);
+      } catch (error) {
+        return json(response, error?.statusCode ?? 400, {
+          error: error instanceof Error ? error.message : String(error),
+          code: error?.code ?? "INVALID_AUTO_TRADING_SETTINGS",
+        });
+      }
+      trader.updateSettings(next);
+      restartAutoTradingTimer();
+      return json(response, 200, trader.status());
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/auto-trading/resume") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const trader = requireKisPaperAutoTrader(response);
+      if (!trader) return;
+      return json(response, 200, trader.clearHalt());
+    }
     if (request.method === "GET" && url.pathname === "/api/kis/paper/performance") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
@@ -790,8 +854,54 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`PulseHFT running at http://localhost:${port}`);
 });
 
+// 자동매매 평가 주기. 실제 주문은 KisPaperAutoTrader가 판단하며, 여기서는 입력만 모아 넘긴다.
+// 장 시간 밖에서는 불필요한 잔고·시세 조회를 하지 않는다.
+async function runAutoTradingCycle() {
+  if (!kisPaperAutoTrader || !kisPaperAutoTrader.settings.enabled) return;
+  if (!isKoreaTradingWindow(Date.now())) return;
+  try {
+    const [recommendations, balance] = await Promise.all([
+      recommendationScanner.get({ refreshIfStale: true }),
+      kisPaperOrderService.getBalance(),
+    ]);
+    await kisPaperAutoTrader.evaluate({
+      candidates: recommendations?.candidates ?? [],
+      balance,
+    });
+  } catch (error) {
+    // 입력 수집 실패는 주문 실패와 다르다. 다음 주기에 다시 시도한다.
+    kisPaperAutoTrader.record({
+      action: "CYCLE_ERROR",
+      at: Date.now(),
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function restartAutoTradingTimer() {
+  if (autoTradingTimer) clearInterval(autoTradingTimer);
+  autoTradingTimer = null;
+  if (!kisPaperAutoTrader || !kisPaperAutoTrader.settings.enabled) return;
+  autoTradingTimer = setInterval(() => {
+    void runAutoTradingCycle();
+  }, kisPaperAutoTrader.settings.evaluationIntervalMs);
+  if (typeof autoTradingTimer.unref === "function") autoTradingTimer.unref();
+}
+
+// 평일 09:00~15:30 KST. 공휴일은 구분하지 않는다(후보가 비어 진입이 성립하지 않는다).
+function isKoreaTradingWindow(timestamp) {
+  const kst = new Date(Number(timestamp) + 9 * 60 * 60 * 1_000);
+  const day = kst.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = kst.getUTCHours() * 60 + kst.getUTCMinutes();
+  return minutes >= 9 * 60 && minutes <= 15 * 60 + 30;
+}
+
+restartAutoTradingTimer();
+
 function shutdown() {
   clearInterval(heartbeat);
+  if (autoTradingTimer) clearInterval(autoTradingTimer);
   mainWorkspace.stop();
   recommendationScanner.stop();
   realtimeCoordinator?.stop();

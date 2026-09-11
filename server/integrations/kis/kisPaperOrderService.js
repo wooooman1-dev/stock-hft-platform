@@ -34,6 +34,8 @@ export class KisPaperOrderService {
     commandIdFactory = randomUUID,
     onUnknownResult = () => {},
     reconciliationRefreshMs = 30_000,
+    // 성과 지표의 비용 모델. 자동매매 진입 게이트와 같은 값을 써야 판정이 일관된다.
+    costModel = {},
   }) {
     if (!client || typeof client.submitOrder !== "function") {
       throw new TypeError("KIS paper client가 필요합니다.");
@@ -70,7 +72,7 @@ export class KisPaperOrderService {
       ? new KisPaperReconciler({ journal, now })
       : null;
     this.performanceTracker = typeof client.getDailyOrders === "function"
-      ? new KisPaperPerformanceTracker({ journal, now })
+      ? new KisPaperPerformanceTracker({ journal, now, costModel })
       : null;
   }
 

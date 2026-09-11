@@ -166,3 +166,46 @@ test("operational stats are null when the journal has no events at all", () => {
   assert.equal(report.operational.lastIncidentAt, null);
   assert.equal(report.operational.daysSinceLastIncident, null);
 });
+
+// 판정 기준(docs/AUTO_TRADING_PAPER_DESIGN.md §8)은 비용 차감 후 순익을 쓴다.
+// 비용을 빼지 않으면 총이익 소폭 플러스인 전략이 실제로는 손실인데 통과해버린다.
+test("실현손익에 왕복 비용을 반영한 netPnl을 산출한다", () => {
+  const COST = { buyCommissionBps: 1.40527, sellCommissionBps: 1.40527, sellTaxBps: 20 };
+  const events = [
+    { type: "BROKER_FILL_OBSERVED", timestamp: 1_000, payload: {
+      day: "2026-09-11", capturedAt: 1_000, orderedAt: 1_000, orderNumber: "1",
+      orderOrganizationNumber: "A", symbol: "005930", side: "BUY",
+      deltaQuantity: 10, executedPrice: 100_000, cumulativeExecutedQuantity: 10,
+    } },
+    { type: "BROKER_FILL_OBSERVED", timestamp: 2_000, payload: {
+      day: "2026-09-11", capturedAt: 2_000, orderedAt: 2_000, orderNumber: "2",
+      orderOrganizationNumber: "A", symbol: "005930", side: "SELL",
+      deltaQuantity: 10, executedPrice: 100_200, cumulativeExecutedQuantity: 10,
+    } },
+  ];
+  const report = computePerformanceReport(events, { now: 3_000, costModel: COST });
+  const trade = report.trades.recent.at(-1);
+
+  // 매수 100만, 매도 100.2만 → 총이익 2,000원
+  assert.equal(trade.grossPnl, 2_000);
+  // 비용: 매수 1,000,000×0.0140527% + 매도 1,002,000×0.0140527% + 세금 1,002,000×0.2%
+  // 1.40527bp = 0.000140527, 20bp = 0.002
+  const expectedCost = 1_000_000 * 0.000140527 + 1_002_000 * 0.000140527 + 1_002_000 * 0.002;
+  assert.ok(Math.abs(trade.totalCost - expectedCost) < 0.01, `비용 계산 불일치: ${trade.totalCost}`);
+  // 순익은 총이익보다 작고, 이 경우 음수다 — 세금 2,004원이 총이익 2,000원을 넘는다
+  assert.ok(trade.netPnl < trade.grossPnl);
+  assert.ok(trade.netPnl < 0, `비용 차감 후에는 손실이어야 한다: ${trade.netPnl}`);
+
+  assert.equal(report.trades.totalRealizedPnl, 2_000, "총손익 계약은 유지한다");
+  assert.ok(report.trades.totalNetPnl < 0);
+  assert.equal(report.trades.winRate, 1, "총손익 기준 승률은 100%");
+  assert.equal(report.trades.netWinRate, 0, "비용 차감 후 승률은 0%");
+  assert.equal(report.costModel.source, "CONFIGURED_ESTIMATE");
+});
+
+test("비용 모델을 지정하지 않으면 기본값을 쓴다", () => {
+  const report = computePerformanceReport([], { now: 1_000 });
+  assert.equal(report.costModel.sellTaxBps, 20);
+  assert.equal(report.costModel.buyCommissionBps, 1.40527);
+  assert.match(report.costModel.warning, /정산내역과 반드시 대사/);
+});
