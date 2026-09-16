@@ -26,6 +26,8 @@ export const DEFAULT_AUTO_TRADING_SETTINGS = Object.freeze({
   staleQuoteMs: 5_000,
   // 평가 주기. 추천 스캐너 캐시 TTL(기본 15초)과 맞춰 불필요한 잔고 조회를 줄인다.
   evaluationIntervalMs: 15_000,
+  // 주문 후 잔고에 반영되기까지 기다리는 시간. 이 구간에는 "보유 없음"을 믿지 않는다.
+  settlementGraceMs: 60_000,
   // 주문 상태가 불확실하거나 대사가 어긋나면 자동매매를 멈춘다.
   haltOnUnknownResult: true,
   haltOnReconciliationMismatch: true,
@@ -46,6 +48,7 @@ const EDITABLE_KEYS = Object.freeze([
   "forcedExitTime",
   "staleQuoteMs",
   "evaluationIntervalMs",
+  "settlementGraceMs",
   "haltOnUnknownResult",
   "haltOnReconciliationMismatch",
 ]);
@@ -77,6 +80,7 @@ export function loadAutoTradingSettings(env = process.env) {
     forcedExitTime: env.PULSEHFT_AUTO_TRADING_FORCED_EXIT_TIME,
     staleQuoteMs: env.PULSEHFT_AUTO_TRADING_STALE_QUOTE_MS,
     evaluationIntervalMs: env.PULSEHFT_AUTO_TRADING_EVALUATION_INTERVAL_MS,
+    settlementGraceMs: env.PULSEHFT_AUTO_TRADING_SETTLEMENT_GRACE_MS,
     haltOnUnknownResult: env.PULSEHFT_AUTO_TRADING_HALT_ON_UNKNOWN,
     haltOnReconciliationMismatch: env.PULSEHFT_AUTO_TRADING_HALT_ON_MISMATCH,
   });
@@ -114,6 +118,7 @@ export function normalizeAutoTradingSettings(input = {}) {
     forcedExitTime: forcedExitTimeValue(merged.forcedExitTime),
     staleQuoteMs: integerInRange(merged.staleQuoteMs, 100, 600_000, "staleQuoteMs"),
     evaluationIntervalMs: integerInRange(merged.evaluationIntervalMs, 1_000, 600_000, "evaluationIntervalMs"),
+    settlementGraceMs: integerInRange(merged.settlementGraceMs, 0, 600_000, "settlementGraceMs"),
     haltOnUnknownResult: booleanValue(merged.haltOnUnknownResult, "haltOnUnknownResult"),
     haltOnReconciliationMismatch: booleanValue(
       merged.haltOnReconciliationMismatch,

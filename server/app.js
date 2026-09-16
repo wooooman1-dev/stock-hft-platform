@@ -856,9 +856,14 @@ server.listen(port, "0.0.0.0", () => {
 
 // 자동매매 평가 주기. 실제 주문은 KisPaperAutoTrader가 판단하며, 여기서는 입력만 모아 넘긴다.
 // 장 시간 밖에서는 불필요한 잔고·시세 조회를 하지 않는다.
+let autoTradingCycleInFlight = false;
+
 async function runAutoTradingCycle() {
   if (!kisPaperAutoTrader || !kisPaperAutoTrader.settings.enabled) return;
   if (!isKoreaTradingWindow(Date.now())) return;
+  // 한 주기가 평가 간격보다 오래 걸리면 다음 틱이 겹쳐 돌면서 같은 판단을 두 번 내린다.
+  if (autoTradingCycleInFlight) return;
+  autoTradingCycleInFlight = true;
   try {
     const [recommendations, balance] = await Promise.all([
       recommendationScanner.get({ refreshIfStale: true }),
@@ -875,6 +880,8 @@ async function runAutoTradingCycle() {
       at: Date.now(),
       detail: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    autoTradingCycleInFlight = false;
   }
 }
 

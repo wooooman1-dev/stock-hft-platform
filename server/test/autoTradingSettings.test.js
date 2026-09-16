@@ -23,6 +23,7 @@ test("설계 기본값을 그대로 사용한다", () => {
   assert.equal(settings.forcedExitTime, "15:15");
   assert.equal(settings.staleQuoteMs, 5_000);
   assert.equal(settings.evaluationIntervalMs, 15_000);
+  assert.equal(settings.settlementGraceMs, 60_000);
   assert.equal(settings.haltOnUnknownResult, true);
   assert.equal(settings.haltOnReconciliationMismatch, true);
 });

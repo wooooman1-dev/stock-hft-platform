@@ -40,6 +40,11 @@ export class KisPaperAutoTrader {
     this.riskTracker = new PositionRiskTracker();
     this.halt = null;
     this.lastOrderAt = 0;
+    // 평가가 겹쳐 돌면 둘 다 "보유 없음"을 보고 각자 진입한다(2026-09-11: 1ms 차이로
+    // 042700을 4주씩 두 번 매수해 저널 8주 / 잔고 4주 불일치가 났다).
+    this.evaluating = false;
+    // 주문을 낸 뒤 잔고에 반영되기까지는 보유 없음으로 보인다. 그 구간에는 진입하지 않는다.
+    this.pendingOrder = null;
     this.holding = null;
     this.decisions = [];
   }
@@ -62,6 +67,7 @@ export class KisPaperAutoTrader {
       settings: { ...this.settings },
       costModel: { ...this.costModel },
       lastOrderAt: this.lastOrderAt || null,
+      pendingOrder: this.pendingOrder ? { ...this.pendingOrder } : null,
       holding: this.holding ? { ...this.holding } : null,
       risk: this.riskTracker.snapshot(),
       recentDecisions: this.decisions.slice(-20),
@@ -80,19 +86,41 @@ export class KisPaperAutoTrader {
     return this.status();
   }
 
-  // 한 번의 평가 주기. 주문을 최대 1건 낸다.
-  async evaluate({ candidates = [], balance = null, marketTime = null } = {}) {
+  // 한 번의 평가 주기. 주문을 최대 1건 낸다. 겹쳐 호출되면 뒤의 호출은 건너뛴다.
+  //
+  // 멈춤(halt)은 *신규 진입만* 막는다. 보호 청산까지 막으면 포지션이 손절·익절·
+  // 강제청산 없이 방치된다(2026-09-11: 대사 불일치로 멈춘 뒤 3시간 동안 4주가
+  // 보호 없이 남아 있었다). 무언가 잘못됐을 때 포지션을 들고 있는 것이
+  // 포지션을 정리하는 것보다 위험하다.
+  async evaluate(input = {}) {
+    if (this.evaluating) {
+      return this.record({ action: "SKIP", at: this.now(), reason: "EVALUATION_IN_FLIGHT" });
+    }
+    this.evaluating = true;
+    try {
+      return await this.evaluateOnce(input);
+    } finally {
+      this.evaluating = false;
+    }
+  }
+
+  async evaluateOnce({ candidates = [], balance = null, marketTime = null } = {}) {
     const at = this.now();
     if (!this.settings.enabled) return this.record({ action: "DISABLED", at });
-    if (this.halt) {
-      return this.record({ action: "HALTED", at, reason: this.halt.code, detail: this.halt.message });
-    }
 
+    // 가드는 먼저 평가해 멈춤 상태를 갱신하되, 청산 경로는 통과시킨다.
     const guard = this.checkServiceGuards();
-    if (guard) return this.record({ ...guard, at });
 
     const position = this.resolvePosition(balance);
     if (position) return this.evaluateExit({ position, at, marketTime });
+
+    if (this.halt) {
+      return this.record({
+        action: "HALTED", at, blocks: "ENTRY",
+        reason: this.halt.code, detail: this.halt.message,
+      });
+    }
+    if (guard) return this.record({ ...guard, at });
     return this.evaluateEntry({ candidates, balance, at });
   }
 
@@ -132,6 +160,10 @@ export class KisPaperAutoTrader {
   resolvePosition(balance) {
     const positions = Array.isArray(balance?.positions) ? balance.positions : [];
     const held = positions.filter((item) => Number(item?.quantity) > 0);
+    // 잔고에 반영됐으면 대기를 푼다.
+    if (this.pendingOrder && held.some((item) => item.symbol === this.pendingOrder.symbol)) {
+      this.pendingOrder = null;
+    }
     if (held.length === 0) {
       this.riskTracker.reset();
       this.holding = null;
@@ -142,9 +174,14 @@ export class KisPaperAutoTrader {
       : held[0];
     return {
       symbol: String(target.symbol ?? ""),
+      // 화면에 종목코드만 보이면 무엇을 들고 있는지 알 수 없다.
+      name: target.name ? String(target.name) : null,
       quantity: Math.trunc(Number(target.quantity)),
       averagePrice: Number(target.averagePrice),
       currentPrice: Number(target.currentPrice),
+      evaluationAmount: numberOrNull(target.evaluationAmount),
+      evaluationProfitLoss: numberOrNull(target.evaluationProfitLoss),
+      evaluationProfitLossRate: numberOrNull(target.evaluationProfitLossRate),
     };
   }
 
@@ -156,17 +193,32 @@ export class KisPaperAutoTrader {
       return this.record({ action: "HOLD", at, symbol: position.symbol, reason: "NO_PRICE" });
     }
 
-    this.holding = { symbol: position.symbol, quantity: position.quantity };
     const risk = this.riskTracker.update({
       quantity: position.quantity,
       lastPrice,
       timestamp: at,
     });
+    this.holding = {
+      symbol: position.symbol,
+      name: position.name,
+      quantity: position.quantity,
+      averagePrice: position.averagePrice,
+      currentPrice: lastPrice,
+      evaluationProfitLoss: position.evaluationProfitLoss,
+      evaluationProfitLossRate: position.evaluationProfitLossRate,
+      openedAt: risk.openedAt,
+      heldMs: risk.openedAt !== null ? Math.max(0, at - risk.openedAt) : null,
+      peakPrice: risk.peakPrice,
+      returnBps: position.averagePrice > 0
+        ? ((lastPrice - position.averagePrice) / position.averagePrice) * 10_000
+        : null,
+    };
 
     // 장 종료 전 강제 청산. 보호 청산보다 우선한다.
     if (this.isForcedExitDue(marketTime ?? at)) {
       return this.submit({
-        side: "SELL", symbol: position.symbol, quantity: position.quantity,
+        side: "SELL", symbol: position.symbol, name: position.name,
+        quantity: position.quantity,
         referencePrice: lastPrice, reason: "FORCED_EXIT", at,
       });
     }
@@ -180,14 +232,21 @@ export class KisPaperAutoTrader {
     });
     if (intent) {
       return this.submit({
-        side: "SELL", symbol: position.symbol, quantity: intent.quantity,
+        side: "SELL", symbol: position.symbol, name: position.name,
+        quantity: intent.quantity,
         referencePrice: lastPrice, reason: intent.reason, at, diagnostics: intent.diagnostics,
       });
     }
-    return this.record({ action: "HOLD", at, symbol: position.symbol, quantity: position.quantity });
+    return this.record({
+      action: "HOLD", at, symbol: position.symbol, name: position.name,
+      quantity: position.quantity, returnBps: this.holding.returnBps,
+    });
   }
 
   async evaluateEntry({ candidates, balance, at }) {
+    // 직전 주문이 아직 잔고에 안 잡혔으면 "보유 없음"은 착시다. 반영될 때까지 기다린다.
+    const pending = this.pendingSettlement(at);
+    if (pending) return this.record({ action: "SKIP", at, reason: "AWAITING_SETTLEMENT", pending });
     if (at - this.lastOrderAt < this.settings.cooldownMs) {
       return this.record({ action: "SKIP", at, reason: "COOLDOWN" });
     }
@@ -197,10 +256,10 @@ export class KisPaperAutoTrader {
     const evaluated = [];
     for (const candidate of candidates) {
       const check = this.checkEntryGate(candidate, equity, at);
-      evaluated.push({ symbol: candidate?.symbol ?? null, ...check });
+      evaluated.push({ symbol: candidate?.symbol ?? null, name: candidate?.name ?? null, ...check });
       if (check.eligible) {
         return this.submit({
-          side: "BUY", symbol: check.symbol, quantity: check.quantity,
+          side: "BUY", symbol: check.symbol, name: check.name, quantity: check.quantity,
           referencePrice: check.price, reason: "ENTRY_SIGNAL", at,
           diagnostics: { expectedNetEdgeBps: check.expectedNetEdgeBps, equity },
           orderBookSnapshot: check.orderBookSnapshot,
@@ -253,7 +312,8 @@ export class KisPaperAutoTrader {
       return { eligible: false, reason: "QUANTITY_TOO_SMALL", price, equity };
     }
     return {
-      eligible: true, symbol, price, quantity, expectedNetEdgeBps,
+      eligible: true, symbol, name: candidate?.name ?? null,
+      price, quantity, expectedNetEdgeBps,
       orderBookSnapshot: candidate?.orderBookSnapshot ?? null,
     };
   }
@@ -266,6 +326,17 @@ export class KisPaperAutoTrader {
     const target = Math.min(equity * this.settings.positionSizeRatio, maxValue);
     const byValue = Math.floor(target / price);
     return Math.max(0, Math.min(byValue, Math.floor(maxQuantity)));
+  }
+
+  // 주문 직후 잔고 반영 지연 구간인지 판정한다. settlementGraceMs가 지나면 포기하고
+  // 정상 흐름으로 돌아간다(주문이 거절됐을 수도 있으므로 영구히 막지 않는다).
+  pendingSettlement(at) {
+    if (!this.pendingOrder) return null;
+    if (at - this.pendingOrder.at >= this.settings.settlementGraceMs) {
+      this.pendingOrder = null;
+      return null;
+    }
+    return { ...this.pendingOrder };
   }
 
   isForcedExitDue(timestamp) {
@@ -286,8 +357,12 @@ export class KisPaperAutoTrader {
     };
   }
 
-  async submit({ side, symbol, quantity, referencePrice, reason, at, diagnostics = null, orderBookSnapshot = null }) {
+  async submit({ side, symbol, name = null, quantity, referencePrice, reason, at, diagnostics = null, orderBookSnapshot = null }) {
     const clientOrderId = `AUTO:${side}:${symbol}:${at}`;
+    // await 이전에 기록한다. 제출이 끝난 뒤에 갱신하면 그 사이의 평가가 옛 값을 보고
+    // 같은 주문을 또 낸다.
+    this.lastOrderAt = at;
+    if (side === "BUY") this.pendingOrder = { symbol, name, quantity, at };
     let result;
     try {
       result = await this.orderService.submitOrder({
@@ -301,16 +376,24 @@ export class KisPaperAutoTrader {
         orderBookSnapshot,
       });
     } catch (error) {
+      // 이미 멈춘 상태에서 청산이 거부되는 것은 새로운 사고가 아니라
+      // 멈춤의 결과다. 원인을 덮어쓰지 않고 별개 사유로 드러낸다.
+      if (side === "SELL" && this.halt) {
+        return this.record({
+          action: "EXIT_BLOCKED", at, side, symbol, name, quantity, reason,
+          detail: `보호 청산이 차단되었습니다: ${message(error)}`,
+          haltReason: this.halt.code,
+        });
+      }
       const halt = this.setHalt("ORDER_FAILED", `주문 제출 실패: ${message(error)}`, { clientOrderId, side, symbol });
-      return this.record({ action: "ORDER_ERROR", at, side, symbol, quantity, reason, detail: halt.message });
+      return this.record({ action: "ORDER_ERROR", at, side, symbol, name, quantity, reason, detail: halt.message });
     }
-    this.lastOrderAt = at;
     if (result?.status === "UNKNOWN_RESULT" && this.settings.haltOnUnknownResult) {
       this.setHalt("UNKNOWN_RESULT", "주문 결과가 불확실합니다. 해소 후 재개하세요.", { clientOrderId });
     }
     return this.record({
-      action: "ORDER", at, side, symbol, quantity, reason, clientOrderId,
-      status: result?.status ?? null, diagnostics,
+      action: "ORDER", at, side, symbol, name, quantity, reason, clientOrderId,
+      referencePrice, status: result?.status ?? null, diagnostics,
     });
   }
 
