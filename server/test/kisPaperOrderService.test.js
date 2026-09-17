@@ -188,3 +188,82 @@ test("result journal failure transitions accepted broker order to UNKNOWN_RESULT
   assert.equal(replay.replayed, true);
   assert.equal(broker.submitCalls, 1);
 });
+
+// 2026-09-17: 손절 매도가 계속 1회 주문 금액 한도에 걸려 거절되면서 포지션이
+// 묶였다. 보호청산(protectiveExit)은 이미 보유한 포지션을 줄이는 매도이므로
+// 이 한도들이 새 위험을 늘리는 것을 막을 이유가 없다.
+test("protective exit bypasses the per-order quantity and value limits", async () => {
+  const broker = client();
+  const orders = service({
+    client: broker,
+    limits: { maxOrderQuantity: 1, maxOrderValue: 1_000_000, maxDailyOrders: 20, maxDailyLoss: 0 },
+  });
+  const result = await orders.submitOrder({
+    clientOrderId: "protective-1",
+    side: "SELL",
+    symbol: "005930",
+    type: "MARKET",
+    quantity: 8,
+    referencePrice: 224_000,
+    protectiveExit: true,
+  });
+  assert.equal(result.status, "ACCEPTED");
+  assert.equal(broker.submitCalls, 1);
+});
+
+test("a non-protective order is still blocked by the same quantity and value limits", async () => {
+  const broker = client();
+  const orders = service({
+    client: broker,
+    limits: { maxOrderQuantity: 1, maxOrderValue: 1_000_000, maxDailyOrders: 20, maxDailyLoss: 0 },
+  });
+  await assert.rejects(
+    () => orders.submitOrder({
+      clientOrderId: "manual-sell-1",
+      side: "SELL",
+      symbol: "005930",
+      type: "MARKET",
+      quantity: 8,
+      referencePrice: 224_000,
+    }),
+    (error) => error.code === "KIS_PAPER_ORDER_QUANTITY_LIMIT",
+  );
+  assert.equal(broker.submitCalls, 0);
+});
+
+test("kill switch still blocks a protective exit — only quantity/value caps are bypassed", async () => {
+  const broker = client();
+  const orders = service({ client: broker });
+  orders.setKillSwitch(true);
+  await assert.rejects(
+    () => orders.submitOrder({
+      clientOrderId: "protective-2",
+      side: "SELL",
+      symbol: "005930",
+      type: "MARKET",
+      quantity: 1,
+      referencePrice: 70_000,
+      protectiveExit: true,
+    }),
+    (error) => error.code === "KIS_PAPER_KILL_SWITCH",
+  );
+  assert.equal(broker.submitCalls, 0);
+});
+
+test("a protective exit still rejects a nonsensical (zero/negative) quantity", async () => {
+  const broker = client();
+  const orders = service({ client: broker });
+  await assert.rejects(
+    () => orders.submitOrder({
+      clientOrderId: "protective-3",
+      side: "SELL",
+      symbol: "005930",
+      type: "MARKET",
+      quantity: 0,
+      referencePrice: 70_000,
+      protectiveExit: true,
+    }),
+    (error) => error.code === "KIS_PAPER_ORDER_QUANTITY_INVALID",
+  );
+  assert.equal(broker.submitCalls, 0);
+});

@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ import { createOpenDartClientFromEnv } from "./integrations/opendart/openDartCli
 import {
   loadKisPaperConfiguration,
   publicKisPaperConfiguration,
+  KIS_PAPER_LIMIT_BOUNDS,
 } from "./integrations/kis/kisPaperConfig.js";
 import { KisPaperOrderService } from "./integrations/kis/kisPaperOrderService.js";
 import { KisPaperAutoTrader } from "./domain/kisPaperAutoTrader.js";
@@ -33,6 +34,7 @@ import {
   loadAutoTradingSettings,
   normalizeAutoTradingSettings,
 } from "./domain/autoTradingSettings.js";
+import { PaperAutoTradingConfigStore } from "./domain/paperAutoTradingConfigStore.js";
 import { KisPaperTradingClient } from "./integrations/kis/kisPaperTradingClient.js";
 import {
   loadKisLiveConfiguration,
@@ -52,6 +54,38 @@ const publicDir = join(root, "public");
 const dataDir = process.env.PULSEHFT_DATA_DIR
   ? resolve(process.env.PULSEHFT_DATA_DIR)
   : join(root, ".pulsehft");
+
+// 실행 저널은 순번 검증이 있어 파일 자체 형식은 지켜지지만, 같은 데이터 디렉터리를
+// 두 서버 프로세스가 동시에 열면 각자 메모리 상 순번 카운터가 서로를 모른 채 같은
+// 다음 번호를 내려써 저널이 뒤섞인다(2026-09-17: 껐다고 생각한 프로세스가 고아로
+// 남아 새로 띄운 프로세스와 동시에 같은 저널에 써서 모의·실전 저널이 모두 손상됐다).
+// 잠금 파일로 같은 데이터 디렉터리를 향한 두 번째 인스턴스의 기동 자체를 막는다.
+// 강제 종료(taskkill, Stop-Process -Force)로 잠금 파일이 안 지워져도, 다음 기동 시
+// 그 PID가 이미 죽어 있으면 자동으로 무시하고 새로 잠근다.
+mkdirSync(dataDir, { recursive: true });
+const lockFilePath = join(dataDir, "server.lock");
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+if (existsSync(lockFilePath)) {
+  const previousPid = Number(readFileSync(lockFilePath, "utf8").trim());
+  if (Number.isInteger(previousPid) && previousPid > 0 && previousPid !== process.pid && isProcessAlive(previousPid)) {
+    console.error(
+      `이미 PID ${previousPid}가 같은 데이터 디렉터리(${dataDir})로 실행 중입니다. ` +
+        "두 프로세스가 동시에 실행 저널에 쓰면 파일이 손상됩니다. 기존 프로세스를 먼저 종료하세요.",
+    );
+    process.exit(1);
+  }
+}
+writeFileSync(lockFilePath, String(process.pid), "utf8");
+
 const defaultInstrument = {
   symbol: process.env.DEFAULT_SYMBOL ?? "005930",
   symbolName: process.env.DEFAULT_SYMBOL_NAME ?? "삼성전자",
@@ -193,6 +227,13 @@ const runtime = new MarketRuntime(
   },
 );
 
+// 모의계좌 자동매매 설정·안전 한도는 화면에서 바꿔도 저장 파일이 없어 재시작하면
+// .env 기본값으로 되돌아갔다(2026-09-17). 저장된 값이 있으면 그걸 우선한다.
+const paperAutoTradingConfigStore = new PaperAutoTradingConfigStore(
+  join(dataDir, "paper-auto-trading-config.json"),
+);
+const persistedPaperAutoTradingConfig = paperAutoTradingConfigStore.load();
+
 const kisPaperOrderService = kisPaperClient
   ? new KisPaperOrderService({
     client: kisPaperClient,
@@ -202,11 +243,16 @@ const kisPaperOrderService = kisPaperClient
     costModel: loadPaperCostModel(process.env),
   })
   : null;
+if (kisPaperOrderService && persistedPaperAutoTradingConfig?.limits) {
+  kisPaperOrderService.setLimits(persistedPaperAutoTradingConfig.limits);
+}
 
 // 모의계좌 자동매매(docs/AUTO_TRADING_PAPER_DESIGN.md). 실전 경로와 무관하며
 // 기본은 꺼져 있다. 비용 모델은 내부 시뮬레이터·성과 지표와 같은 값을 공유한다.
 const autoTradingCostModel = loadPaperCostModel(process.env);
-const autoTradingSettings = loadAutoTradingSettings(process.env);
+const autoTradingSettings = persistedPaperAutoTradingConfig?.settings
+  ? normalizeAutoTradingSettings(persistedPaperAutoTradingConfig.settings)
+  : loadAutoTradingSettings(process.env);
 // 익절 목표가 문턱과 고정비용의 합을 넘지 못하면 조용히 거래 0건이 된다. 기동 시점에 막는다.
 assertTradeableConfiguration(autoTradingSettings, autoTradingCostModel);
 const kisPaperAutoTrader = kisPaperOrderService
@@ -382,6 +428,41 @@ function rejectNonLoopbackKisRequest(request, response) {
   if (isLoopbackAddress(request.socket.remoteAddress)) return false;
   json(response, 404, { error: "요청한 경로를 찾을 수 없습니다." });
   return true;
+}
+
+// 실현손익 기록(BROKER_FILL_OBSERVED)에는 종목명이 없다 — 체결 당시 KIS 응답의 이름을
+// 저널에 남기지 않았기 때문이다. 저널 스키마를 바꾸는 대신, 응답 시점에 종목 마스터로
+// 이름을 찾아 붙인다. 이러면 이미 기록된 과거 거래도(마스터에 있는 한) 이름이 나온다.
+// 종목을 못 찾아도(상장폐지 등) 조용히 이름 없이 코드만 보여주고 목록 자체는 막지 않는다.
+// 종목 마스터 캐시가 없으면 findBySymbol이 KIS 서버로 실제 네트워크 요청을 건다
+// (2026-09-17: 이게 느려지자 이 응답을 기다리던 화면의 다른 폴링(한도 조회 등)까지
+// 전부 밀렸다). 그래서 각 조회를 500ms 안에 못 끝내면 이름 없이 넘어가도록 못박는다.
+async function withTradeNames(performance) {
+  const trades = performance?.trades?.recent;
+  if (!Array.isArray(trades) || trades.length === 0) return performance;
+  const symbols = [...new Set(trades.map((trade) => trade?.symbol).filter(Boolean))];
+  const names = new Map();
+  await Promise.all(symbols.map(async (symbol) => {
+    try {
+      const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 500));
+      // 타임아웃으로 이겨도 findBySymbol 자체는 백그라운드에서 계속 진행되다 나중에
+      // 거부될 수 있다 — 그 늦은 거부가 처리되지 않은 rejection으로 남지 않게 한다.
+      const instrument = await Promise.race([
+        instrumentCatalog.findBySymbol(symbol).catch(() => null),
+        timeout,
+      ]);
+      if (instrument?.name) names.set(symbol, instrument.name);
+    } catch {
+      // 마스터에 없는 종목(상장폐지 등)은 이름 없이 코드만 표시한다.
+    }
+  }));
+  return {
+    ...performance,
+    trades: {
+      ...performance.trades,
+      recent: trades.map((trade) => ({ ...trade, name: names.get(trade?.symbol) ?? null })),
+    },
+  };
 }
 
 function requireKisPaperAutoTrader(response) {
@@ -618,6 +699,33 @@ const server = createServer(async (request, response) => {
       if (!service) return;
       return json(response, 200, await service.getBalance());
     }
+    // 모의계좌 안전 한도. 검증 중 표본 수집 속도를 조절하기 위해 런타임 변경을 허용한다.
+    // 실전 한도는 이 경로를 제공하지 않는다.
+    if (request.method === "GET" && url.pathname === "/api/kis/paper/limits") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      return json(response, 200, {
+        limits: service.status().limits,
+        bounds: KIS_PAPER_LIMIT_BOUNDS,
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/limits") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      const body = await readJson(request);
+      try {
+        const status = service.setLimits(body);
+        paperAutoTradingConfigStore.save({ limits: status.limits });
+        return json(response, 200, { limits: status.limits, bounds: KIS_PAPER_LIMIT_BOUNDS });
+      } catch (error) {
+        return json(response, error?.statusCode ?? 400, {
+          error: error instanceof Error ? error.message : String(error),
+          code: error?.code ?? "KIS_PAPER_LIMIT_INVALID",
+        });
+      }
+    }
     // 자동매매 상태·설정. 실전 경로와 분리된 모의계좌 전용 엔드포인트다.
     if (request.method === "GET" && url.pathname === "/api/kis/paper/auto-trading") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
@@ -641,6 +749,7 @@ const server = createServer(async (request, response) => {
         });
       }
       trader.updateSettings(next);
+      paperAutoTradingConfigStore.save({ settings: next });
       restartAutoTradingTimer();
       return json(response, 200, trader.status());
     }
@@ -654,7 +763,8 @@ const server = createServer(async (request, response) => {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
       if (!service) return;
-      return json(response, 200, service.getPerformance());
+      const recentLimit = url.searchParams.get("recent") === "all" ? 0 : undefined;
+      return json(response, 200, await withTradeNames(service.getPerformance({ recentLimit })));
     }
     if (request.method === "GET" && url.pathname === "/api/kis/paper/fill-comparison") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
@@ -914,6 +1024,11 @@ function shutdown() {
   realtimeCoordinator?.stop();
   runtime.stop();
   for (const client of eventClients) client.end();
+  try {
+    unlinkSync(lockFilePath);
+  } catch {
+    // 이미 없거나 지울 수 없으면 다음 기동의 PID 생존 확인이 대신 처리한다.
+  }
   server.close(() => process.exit(0));
 }
 process.on("SIGINT", shutdown);

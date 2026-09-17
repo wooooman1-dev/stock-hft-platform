@@ -374,6 +374,9 @@ export class KisPaperAutoTrader {
         referencePrice,
         exchange: "KRX",
         orderBookSnapshot,
+        // 이 자동매매(v1, 동시 보유 1종목)는 매도를 손절·익절·트레일링 스톱·최대
+        // 보유시간·강제청산 용도로만 낸다 — 매도는 전부 보호청산이다.
+        protectiveExit: side === "SELL",
       });
     } catch (error) {
       // 이미 멈춘 상태에서 청산이 거부되는 것은 새로운 사고가 아니라

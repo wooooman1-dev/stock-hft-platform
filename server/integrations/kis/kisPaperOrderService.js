@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { KisPaperReconciler } from "../../domain/kisPaperReconciler.js";
 import { KisPaperPerformanceTracker } from "../../domain/kisPaperPerformance.js";
+import { normalizeKisPaperLimits } from "./kisPaperConfig.js";
 import { computeFillModelComparison } from "../../domain/fillModelComparison.js";
 import {
   KisPaperOrderServiceError,
@@ -113,6 +114,13 @@ export class KisPaperOrderService {
     };
   }
 
+  // 모의계좌 한도는 검증 중에 조절할 일이 많다(표본 수집 속도 등).
+  // 실전 주문 서비스에는 이 경로를 만들지 않는다.
+  setLimits(limits) {
+    this.limits = normalizeKisPaperLimits(limits, this.limits);
+    return this.status();
+  }
+
   setKillSwitch(enabled) {
     if (!enabled && this.unknownResult) {
       throw new KisPaperOrderServiceError(
@@ -146,12 +154,19 @@ export class KisPaperOrderService {
     return balance;
   }
 
+  // protectiveExit: 손절·익절·트레일링 스톱·최대 보유시간·강제청산처럼 이미 보유한
+  // 포지션을 줄이는 매도다. 1회 주문 수량·금액 한도는 "한 번에 새 위험을 얼마나
+  // 늘릴 수 있는가"를 막는 장치이므로, 위험을 줄이는 이 매도에는 적용하지 않는다
+  // (2026-09-17: 한도를 넘는 손절이 계속 거절되어 포지션이 묶였다). 킬 스위치는
+  // 이 플래그와 무관하게 그대로 모든 신규·정정 주문을 막는다 — 결과가 불확실하거나
+  // 대사가 어긋난 상태는 사람이 직접 확인하기 전까지 멈추는 게 맞기 때문이다.
   async submitOrder(input) {
     return this.enqueue(() => this.execute({
       operation: "SUBMIT",
       clientOrderId: normalizeClientOrderId(input?.clientOrderId),
       request: normalizeSubmitRequest(input),
       orderBookSnapshot: normalizeOrderBookSnapshot(input?.orderBookSnapshot),
+      protectiveExit: Boolean(input?.protectiveExit),
       call: (request) => this.client.submitOrder(request),
     }));
   }
@@ -180,10 +195,10 @@ export class KisPaperOrderService {
     return next;
   }
 
-  async execute({ operation, clientOrderId, request, call, orderBookSnapshot = null }) {
+  async execute({ operation, clientOrderId, request, call, orderBookSnapshot = null, protectiveExit = false }) {
     const existing = this.commands.get(clientOrderId);
     if (existing) return replayExisting(existing);
-    await this.enforceSafety(operation, request);
+    await this.enforceSafety(operation, request, { protectiveExit });
     const timestamp = this.now();
     const command = {
       commandId: String(this.commandIdFactory()),
@@ -272,7 +287,7 @@ export class KisPaperOrderService {
     }
   }
 
-  async enforceSafety(operation, request) {
+  async enforceSafety(operation, request, { protectiveExit = false } = {}) {
     if (operation === "CANCEL") return;
     await this.refreshReconciliation({ force: true });
     const status = this.status();
@@ -289,27 +304,39 @@ export class KisPaperOrderService {
       });
     }
     const quantity = Number(request.quantity);
-    if (!Number.isInteger(quantity) || quantity <= 0 || quantity > this.limits.maxOrderQuantity) {
+    if (!Number.isInteger(quantity) || quantity <= 0) {
       throw new KisPaperOrderServiceError(
-        `주문 수량은 1주 이상 ${this.limits.maxOrderQuantity}주 이하여야 합니다.`,
-        { code: "KIS_PAPER_ORDER_QUANTITY_LIMIT", statusCode: 400 },
+        "주문 수량은 1주 이상의 정수여야 합니다.",
+        { code: "KIS_PAPER_ORDER_QUANTITY_INVALID", statusCode: 400 },
       );
     }
-    const riskPrice = request.type === "LIMIT"
-      ? Number(request.limitPrice)
-      : Number(request.referencePrice);
-    if (!Number.isFinite(riskPrice) || riskPrice <= 0) {
-      throw new KisPaperOrderServiceError(
-        "시장가 주문은 안전 한도 계산을 위한 referencePrice가 필요합니다.",
-        { code: "KIS_PAPER_REFERENCE_PRICE_REQUIRED", statusCode: 400 },
-      );
-    }
-    const orderValue = quantity * riskPrice;
-    if (orderValue > this.limits.maxOrderValue) {
-      throw new KisPaperOrderServiceError(
-        `주문 추정금액 ${orderValue}원이 최대 주문금액 ${this.limits.maxOrderValue}원을 초과합니다.`,
-        { code: "KIS_PAPER_ORDER_VALUE_LIMIT", statusCode: 400 },
-      );
+    // 보호청산(손절·익절·트레일링 스톱·최대 보유시간·강제청산)은 이미 보유한 포지션을
+    // 줄이는 매도라, "한 번에 새 위험을 얼마나 늘릴 수 있는가"를 막는 수량·금액 한도를
+    // 적용하지 않는다. 적용하면 보유 수량·가격이 한도를 넘는 순간 포지션이 영영 묶인다
+    // (2026-09-17: 8주 손절이 계속 거절되어 한도를 올려도 주가가 더 움직이면 다시 걸렸다).
+    if (!protectiveExit) {
+      if (quantity > this.limits.maxOrderQuantity) {
+        throw new KisPaperOrderServiceError(
+          `주문 수량은 1주 이상 ${this.limits.maxOrderQuantity}주 이하여야 합니다.`,
+          { code: "KIS_PAPER_ORDER_QUANTITY_LIMIT", statusCode: 400 },
+        );
+      }
+      const riskPrice = request.type === "LIMIT"
+        ? Number(request.limitPrice)
+        : Number(request.referencePrice);
+      if (!Number.isFinite(riskPrice) || riskPrice <= 0) {
+        throw new KisPaperOrderServiceError(
+          "시장가 주문은 안전 한도 계산을 위한 referencePrice가 필요합니다.",
+          { code: "KIS_PAPER_REFERENCE_PRICE_REQUIRED", statusCode: 400 },
+        );
+      }
+      const orderValue = quantity * riskPrice;
+      if (orderValue > this.limits.maxOrderValue) {
+        throw new KisPaperOrderServiceError(
+          `주문 추정금액 ${orderValue}원이 최대 주문금액 ${this.limits.maxOrderValue}원을 초과합니다.`,
+          { code: "KIS_PAPER_ORDER_VALUE_LIMIT", statusCode: 400 },
+        );
+      }
     }
     const today = koreaDateKey(this.now());
     const todayCount = [...this.commands.values()].filter((state) => state.day === today).length;
@@ -394,11 +421,11 @@ export class KisPaperOrderService {
     }
   }
 
-  getPerformance() {
+  getPerformance({ recentLimit } = {}) {
     if (!this.performanceTracker) {
       return { available: false, reason: "KIS 당일 주문내역 조회를 사용할 수 없어 성과 통계를 계산할 수 없습니다." };
     }
-    return { available: true, ...this.performanceTracker.report() };
+    return { available: true, ...this.performanceTracker.report({ recentLimit }) };
   }
 
   getFillComparison() {

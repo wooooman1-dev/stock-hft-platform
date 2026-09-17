@@ -197,7 +197,10 @@ function render() {
     </div>
     <div class="kis-live-orders">${commands.slice(0, 8).map(commandRow).join("") || '<div>제출한 실전 주문 명령이 아직 없습니다(이 브라우저 기록 기준).</div>'}</div>
   `;
-  if (!existing) executionGrid.insertAdjacentElement("afterend", panel);
+  // app.js가 execution-grid를 다시 그릴 때마다 이 패널을 일단 그리드 안으로
+  // 옮겨 붙여 놓으므로(파괴 방지용 임시 조치), 매 렌더마다 원래 자리(그리드
+  // 바로 다음 형제, 전체 너비)로 스스로 되돌린다.
+  if (executionGrid.nextElementSibling !== panel) executionGrid.insertAdjacentElement("afterend", panel);
 
   if (message) {
     let toast = app.querySelector(".kis-live-toast");

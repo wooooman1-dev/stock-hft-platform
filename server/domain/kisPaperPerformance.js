@@ -72,10 +72,11 @@ export class KisPaperPerformanceTracker {
     }
   }
 
-  report() {
+  report({ recentLimit } = {}) {
     return computePerformanceReport(this.journal.readAll(), {
       now: this.now(),
       costModel: this.costModel,
+      ...(recentLimit === undefined ? {} : { recentLimit }),
     });
   }
 
@@ -99,7 +100,7 @@ const DEFAULT_COST_MODEL = Object.freeze({
   sellTaxBps: 20,
 });
 
-export function computePerformanceReport(events, { now = Date.now(), costModel = {} } = {}) {
+export function computePerformanceReport(events, { now = Date.now(), costModel = {}, recentLimit = 20 } = {}) {
   const costs = { ...DEFAULT_COST_MODEL, ...costModel };
   const operational = computeOperationalStats(events, now);
   const equitySnapshots = events
@@ -247,7 +248,7 @@ export function computePerformanceReport(events, { now = Date.now(), costModel =
       consecutiveLossStreak,
       maxConsecutiveLossStreak,
       costBasisIncompleteQuantity,
-      recent: realizedTrades.slice(-20),
+      recent: recentLimit > 0 ? realizedTrades.slice(-recentLimit) : realizedTrades,
     },
   };
 }

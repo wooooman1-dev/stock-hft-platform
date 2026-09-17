@@ -12,7 +12,7 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
-  assert.match(indexSource, /app\.js\?v=2/);
+  assert.match(indexSource, /app\.js\?v=4/);
   assert.match(indexSource, /kisOrderHistory\.js\?v=1/);
   assert.match(indexSource, /recommendationTabs\.js\?v=7/);
 });
@@ -33,7 +33,7 @@ test("workspace keeps only main analysis and recommendation tabs", () => {
 });
 
 test("workspace tabs live outside the snapshot-rendered app tree", () => {
-  assert.match(appSource, /app\.innerHTML\s*=/);
+  assert.match(appSource, /app\.replaceChildren\(/);
   assert.match(tabsSource, /tabsPortal\.className = "recommendation-tabs-portal"/);
   assert.match(tabsSource, /document\.body\.append\(tabsPortal\)/);
   assert.match(tabsSource, /tabsPortal\.querySelectorAll\("\[data-recommendation-tab\]"\)/);
