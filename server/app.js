@@ -241,6 +241,7 @@ const kisPaperOrderService = kisPaperClient
     limits: kisPaperConfiguration.limits,
     onUnknownResult: () => runtime.setKillSwitch(true),
     costModel: loadPaperCostModel(process.env),
+    performanceResetAt: persistedPaperAutoTradingConfig?.performanceResetAt ?? null,
   })
   : null;
 if (kisPaperOrderService && persistedPaperAutoTradingConfig?.limits) {
@@ -766,6 +767,27 @@ const server = createServer(async (request, response) => {
       const recentLimit = url.searchParams.get("recent") === "all" ? 0 : undefined;
       return json(response, 200, await withTradeNames(service.getPerformance({ recentLimit })));
     }
+    // 초기 오류가 있던 기간의 손익이 지금 성과를 계속 가려서 "오늘부터 새로
+    // 보고 싶다"는 요청으로 추가했다(2026-09-23). 실행 저널은 그대로 두고
+    // 성과 집계 시작 시각만 옮긴다 — resetAt을 생략하면 오늘 00:00(KST)부터,
+    // resetAt: null을 명시하면 전체 이력 보기로 되돌린다.
+    if (request.method === "POST" && url.pathname === "/api/kis/paper/performance/reset") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisPaperService(response);
+      if (!service) return;
+      const body = await readJson(request);
+      const hasExplicitResetAt = Object.hasOwn(body, "resetAt");
+      const resetAt = hasExplicitResetAt
+        ? (body.resetAt === null ? null : Number(body.resetAt))
+        : startOfKoreaDay(Date.now());
+      if (resetAt !== null && !Number.isFinite(resetAt)) {
+        return json(response, 400, { error: "resetAt은 타임스탬프(ms) 또는 null이어야 합니다." });
+      }
+      service.setPerformanceResetAt(resetAt);
+      paperAutoTradingConfigStore.save({ performanceResetAt: resetAt });
+      const recentLimit = url.searchParams.get("recent") === "all" ? 0 : undefined;
+      return json(response, 200, await withTradeNames(service.getPerformance({ recentLimit })));
+    }
     if (request.method === "GET" && url.pathname === "/api/kis/paper/fill-comparison") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisPaperService(response);
@@ -1005,7 +1027,13 @@ function restartAutoTradingTimer() {
   if (typeof autoTradingTimer.unref === "function") autoTradingTimer.unref();
 }
 
-// 평일 09:00~15:30 KST. 공휴일은 구분하지 않는다(후보가 비어 진입이 성립하지 않는다).
+// 모의투자(KIS 계정)는 정규장(09:00~15:30 KST)에만 주문을 받는다 — 08:00~20:00
+// 확장 시간대(NXT 프리마켓·애프터마켓)로 자동 진입을 시도하면 "모의투자
+// 장종료"로 거절되거나, 그 시간대에 몰린 응답 지연이 결과 불명(UNKNOWN)으로
+// 이어져 킬 스위치가 켜진다 — 사람이 밤새 지켜보지 않으면 다음날 아침까지
+// 전체 매매가 멈춘다(2026-09-17 저녁 18:46 킬 스위치가 다음날 09:42까지
+// 안 풀려 그 사이 진입 기회를 전부 날린 사례로 확인). SOR/확장 시간대는
+// 실전 계좌 쪽에만 유효하고, 모의투자 자동매매 진입 주기는 정규장으로 제한한다.
 function isKoreaTradingWindow(timestamp) {
   const kst = new Date(Number(timestamp) + 9 * 60 * 60 * 1_000);
   const day = kst.getUTCDay();
@@ -1014,9 +1042,23 @@ function isKoreaTradingWindow(timestamp) {
   return minutes >= 9 * 60 && minutes <= 15 * 60 + 30;
 }
 
+// KST 날짜 경계의 00:00을 epoch ms로. KST는 UTC+9라 그 날짜 00:00 UTC에서 9시간을
+// 빼면 된다(서머타임 없음).
+function startOfKoreaDay(timestamp) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date(Number(timestamp)));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day)) - 9 * 60 * 60 * 1_000;
+}
+
 restartAutoTradingTimer();
 
+let shuttingDown = false;
 function shutdown() {
+  // Ctrl+C를 여러 번 누르거나 SIGINT·SIGTERM이 겹쳐 들어와도 한 번만 처리한다.
+  if (shuttingDown) return;
+  shuttingDown = true;
   clearInterval(heartbeat);
   if (autoTradingTimer) clearInterval(autoTradingTimer);
   mainWorkspace.stop();
@@ -1024,12 +1066,34 @@ function shutdown() {
   realtimeCoordinator?.stop();
   runtime.stop();
   for (const client of eventClients) client.end();
-  try {
-    unlinkSync(lockFilePath);
-  } catch {
-    // 이미 없거나 지울 수 없으면 다음 기동의 PID 생존 확인이 대신 처리한다.
-  }
-  server.close(() => process.exit(0));
+
+  let exited = false;
+  const finish = () => {
+    if (exited) return;
+    exited = true;
+    clearTimeout(forceExitTimer);
+    // 잠금 파일은 여기서 지운다 — stop()들은 타이머만 멈출 뿐 이미 시작된 저널
+    // 쓰기가 끝났다는 보장이 없어서, 서버가 실제로 닫히는(또는 강제 종료
+    // 유예시간이 끝나는) 이 시점까지 최대한 늦춘다. 너무 일찍 지우면 그 순간
+    // 새 프로세스가 잠금이 없는 걸 보고 기동해 옛 프로세스와 동시에 같은
+    // 저널에 써서 다시 손상된다(2026-09-17, 재발).
+    try {
+      unlinkSync(lockFilePath);
+    } catch {
+      // 이미 없거나 지울 수 없으면 다음 기동의 PID 생존 확인이 대신 처리한다.
+    }
+    process.exit(0);
+  };
+
+  // 브라우저가 유지하는 idle keep-alive 연결이 하나라도 남아 있으면
+  // server.close()의 콜백이 영영 안 불려서 Ctrl+C를 눌러도 프로세스가 안
+  // 죽는 문제가 있었다(2026-09-18: 사용자가 Ctrl+C로 껐다고 했는데 프로세스가
+  // 계속 살아있었다). 열려 있는 소켓을 명시적으로 끊어서 close()가 실제로
+  // 끝나게 하고, 그래도 안 끝나면 3초 뒤 강제 종료한다.
+  server.close(finish);
+  server.closeAllConnections?.();
+  const forceExitTimer = setTimeout(finish, 3_000);
+  forceExitTimer.unref?.();
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

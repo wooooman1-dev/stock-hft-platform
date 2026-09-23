@@ -10,6 +10,7 @@
     "start:kis:prod-read-only": "node --env-file=.env --import ./server/integrations/kis/installKisPongWebSocket.js server/app.js",
     "start:kis:paper": "node --env-file=.env --import ./server/integrations/kis/installKisPongWebSocket.js server/app.js",
     "start:kis:live": "node --env-file=.env --import ./server/integrations/kis/installKisPongWebSocket.js server/app.js",
+    "kis": "node --env-file=.env --import ./server/integrations/kis/installKisPongWebSocket.js server/app.js",
     "replay:kis:realtime": "node scripts/replay-kis-realtime.js",
     "backtest:walk-forward": "node scripts/walk-forward-backtest.js",
     "verify:kis:paper-roundtrip": "node scripts/verify-kis-paper-roundtrip.js",

@@ -25,6 +25,7 @@ const UNKNOWN_EVENT = "BROKER_ORDER_UNKNOWN";
 const UNKNOWN_RESOLVED_EVENT = "BROKER_ORDER_UNKNOWN_RESOLVED";
 const UNKNOWN_RESOLUTIONS = new Set(["ACCEPTED", "NOT_ACCEPTED"]);
 const RISK_BASELINE_EVENT = "BROKER_RISK_BASELINE";
+const RECONCILIATION_UNAVAILABLE_EVENT = "BROKER_RECONCILIATION_UNAVAILABLE";
 
 export class KisPaperOrderService {
   constructor({
@@ -37,6 +38,9 @@ export class KisPaperOrderService {
     reconciliationRefreshMs = 30_000,
     // 성과 지표의 비용 모델. 자동매매 진입 게이트와 같은 값을 써야 판정이 일관된다.
     costModel = {},
+    // 성과 통계 집계 시작 시각. 이 시각 이전 체결은 승률·총순이익 계산에서
+    // 제외한다(실행 저널 자체는 그대로 유지 — 대사·킬 스위치 복구용).
+    performanceResetAt = null,
   }) {
     if (!client || typeof client.submitOrder !== "function") {
       throw new TypeError("KIS paper client가 필요합니다.");
@@ -73,8 +77,18 @@ export class KisPaperOrderService {
       ? new KisPaperReconciler({ journal, now })
       : null;
     this.performanceTracker = typeof client.getDailyOrders === "function"
-      ? new KisPaperPerformanceTracker({ journal, now, costModel })
+      ? new KisPaperPerformanceTracker({ journal, now, costModel, resetAt: performanceResetAt })
       : null;
+  }
+
+  setPerformanceResetAt(timestamp) {
+    if (!this.performanceTracker) {
+      throw new KisPaperOrderServiceError(
+        "KIS 당일 주문내역 조회를 사용할 수 없어 성과 집계 기준을 바꿀 수 없습니다.",
+        { code: "KIS_PAPER_PERFORMANCE_UNAVAILABLE", statusCode: 503 },
+      );
+    }
+    return this.performanceTracker.setResetAt(timestamp);
   }
 
   status() {
@@ -167,6 +181,8 @@ export class KisPaperOrderService {
       request: normalizeSubmitRequest(input),
       orderBookSnapshot: normalizeOrderBookSnapshot(input?.orderBookSnapshot),
       protectiveExit: Boolean(input?.protectiveExit),
+      // KIS로 나가는 request에는 안 넣는다 — 실행 저널에만 붙는 내부 메모다.
+      reason: input?.reason ?? null,
       call: (request) => this.client.submitOrder(request),
     }));
   }
@@ -195,7 +211,9 @@ export class KisPaperOrderService {
     return next;
   }
 
-  async execute({ operation, clientOrderId, request, call, orderBookSnapshot = null, protectiveExit = false }) {
+  async execute({
+    operation, clientOrderId, request, call, orderBookSnapshot = null, protectiveExit = false, reason = null,
+  }) {
     const existing = this.commands.get(clientOrderId);
     if (existing) return replayExisting(existing);
     await this.enforceSafety(operation, request, { protectiveExit });
@@ -206,6 +224,7 @@ export class KisPaperOrderService {
       operation,
       request: safeRequest(request),
       orderBookSnapshot: orderBookSnapshot ? structuredClone(orderBookSnapshot) : null,
+      reason: text(reason),
       timestamp,
       day: koreaDateKey(timestamp),
     };
@@ -417,6 +436,20 @@ export class KisPaperOrderService {
       return report;
     } catch (error) {
       this.lastReconciliationRefreshAt = this.now();
+      // markUnavailable()는 메모리에만 남고 저널에는 안 남는다 — 2026-09-23에 계좌
+      // 대조가 2분간 안 되면서 킬 스위치가 걸렸는데, 원인(어느 KIS 호출이 왜
+      // 실패했는지)을 나중에 전혀 확인할 수 없었다. 다음에 같은 일이 생기면
+      // 원인을 찾을 수 있도록 여기서 저널에 남긴다.
+      const checkedAt = this.now();
+      try {
+        this.journal.append(RECONCILIATION_UNAVAILABLE_EVENT, {
+          day: koreaDateKey(checkedAt),
+          checkedAt,
+          error: safeError(error),
+        }, checkedAt);
+      } catch {
+        // 저널 기록 실패가 원래 에러 처리를 막지 않게 한다 — 계좌 대조는 그대로 진행.
+      }
       return this.reconciler.markUnavailable(error);
     }
   }

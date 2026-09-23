@@ -46,6 +46,24 @@ test("same clientOrderId is idempotent and does not call broker twice", async ()
   assert.equal(broker.submitCalls, 1);
 });
 
+// 2026-09-23: 9연패가 났는데 매도가 손절인지 트레일링인지 신호청산인지 저널에서
+// 전혀 알 수 없었다(어느 것도 KIS에 보낼 필드가 아니라서). 내부 진단용 메모로만
+// 저널에 남기고 KIS로 나가는 request에는 섞이지 않는지 같이 확인한다.
+test("an order's internal reason is journaled but never sent to the broker", async () => {
+  const journal = new MemoryJournal();
+  const broker = client();
+  const orders = service({ client: broker, journal });
+  await orders.submitOrder({
+    clientOrderId: "reason-1", side: "SELL", symbol: "005930", type: "MARKET", quantity: 1,
+    referencePrice: 70_000, reason: "TRAILING_STOP",
+  });
+
+  const commandEvent = journal.readAll().find((event) => event.type === "BROKER_ORDER_COMMAND");
+  assert.equal(commandEvent.payload.reason, "TRAILING_STOP");
+  assert.equal(commandEvent.payload.request.reason, undefined, "reason이 KIS 요청 필드로 새면 안 된다");
+  assert.equal(broker.submitCalls, 1);
+});
+
 test("restart replays accepted result without reissuing order", async () => {
   const journal = new MemoryJournal();
   const firstBroker = client();
@@ -86,6 +104,22 @@ test("ambiguous broker failure is journaled and blocks later new orders", async 
   assert.equal(first.status, "UNKNOWN_RESULT");
   assert.equal(callbackCount, 1);
   await assert.rejects(() => orders.submitOrder({ clientOrderId: "ambiguous-2", side: "BUY", symbol: "005930", type: "LIMIT", quantity: 1, limitPrice: 70000 }), (error) => error.code === "KIS_PAPER_KILL_SWITCH");
+});
+
+test("a failed reconciliation check (KIS call throws) is journaled with the error so the cause is diagnosable later", async () => {
+  const journal = new MemoryJournal();
+  const broker = client({
+    async getDailyOrders() { throw new Error("ECONNRESET"); },
+    async getCancelableOrders() { return { orders: [] }; },
+  });
+  const orders = service({ client: broker, journal });
+
+  await orders.performReconciliation();
+
+  const events = journal.readAll().filter((event) => event.type === "BROKER_RECONCILIATION_UNAVAILABLE");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.error.message, "ECONNRESET");
+  assert.equal(typeof events[0].payload.checkedAt, "number");
 });
 
 test("journal command failure prevents any broker request", async () => {

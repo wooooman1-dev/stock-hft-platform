@@ -17,9 +17,9 @@ let limits = null;
 let limitBounds = null;
 let allTrades = null;
 let loadingAllTrades = false;
-// app.js가 #app.innerHTML을 통째로 다시 그리므로(app.js:190) 이 패널도 그때마다
-// 파괴되고 재생성된다. 입력 중이던 값과 커서를 DOM에 의존해 지킬 수 없으므로
-// 모듈 상태로 들고 있다가 렌더 후 복원한다.
+// 이 패널 자신도 3초마다 폴링해서 다시 그리므로(refresh() → render()), 입력
+// 중이던 값과 커서를 DOM에만 의존해 지킬 수 없다. 모듈 상태로 들고 있다가
+// 렌더 후 복원한다.
 const draft = { strategy: {}, limits: {} };
 let focusState = null;
 
@@ -34,6 +34,12 @@ const signedWon = (value) => {
 const pct = (value) => (Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(2)}%` : "-");
 const bps = (value) => (Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)}bp` : "-");
 const clock = (ms) => (ms ? new Date(ms).toLocaleTimeString("ko-KR", { hour12: false }) : "-");
+const dateTime = (ms) => {
+  if (!ms) return "-";
+  const date = new Date(ms);
+  const datePart = date.toLocaleDateString("ko-KR", { month: "2-digit", day: "2-digit" });
+  return `${datePart} ${clock(ms)}`;
+};
 const duration = (ms) => {
   if (!Number.isFinite(Number(ms))) return "-";
   const total = Math.floor(Number(ms) / 1_000);
@@ -57,8 +63,8 @@ function buildNameMap() {
       if (item?.symbol && item?.name) map.set(item.symbol, item.name);
     }
   }
-  if (status?.holding?.symbol && status?.holding?.name) {
-    map.set(status.holding.symbol, status.holding.name);
+  for (const holding of status?.holdings ?? []) {
+    if (holding?.symbol && holding?.name) map.set(holding.symbol, holding.name);
   }
   return map;
 }
@@ -78,6 +84,7 @@ const REASON_TEXT = {
   SPREAD_TOO_WIDE: "스프레드 과다", NO_EQUITY: "잔고 확인 불가",
   KILL_SWITCH: "주문 차단(킬 스위치)", UNKNOWN_RESULT: "주문 결과 불명",
   RECONCILIATION_MISMATCH: "계좌 대사 불일치", ORDER_FAILED: "주문 실패",
+  RECONCILIATION_PENDING: "KIS 반영 대기", RECONCILIATION_UNAVAILABLE: "계좌 대조 재시도 중",
 };
 const reasonText = (code) => REASON_TEXT[code] ?? code ?? "-";
 
@@ -147,6 +154,21 @@ const releaseHalt = () => run(async () => {
   await api("/api/kis/paper/auto-trading/resume", { method: "POST" });
 });
 
+// 초기 오류가 있던 기간의 손익이 지금 성과를 계속 가려서 "오늘부터 새로 보고
+// 싶다"는 요청으로 추가했다(2026-09-23). 실행 저널은 그대로 두고 통계 집계
+// 시작 시각만 오늘 00:00(KST)로 옮긴다 — 서버가 기본값을 계산한다.
+function resetPerformanceToday() {
+  const confirmed = window.confirm("오늘 00:00 이전 거래는 승률·총순이익 집계에서 빠집니다. 실행 저널 자체는 그대로 남습니다. 계속할까요?");
+  if (!confirmed) return;
+  void run(() => api("/api/kis/paper/performance/reset", { method: "POST" }));
+}
+
+const clearPerformanceReset = () => run(() => api("/api/kis/paper/performance/reset", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ resetAt: null }),
+}));
+
 // 백그라운드 탭에서는 requestAnimationFrame이 아예 호출되지 않는다. 자동매매 모니터는
 // 다른 탭에 띄워두는 것이 정상적인 사용 방식이므로, 숨겨진 탭에서는 타이머로 렌더한다.
 // 다만 호출 시점엔 탭이 보이고 있어도(그래서 requestAnimationFrame을 선택해도) 그
@@ -175,14 +197,16 @@ function scheduleRender() {
 function render() {
   scheduled = false;
   if (!app || stopped) return;
-  const existing = app.querySelector(".auto-trading-panel");
+  // 매수추천 리스트 화면이든 종목 상세 화면이든 상관없이 항상 body 맨 끝에
+  // 붙어 있어야 하므로(2026-09-17), 더 이상 #app 안에서 찾지 않는다.
+  const existing = document.querySelector(".auto-trading-panel");
   if (!status) { existing?.remove(); return; }
-  const host = app.querySelector(".execution-grid") ?? app;
 
   const names = buildNameMap();
   const running = Boolean(status.enabled);
   const halted = Boolean(status.halted);
-  const holding = status.holding;
+  const holdings = status.holdings ?? [];
+  const maxPositions = status.settings?.maxConcurrentPositions ?? holdings.length;
   const trades = allTrades ?? performance?.trades ?? null;
 
   const panel = existing ?? document.createElement("div");
@@ -197,11 +221,16 @@ function render() {
     live.className = "at-live";
     panel.append(live);
   }
+  // 사고판 내역 표는 innerHTML을 새로 그릴 때마다 스크롤이 통째로 새 DOM 노드로
+  // 바뀌어 맨 위로 되돌아갔다 — 3초마다 폴링하다보니 사용자가 스크롤해도 거의
+  // 바로 원위치로 튕겨서 "스크롤이 안 된다"로 보였다(2026-09-23). 옛 스크롤
+  // 위치를 기억해뒀다가 새로 그린 뒤 그대로 되돌린다.
+  const previousTradesScrollTop = live.querySelector(".at-table-scroll")?.scrollTop ?? 0;
   live.innerHTML = `
     <div class="at-head">
       <div>
         <div class="at-eyebrow">모의계좌 자동매매</div>
-        <h3>${running ? "작동 중" : "정지"}</h3>
+        <h3>${!running ? "정지" : halted ? "멈춤" : "작동 중"}</h3>
         <div class="at-sub">모의투자 계좌입니다. 실제 자금이 아닙니다.</div>
       </div>
       <div class="at-actions">
@@ -229,8 +258,21 @@ function render() {
       <button type="button" data-at-action="dismiss">닫기</button></div>` : ""}
 
     <div class="at-section">
-      <div class="at-section-title">지금 보유 중인 종목</div>
-      ${holding ? `
+      <div class="at-section-title">계좌</div>
+      <div class="at-grid">
+        <div><span>총자산</span><strong>${won(balance?.summary?.totalEvaluationAmount)}</strong></div>
+        <div><span>가용현금</span><strong>${won(balance?.summary?.cash)}</strong></div>
+        <div><span>사용금액</span><strong>${won(balance?.summary?.purchaseAmount)}</strong></div>
+        <div><span>평가손익</span><strong class="${(Number(balance?.summary?.evaluationProfitLoss) || 0) >= 0 ? "at-up" : "at-down"}">
+          ${signedWon(balance?.summary?.evaluationProfitLoss)}</strong></div>
+      </div>
+    </div>
+
+    <div class="at-section">
+      <div class="at-section-title">지금 보유 중인 종목
+        <span class="at-badge">${holdings.length}/${maxPositions}</span>
+      </div>
+      ${holdings.length > 0 ? holdings.map((holding) => `
         <div class="at-holding">
           <div class="at-holding-name">${labelFor(holding.symbol, names)}</div>
           <div class="at-grid">
@@ -243,7 +285,7 @@ function render() {
               ${bps(holding.returnBps)}</strong></div>
             <div><span>보유 시간</span><strong>${duration(holding.heldMs)}</strong></div>
           </div>
-        </div>` : `<div class="at-empty">보유 중인 종목이 없습니다.</div>`}
+        </div>`).join("") : `<div class="at-empty">보유 중인 종목이 없습니다.</div>`}
     </div>
 
     <div class="at-section">
@@ -255,15 +297,24 @@ function render() {
           </button>` : ""}
         ${allTrades ? `
           <button type="button" class="at-btn at-btn-ghost at-btn-tiny" data-at-action="collapse-trades">최근만 보기</button>` : ""}
+        ${performance?.resetAt ? `
+          <button type="button" class="at-btn at-btn-ghost at-btn-tiny" data-at-action="clear-performance-reset" ${busy ? "disabled" : ""}>전체 기록 보기</button>
+        ` : `
+          <button type="button" class="at-btn at-btn-ghost at-btn-tiny" data-at-action="reset-performance-today" ${busy ? "disabled" : ""}>오늘부터 새로 집계</button>
+        `}
       </div>
+      ${performance?.resetAt ? `
+        <div class="at-reset-note">${dateTime(performance.resetAt)}부터 집계 중 — 그 이전 거래는 통계에서 빠졌을 뿐 실행 저널에는 그대로 남아 있습니다.</div>
+      ` : ""}
       ${trades && trades.recent?.length ? `
         <div class="at-table-scroll">
         <table class="at-table">
-          <thead><tr><th>종목</th><th>수량</th><th>매수</th><th>매도</th>
+          <thead><tr><th>시각</th><th>종목</th><th>수량</th><th>매수</th><th>매도</th>
             <th>총이익</th><th>비용</th><th>순익</th></tr></thead>
           <tbody>
             ${[...trades.recent].reverse().map((trade) => `
               <tr>
+                <td>${dateTime(trade.closedAt)}</td>
                 <td>${labelFor(trade.symbol, names)}</td>
                 <td>${trade.quantity}주</td>
                 <td>${won(trade.buyAveragePrice)}</td>
@@ -276,7 +327,7 @@ function render() {
         </table>
         </div>
         <div class="at-totals">
-          비용 차감 후 누적 <strong class="${trades.totalNetPnl >= 0 ? "at-up" : "at-down"}">
+          총순이익(비용 차감 후 누적) <strong class="${trades.totalNetPnl >= 0 ? "at-up" : "at-down"}">
             ${signedWon(trades.totalNetPnl)}</strong>
           · 승률 ${trades.netWinRate === null ? "-" : pct(trades.netWinRate)}
           · 최대 낙폭 ${won(performance?.equity?.maxDrawdownAmount)}
@@ -321,9 +372,16 @@ function render() {
     syncSettingsFields(openForm);
   }
 
-  // app.js가 execution-grid를 다시 그릴 때마다 이 패널을 일단 그리드 안으로
-  // 옮겨 붙여 놓지만, 혹시라도 다른 자리로 가 있으면 매 렌더마다 스스로 바로잡는다.
-  if (panel.parentElement !== host) host.append(panel);
+  // 매수추천 리스트 화면이든 종목 상세 화면이든 상관없이 항상 body 맨 끝에
+  // 고정한다(2026-09-17). 실전 패널(kisLiveOrderPanel.js)이 내 바로 다음에
+  // 스스로 붙는 게 정상 순서이므로, 그 경우는 body 맨 끝이 아니어도 그대로 둔다
+  // — 안 그러면 두 패널이 매 렌더마다 서로 마지막 자리를 다투며 깜빡인다.
+  const nextIsLivePanel = panel.nextElementSibling?.classList.contains("kis-live-panel");
+  if (document.body.lastElementChild !== panel && !nextIsLivePanel) {
+    document.body.append(panel);
+  }
+  const tradesScroll = live.querySelector(".at-table-scroll");
+  if (tradesScroll && previousTradesScrollTop > 0) tradesScroll.scrollTop = previousTradesScrollTop;
   restoreFocus();
 }
 
@@ -350,6 +408,7 @@ function decisionLabel(decision) {
   if (decision.action === "ORDER") return decision.side === "BUY" ? "매수" : "매도";
   if (decision.action === "HOLD") return "보유";
   if (decision.action === "SKIP") return "대기";
+  if (decision.action === "WAITING") return "잠시 대기";
   if (decision.action === "HALTED") return "멈춤";
   if (decision.action === "EXIT_BLOCKED") return "청산 차단";
   if (decision.action === "ORDER_ERROR") return "주문 실패";
@@ -378,6 +437,7 @@ function decisionDetail(decision, names) {
 const STRATEGY_FIELDS = [
   ["minimumNetEdgeBps", "최소 기대 순익", "bp", "비용을 다 빼고도 남아야 하는 크기"],
   ["positionSizeRatio", "진입 비중", "배", "자기자본 대비 (0.1 = 10%)"],
+  ["maxConcurrentPositions", "동시 보유 종목 수", "개", "이 수만큼 종목을 동시에 들고 갈 수 있음"],
   ["takeProfitBps", "익절", "bp", ""],
   ["stopLossBps", "손절", "bp", ""],
   ["trailingStopBps", "트레일링 스톱", "bp", ""],
@@ -387,7 +447,7 @@ const STRATEGY_FIELDS = [
   ["entryMinimumConfidence", "진입 확신도", "", ""],
   ["exitMinimumConfidence", "청산 확신도", "", ""],
   ["staleQuoteMs", "시세 지연 허용", "ms", ""],
-  ["evaluationIntervalMs", "평가 주기", "ms", "15000 = 15초"],
+  ["evaluationIntervalMs", "평가 주기", "ms", "5000 = 5초"],
   ["settlementGraceMs", "정산 대기", "ms", "주문 후 잔고 반영 대기"],
   ["forcedExitTime", "강제 청산 시각", "", "HH:MM, 비우면 안 함"],
 ];
@@ -495,7 +555,9 @@ document.addEventListener("focusout", (event) => {
   if (event.target.closest?.("[data-at-field]")) focusState = null;
 });
 
-app?.addEventListener("click", (event) => {
+// 이 패널은 이제 #app 밖(body 맨 끝)에 살고 있어서(2026-09-17) app이 아니라
+// document에 걸어야 클릭이 잡힌다.
+document.addEventListener("click", (event) => {
   const action = event.target.closest("[data-at-action]")?.dataset.atAction;
   if (!action) return;
   if (action === "start") void setEnabled(true);
@@ -515,6 +577,8 @@ app?.addEventListener("click", (event) => {
   if (action === "dismiss") { message = null; render(); }
   if (action === "load-all-trades") void loadAllTrades();
   if (action === "collapse-trades") { allTrades = null; render(); }
+  if (action === "reset-performance-today") resetPerformanceToday();
+  if (action === "clear-performance-reset") void clearPerformanceReset();
 });
 
 // 폴링에 쓰는 /performance 호출은 20건으로 가볍게 유지하고, 전체 내역은 사용자가
@@ -563,6 +627,8 @@ function injectStyles() {
     .at-badge{background:#16304a;color:#8fc4e8;border-radius:9px;padding:1px 7px;font-size:9px}
     .at-btn-tiny{padding:2px 9px;font-size:9px;margin-left:auto}
     .at-empty{font-size:11px;color:#5d7385;padding:8px 0}
+    .at-holding{margin-bottom:10px}
+    .at-holding:last-child{margin-bottom:0}
     .at-holding-name{font-size:13px;color:#dbeeff;margin-bottom:7px}
     .at-code{font-size:10px;color:#6f8ba0}
     .at-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(92px,1fr));gap:7px}
@@ -578,6 +644,7 @@ function injectStyles() {
     .at-table th{text-align:left;font-weight:500;color:#6f8ba0;font-size:9px;padding:4px 6px;border-bottom:1px solid #1c344a}
     .at-table td{padding:5px 6px;border-bottom:1px solid #12242f;color:#c3d8e8}
     .at-totals{margin-top:7px;font-size:11px;color:#8fa9bd}
+    .at-reset-note{font-size:9px;color:#6f8ba0;margin:-3px 0 6px}
     .at-decisions{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
     .at-decisions li{display:grid;grid-template-columns:58px 76px 1fr;gap:8px;font-size:11px;align-items:baseline}
     .at-time{color:#5d7385;font-size:10px}

@@ -12,21 +12,21 @@ test("recommendation workspace loads the tab adapter after the existing panel", 
   const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
   assert.ok(panelIndex >= 0);
   assert.ok(tabsIndex > panelIndex);
-  assert.match(indexSource, /app\.js\?v=4/);
-  assert.match(indexSource, /kisOrderHistory\.js\?v=1/);
-  assert.match(indexSource, /recommendationTabs\.js\?v=7/);
+  assert.match(indexSource, /app\.js\?v=6/);
+  assert.match(indexSource, /kisOrderHistory\.js\?v=2/);
+  assert.match(indexSource, /recommendationTabs\.js\?v=11/);
 });
 
 test("recommendation workspace can be isolated without loading the tab adapter", () => {
   assert.match(indexSource, /noRecommendationTabs/);
-  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=7"\)/);
+  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=11"\)/);
 });
 
-test("workspace keeps only main analysis and recommendation tabs", () => {
-  assert.match(tabsSource, /data-recommendation-tab="main"/);
-  assert.match(tabsSource, /data-recommendation-tab="recommendations"/);
-  assert.doesNotMatch(tabsSource, /data-recommendation-tab="kis-paper"/);
-  assert.doesNotMatch(tabsSource, /kis-paper-workspace/);
+test("recommendation list is the default view with a one-way back button, not a two-way tab bar", () => {
+  assert.match(tabsSource, /pendingInitialView = VIEW_RECOMMENDATIONS/);
+  assert.match(tabsSource, /data-recommendation-back/);
+  assert.doesNotMatch(tabsSource, /data-recommendation-tab/);
+  assert.doesNotMatch(tabsSource, /ArrowLeft|ArrowRight/);
   assert.match(tabsSource, /position:static!important/);
   assert.match(tabsSource, /panel\.removeAttribute\("aria-modal"\)/);
   assert.match(tabsSource, /openRecommendationPanel\(\)/);
@@ -36,7 +36,7 @@ test("workspace tabs live outside the snapshot-rendered app tree", () => {
   assert.match(appSource, /app\.replaceChildren\(/);
   assert.match(tabsSource, /tabsPortal\.className = "recommendation-tabs-portal"/);
   assert.match(tabsSource, /document\.body\.append\(tabsPortal\)/);
-  assert.match(tabsSource, /tabsPortal\.querySelectorAll\("\[data-recommendation-tab\]"\)/);
+  assert.match(tabsSource, /tabsPortal\.querySelector\("\.recommendation-back-button"\)/);
   assert.doesNotMatch(tabsSource, /topStatus\.insertBefore\(tabs/);
   assert.match(tabsSource, /positionTabs\(topStatus\)/);
 });

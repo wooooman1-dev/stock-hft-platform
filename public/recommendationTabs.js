@@ -4,15 +4,9 @@ style.textContent = String.raw`
 .recommendation-trigger{display:none!important}
 .recommendation-tabs-portal{position:fixed;z-index:45;left:0;top:0;pointer-events:none}
 .recommendation-tabs-portal[hidden]{display:none!important}
-.recommendation-tabs-portal .recommendation-workspace-tabs{pointer-events:auto}
-.recommendation-workspace-tabs{display:inline-flex;align-items:center;gap:3px;padding:3px;border:1px solid #26384f;border-radius:10px;background:#09111d;white-space:nowrap;box-shadow:0 8px 24px rgba(0,0,0,.28)}
-.recommendation-workspace-tab{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:26px;border:0;border-radius:7px;background:transparent;color:#71849b;padding:0 9px;font-size:9px;font-weight:900}
-.recommendation-workspace-tab:hover{color:#d8f8ff;background:#101d2d}
-.recommendation-workspace-tab.active{color:#dffbff;background:linear-gradient(180deg,#15304a,#102237);box-shadow:inset 0 0 0 1px #2d5b78}
-.recommendation-tab-count{display:inline-grid;place-items:center;min-width:18px;height:18px;border-radius:999px;padding:0 5px;background:#17283b;color:#8fdff0;font-size:8px}
-.recommendation-workspace-tab.active .recommendation-tab-count{background:#25506b;color:#e8fdff}
-.recommendation-tab-ready{width:6px;height:6px;border-radius:50%;background:#52657a}
-.recommendation-tab-ready.live{background:#4ee5ba;box-shadow:0 0 10px rgba(78,229,186,.75)}
+.recommendation-tabs-portal .recommendation-back-button{pointer-events:auto}
+.recommendation-back-button{display:inline-flex;align-items:center;height:30px;border:1px solid #26384f;border-radius:8px;background:#09111d;color:#9fb0c5;padding:0 12px;font-size:10px;font-weight:800;white-space:nowrap;box-shadow:0 8px 24px rgba(0,0,0,.28)}
+.recommendation-back-button:hover{color:#d8f8ff;border-color:#5bd6eb}
 body.recommendation-open{overflow:auto!important}
 body.recommendation-view-active #app.app-shell> :not(.topbar){display:none!important}
 body.recommendation-view-active #app.app-shell{padding-bottom:0}
@@ -20,11 +14,12 @@ body.recommendation-view-active #app.app-shell{padding-bottom:0}
 body:not(.recommendation-view-active) .recommendation-backdrop{display:none!important}
 .recommendation-panel{width:100%!important;max-width:none!important;margin:0!important;box-shadow:0 24px 70px rgba(0,0,0,.38)!important}
 .recommendation-close{display:none!important}
-@media(max-width:1400px){.recommendation-workspace-tab{padding:0 7px}.recommendation-workspace-tabs{margin-right:2px}}
 `;
 document.head.append(style);
 
-const VIEW_KEY = "pulsehft.activeWorkspaceView";
+// 매수추천 리스트가 기본 화면이고, 리스트에서 종목을 고르면 그 종목의 상세
+// 페이지(메인 분석)로 전환된다 — 양방향으로 오가는 탭이 아니라, 상세 페이지에
+// 있을 때만 "← 매수추천 목록"으로 돌아가는 단방향 흐름이다(2026-09-17).
 const FILTER_KEY = "pulsehft.recommendationFilter";
 const VIEW_MAIN = "MAIN";
 const VIEW_RECOMMENDATIONS = "RECOMMENDATIONS";
@@ -34,15 +29,12 @@ const app = document.querySelector("#app");
 const tabsPortal = document.createElement("div");
 tabsPortal.className = "recommendation-tabs-portal";
 tabsPortal.hidden = true;
-tabsPortal.innerHTML = `
-  <div class="recommendation-workspace-tabs" role="tablist" aria-label="분석 화면 전환">
-    <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="main">메인 분석</button>
-    <button type="button" class="recommendation-workspace-tab" role="tab" data-recommendation-tab="recommendations"><i class="recommendation-tab-ready"></i>매수추천 <span class="recommendation-tab-count">0</span></button>
-  </div>`;
+tabsPortal.innerHTML = '<button type="button" class="recommendation-back-button" data-recommendation-back>← 매수추천 목록</button>';
 document.body.append(tabsPortal);
 
-const storedView = readStorage(VIEW_KEY);
-let pendingInitialView = storedView === VIEW_RECOMMENDATIONS ? VIEW_RECOMMENDATIONS : VIEW_MAIN;
+// 기본은 항상 매수추천 리스트다 — 이전에 상세를 보고 있었더라도 새로고침하면
+// 리스트부터 시작한다(세션 간에 기억하지 않는다).
+let pendingInitialView = VIEW_RECOMMENDATIONS;
 let activeView = VIEW_MAIN;
 let initialViewRestored = false;
 let ensureTabsScheduled = false;
@@ -56,8 +48,6 @@ let recommendationScrollY = 0;
 let tableScrollLeft = 0;
 let tableScrollTop = 0;
 let filterRestored = false;
-let candidateCount = 0;
-let entryReadyCount = 0;
 let selectingSymbol = null;
 
 function getOverlay() {
@@ -81,32 +71,49 @@ function applyViewClass() {
 }
 
 function positionTabs(topStatus) {
-  const tabs = tabsPortal.querySelector(".recommendation-workspace-tabs");
-  if (!tabs || !topStatus?.isConnected) {
+  if (activeView !== VIEW_MAIN || !topStatus?.isConnected) {
     tabsPortal.hidden = true;
     return;
   }
   tabsPortal.hidden = false;
+  const button = tabsPortal.querySelector(".recommendation-back-button");
+  if (!button) return;
   const statusRect = topStatus.getBoundingClientRect();
   const firstStatusItem = [...topStatus.children].find((element) => {
     const computed = window.getComputedStyle(element);
     return computed.display !== "none" && computed.visibility !== "hidden";
   });
   const firstRect = firstStatusItem?.getBoundingClientRect();
-  const tabsRect = tabs.getBoundingClientRect();
-  const desiredLeft = (firstRect?.left ?? statusRect.right) - 12 - tabsRect.width;
-  const left = Math.max(8, Math.min(desiredLeft, window.innerWidth - tabsRect.width - 8));
-  const top = statusRect.top + Math.max(0, (statusRect.height - tabsRect.height) / 2);
+  const buttonRect = button.getBoundingClientRect();
+  const desiredLeft = (firstRect?.left ?? statusRect.right) - 12 - buttonRect.width;
+  const left = Math.max(8, Math.min(desiredLeft, window.innerWidth - buttonRect.width - 8));
+  const top = statusRect.top + Math.max(0, (statusRect.height - buttonRect.height) / 2);
   tabsPortal.style.transform = `translate(${Math.round(left)}px,${Math.round(top)}px)`;
 }
 
+// 백그라운드 탭에서는 requestAnimationFrame이 아예 호출되지 않는다(autoTradingPanel.js
+// 도 같은 이유로 방어 로직이 있다). 이게 없으면, 새로고침 시점에 탭이 백그라운드
+// 상태였을 경우 매수추천 리스트가 자동으로 열리는 시점 자체가 영영 안 온다
+// (2026-09-18). document.hidden이면 타이머로 대체한다.
 function scheduleEnsureTabs() {
   if (ensureTabsScheduled) return;
   ensureTabsScheduled = true;
-  requestAnimationFrame(() => {
+  if (document.hidden) {
+    setTimeout(() => {
+      ensureTabsScheduled = false;
+      ensureTabs();
+    }, 0);
+    return;
+  }
+  let done = false;
+  const runOnce = () => {
+    if (done) return;
+    done = true;
     ensureTabsScheduled = false;
     ensureTabs();
-  });
+  };
+  requestAnimationFrame(runOnce);
+  setTimeout(runOnce, 200);
 }
 
 function ensureTabs() {
@@ -124,7 +131,7 @@ function ensureTabs() {
     if (activeView === VIEW_RECOMMENDATIONS) schedulePanelOpen();
   }
   applyViewClass();
-  syncTabs();
+  positionTabs(topStatus);
 }
 
 function bindPanelObserver() {
@@ -173,9 +180,9 @@ function schedulePanelOpen() {
     if (panelOpenAttempts >= 40) {
       activeView = VIEW_MAIN;
       pendingInitialView = VIEW_MAIN;
-      writeStorage(VIEW_KEY, VIEW_MAIN);
       applyViewClass();
-      syncTabs();
+      const topStatus = app?.querySelector(".topbar .top-status");
+      if (topStatus) positionTabs(topStatus);
       return;
     }
     panelOpenTimer = setTimeout(attempt, 50);
@@ -194,47 +201,17 @@ function setActiveView(nextView, { restoreScroll = true } = {}) {
   if (activeView === VIEW_RECOMMENDATIONS) recommendationScrollY = window.scrollY;
   else mainScrollY = window.scrollY;
   activeView = normalized;
-  writeStorage(VIEW_KEY, activeView);
   if (activeView === VIEW_RECOMMENDATIONS) schedulePanelOpen();
   else {
     clearTimeout(panelOpenTimer);
     panelOpenTimer = null;
     applyViewClass();
   }
-  syncTabs();
+  const topStatus = app?.querySelector(".topbar .top-status");
+  if (topStatus) positionTabs(topStatus);
   if (restoreScroll) {
     const targetY = activeView === VIEW_RECOMMENDATIONS ? recommendationScrollY : mainScrollY;
     requestAnimationFrame(() => window.scrollTo(0, targetY));
-  }
-}
-
-function syncTabs() {
-  for (const tab of tabsPortal.querySelectorAll("[data-recommendation-tab]")) {
-    const recommendationTab = tab.dataset.recommendationTab === "recommendations";
-    const selected = recommendationTab ? activeView === VIEW_RECOMMENDATIONS : activeView === VIEW_MAIN;
-    tab.classList.toggle("active", selected);
-    tab.setAttribute("aria-selected", String(selected));
-    tab.tabIndex = selected ? 0 : -1;
-    if (!recommendationTab) continue;
-    const count = tab.querySelector(".recommendation-tab-count");
-    if (count && count.textContent !== String(candidateCount)) count.textContent = String(candidateCount);
-    tab.querySelector(".recommendation-tab-ready")?.classList.toggle("live", entryReadyCount > 0);
-    tab.title = entryReadyCount > 0
-      ? `추천 ${candidateCount}종목 · ENTRY_READY ${entryReadyCount}종목`
-      : `추천 ${candidateCount}종목`;
-  }
-}
-
-async function refreshTabStatus() {
-  try {
-    const response = await fetch("/api/recommendations", { headers: { Accept: "application/json" } });
-    if (!response.ok) return;
-    const result = await response.json();
-    candidateCount = Array.isArray(result.candidates) ? result.candidates.length : 0;
-    entryReadyCount = Number(result.realtimeStateCounts?.ENTRY_READY ?? 0);
-    syncTabs();
-  } catch {
-    // 추천 패널 자체가 오류를 표시하므로 배지 갱신 실패는 조용히 유지합니다.
   }
 }
 
@@ -287,10 +264,9 @@ async function selectInstrument(symbol) {
 }
 
 function handleClick(event) {
-  const tab = event.target.closest("[data-recommendation-tab]");
-  if (tab) {
+  if (event.target.closest("[data-recommendation-back]")) {
     event.preventDefault();
-    setActiveView(tab.dataset.recommendationTab === "recommendations" ? VIEW_RECOMMENDATIONS : VIEW_MAIN);
+    setActiveView(VIEW_RECOMMENDATIONS);
     return;
   }
   const actionTarget = event.target.closest("[data-recommendation-action]");
@@ -330,16 +306,11 @@ function handleClick(event) {
 }
 
 function handleKeydown(event) {
-  if (event.key === "Escape" && activeView === VIEW_RECOMMENDATIONS) {
+  if (event.key === "Escape" && activeView === VIEW_MAIN) {
     event.preventDefault();
     event.stopImmediatePropagation();
-    setActiveView(VIEW_MAIN);
-    return;
+    setActiveView(VIEW_RECOMMENDATIONS);
   }
-  if (!new Set(["ArrowLeft", "ArrowRight"]).has(event.key)) return;
-  if (!event.target.closest(".recommendation-workspace-tabs")) return;
-  event.preventDefault();
-  setActiveView(activeView === VIEW_MAIN ? VIEW_RECOMMENDATIONS : VIEW_MAIN);
 }
 
 function readStorage(key) {
@@ -348,7 +319,7 @@ function readStorage(key) {
 
 function writeStorage(key, value) {
   try { localStorage.setItem(key, value); } catch {
-    // 저장소가 차단돼도 현재 세션 탭 전환은 유지합니다.
+    // 저장소가 차단돼도 현재 세션 필터는 유지됩니다.
   }
 }
 
@@ -357,13 +328,11 @@ document.addEventListener("click", handleClick, true);
 document.addEventListener("keydown", handleKeydown, true);
 window.addEventListener("resize", scheduleEnsureTabs);
 window.addEventListener("scroll", scheduleEnsureTabs, { passive: true });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) scheduleEnsureTabs(); });
 
 document.body.classList.remove("recommendation-view-active");
 scheduleEnsureTabs();
-void refreshTabStatus();
-const statusTimer = setInterval(() => void refreshTabStatus(), 15_000);
 window.addEventListener("beforeunload", () => {
-  clearInterval(statusTimer);
   clearTimeout(panelOpenTimer);
   panelObserver?.disconnect();
 });

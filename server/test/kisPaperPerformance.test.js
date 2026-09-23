@@ -74,6 +74,47 @@ test("matches a buy fill against a later sell fill using FIFO cost basis for rea
   assert.equal(report.trades.costBasisIncompleteQuantity, 0);
 });
 
+test("resetAt excludes trades closed before it from the report but keeps the execution journal untouched", () => {
+  const events = [
+    fillEvent({ orderNumber: "b1", side: "BUY", deltaQuantity: 10, executedPrice: 70_000, orderedAt: NOW - 100_000 }),
+    fillEvent({ orderNumber: "s1", side: "SELL", deltaQuantity: 10, executedPrice: 60_000, orderedAt: NOW - 90_000 }),
+    fillEvent({ orderNumber: "b2", side: "BUY", deltaQuantity: 5, executedPrice: 70_000, orderedAt: NOW - 1_000 }),
+    fillEvent({ orderNumber: "s2", side: "SELL", deltaQuantity: 5, executedPrice: 75_000, orderedAt: NOW }),
+  ];
+
+  const full = computePerformanceReport(events, { now: NOW });
+  assert.equal(full.resetAt, null);
+  assert.equal(full.trades.realizedCount, 2);
+
+  const scoped = computePerformanceReport(events, { now: NOW, resetAt: NOW - 50_000 });
+  assert.equal(scoped.resetAt, NOW - 50_000);
+  assert.equal(scoped.trades.realizedCount, 1);
+  assert.equal(scoped.trades.totalNetPnl > 0, true);
+  // 원본 이벤트 배열은 그대로다 — resetAt은 표시 범위만 좁히고 저널을 자르지 않는다.
+  assert.equal(events.length, 4);
+});
+
+test("KisPaperPerformanceTracker.setResetAt changes what future report() calls include", () => {
+  const journal = new MemoryJournal();
+  const tracker = new KisPaperPerformanceTracker({ journal, now: () => NOW });
+  tracker.record({
+    balance: { summary: { totalEvaluationAmount: 10_000_000 } },
+    orderHistory: {
+      orders: [
+        order({ orderNumber: "1", side: "BUY", executedQuantity: 10, averageExecutedPrice: 70_000, orderedAt: NOW - 100_000 }),
+        order({ orderNumber: "2", side: "SELL", executedQuantity: 10, averageExecutedPrice: 60_000, orderedAt: NOW - 90_000 }),
+      ],
+    },
+  });
+
+  assert.equal(tracker.report().trades.realizedCount, 1);
+  tracker.setResetAt(NOW - 50_000);
+  assert.equal(tracker.report().trades.realizedCount, 0);
+  assert.equal(tracker.report().resetAt, NOW - 50_000);
+  tracker.setResetAt(null);
+  assert.equal(tracker.report().trades.realizedCount, 1);
+});
+
 test("a sell fill with no matching buy lot is excluded from realized P&L and flagged incomplete", () => {
   const events = [
     fillEvent({ orderNumber: "9", side: "SELL", deltaQuantity: 5, executedPrice: 50_000, orderedAt: NOW }),
@@ -121,6 +162,7 @@ test("restarting the tracker replays the journal and does not double-count alrea
 function fillEvent({ orderNumber, side, deltaQuantity, executedPrice, orderedAt }) {
   return {
     type: "BROKER_FILL_OBSERVED",
+    timestamp: orderedAt,
     payload: {
       day: "2026-08-04",
       capturedAt: orderedAt,

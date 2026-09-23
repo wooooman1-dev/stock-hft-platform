@@ -129,7 +129,10 @@ function render() {
   scheduled = false;
   if (!app || stopped) return;
 
-  const existing = app.querySelector(".kis-live-panel");
+  // 매수추천 리스트 화면이든 종목 상세 화면이든 상관없이 항상 body 맨 끝(모의
+  // 자동매매 패널 바로 다음)에 붙어 있어야 하므로(2026-09-17), #app 안에서
+  // 찾지 않는다.
+  const existing = document.querySelector(".kis-live-panel");
   const enabled = Boolean(liveStatus?.enabled);
   const hasOrderService = Boolean(liveStatus?.orderApiAvailable);
 
@@ -137,9 +140,6 @@ function render() {
     existing?.remove();
     return;
   }
-
-  const executionGrid = app.querySelector(".execution-grid");
-  if (!executionGrid) return;
 
   const service = liveStatus.service ?? {};
   const killSwitch = Boolean(service.killSwitch);
@@ -197,13 +197,18 @@ function render() {
     </div>
     <div class="kis-live-orders">${commands.slice(0, 8).map(commandRow).join("") || '<div>제출한 실전 주문 명령이 아직 없습니다(이 브라우저 기록 기준).</div>'}</div>
   `;
-  // app.js가 execution-grid를 다시 그릴 때마다 이 패널을 일단 그리드 안으로
-  // 옮겨 붙여 놓으므로(파괴 방지용 임시 조치), 매 렌더마다 원래 자리(그리드
-  // 바로 다음 형제, 전체 너비)로 스스로 되돌린다.
-  if (executionGrid.nextElementSibling !== panel) executionGrid.insertAdjacentElement("afterend", panel);
+  // 매수추천 리스트 화면이든 종목 상세 화면이든 상관없이 항상 화면 맨 아래에
+  // 붙어 있어야 한다(2026-09-17). 모의 자동매매 패널이 있으면 그 바로 다음에
+  // 붙어서 "모의 → 실전" 순서를 유지하고, 없으면(비활성 등) body 맨 끝에 붙는다.
+  const anchor = document.querySelector(".auto-trading-panel");
+  if (anchor) {
+    if (anchor.nextElementSibling !== panel) anchor.insertAdjacentElement("afterend", panel);
+  } else if (document.body.lastElementChild !== panel) {
+    document.body.append(panel);
+  }
 
   if (message) {
-    let toast = app.querySelector(".kis-live-toast");
+    let toast = document.querySelector(".kis-live-toast");
     if (!toast) {
       toast = document.createElement("div");
       toast.className = "toast kis-live-toast";
@@ -212,7 +217,7 @@ function render() {
     }
     toast.textContent = message;
   } else {
-    app.querySelector(".kis-live-toast")?.remove();
+    document.querySelector(".kis-live-toast")?.remove();
   }
 }
 
@@ -249,12 +254,15 @@ async function refresh() {
 }
 
 function orderRequest(side) {
+  // SOR(Smart Order Routing) — KRX 정규장이든 넥스트레이드 프리마켓·애프터마켓
+  // (08:00~08:50, 15:30~20:00)이든 그 순간 열려 있는 거래소로 KIS가 알아서
+  // 라우팅한다(2026-09-17).
   const body = {
     side,
     symbol: market?.symbol,
     type: orderType,
     quantity: CANARY_QUANTITY,
-    exchange: "KRX",
+    exchange: "SOR",
     clientOrderId: createClientOrderId(side),
   };
   if (orderType === "LIMIT") body.limitPrice = limitPrice;
@@ -315,7 +323,7 @@ async function cancel() {
     originalOrderNumber,
     orderOrganizationNumber,
     quantity,
-    exchange: "KRX",
+    exchange: "SOR",
     allQuantity: true,
   };
   const confirmed = window.confirm(`실전 주문 ${originalOrderNumber}의 취소 가능 수량 ${quantity}주를 전부 취소할까요?`);
@@ -323,11 +331,13 @@ async function cancel() {
   await run(() => request("/api/kis/live/orders/cancel", body), { recordEntry: { ...body, side: "CANCEL", operation: "CANCEL" } });
 }
 
-app?.addEventListener("input", (event) => {
+// 이 패널은 이제 #app 밖(body 맨 끝)에 살고 있어서(2026-09-17) app이 아니라
+// document에 걸어야 이벤트가 잡힌다.
+document.addEventListener("input", (event) => {
   if (event.target.id === "live-limit-price") limitPrice = Math.max(1, Number(event.target.value) || 1);
 });
 
-app?.addEventListener("change", (event) => {
+document.addEventListener("change", (event) => {
   if (event.target.id === "live-order-type") {
     orderType = event.target.value;
     if (orderType === "LIMIT" && !limitPrice) limitPrice = market?.lastPrice ?? 1;
@@ -335,7 +345,7 @@ app?.addEventListener("change", (event) => {
   }
 });
 
-app?.addEventListener("click", (event) => {
+document.addEventListener("click", (event) => {
   const target = event.target.closest("[data-live-action]");
   const action = target?.dataset.liveAction;
   if (!action) return;

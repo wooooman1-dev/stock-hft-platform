@@ -76,12 +76,16 @@ function createClientOrderId(operation) {
 }
 
 function orderRequest(side) {
+  // "SOR"(Smart Order Routing)로 보내면 KIS가 그 순간 KRX·NXT 중 열려 있고
+  // 유리한 거래소로 알아서 라우팅한다 — 정규장(09:00~15:30)이든 넥스트레이드
+  // 프리마켓·애프터마켓(08:00~08:50, 15:30~20:00)이든 별도 분기 없이 그대로
+  // 동작한다(2026-09-17).
   const body = {
     side,
     symbol: snapshot.symbol,
     type: orderType,
     quantity,
-    exchange: "KRX",
+    exchange: "SOR",
     clientOrderId: createClientOrderId(side),
   };
   if (orderType === "LIMIT") body.limitPrice = limitPrice;
@@ -186,24 +190,17 @@ function render() {
     ? ` · ${escapeHtml(account.error.message)}`
     : "";
 
-  // autoTradingPanel.js/kisLiveOrderPanel.js는 이 함수가 그리는 execution-grid
-  // 안에 직접 자기 패널을 붙여 상태(입력 중인 값, 포커스)를 그 DOM 노드 자체에
-  // 들고 있다. 매 스냅샷마다 app.innerHTML을 통째로 갈아엎으면 그 노드가 파괴되고
-  // 새로 만들어지면서 포커스와 타이핑 중이던 값이 날아간다(2026-09-16 확인).
-  // 통째로 새로 만들지 않고 같은 노드를 떼었다가 새 execution-grid에 그대로
-  // 옮겨 붙이면(재생성이 아니라 이동) 포커스가 그대로 보존된다.
-  //
-  // 처음에는 이 패널들을 먼저 #app에서 node.remove()로 떼어낸 다음
-  // app.innerHTML로 본문을 통째로 새로 그리고 나서야 다시 붙였는데, 그 사이
-  // 잠깐(같은 동기 실행 안이라도) 문서 높이가 패널 크기만큼 줄어드는 상태가
-  // 브라우저에 실제로 반영돼, 스크롤을 중간 아래로 내려둔 사용자는 매 렌더마다
-  // 브라우저가 스크롤을 그 줄어든 높이에 맞춰 강제로 잘라내 "중간"으로 자꾸
-  // 되돌아가는 것처럼 보였다(2026-09-17). 화면에 아직 붙어 있지 않은 새 문서
-  // 조각(nextContent) 안에서 패널을 먼저 옮겨 놓고, #app 쪽은 옛 내용과 새
-  // 내용을 replaceChildren으로 한 번에 통째로 교체하면 — 브라우저가 실제
-  // 화면에 반영하는 상태는 "패널이 잠깐 빠진 줄어든 문서"를 절대 거치지 않고
-  // 옛 상태에서 새 상태(패널 포함)로 곧장 바뀐다.
-  const externalPanels = Array.from(app.querySelectorAll(".auto-trading-panel, .kis-live-panel"));
+  // #app.innerHTML을 매 스냅샷마다 그 자리에서 통째로 새로 쓰면, 그 사이(같은
+  // 동기 실행 안이라도) 브라우저가 순간적으로 짧아진 문서를 실제로 반영해서,
+  // 스크롤을 아래로 내려둔 사용자는 매 렌더마다 스크롤이 그 순간의 문서 높이에
+  // 맞춰 강제로 잘리는 것처럼 보였다(2026-09-17). 화면에 아직 붙어 있지 않은 새
+  // 문서 조각(nextContent)을 통째로 만들어 두고, #app 쪽은 옛 내용과 새 내용을
+  // replaceChildren으로 한 번에 교체하면 — 브라우저가 실제 화면에 반영하는
+  // 상태는 중간의 "일부만 있는 문서"를 절대 거치지 않고 옛 상태에서 새 상태로
+  // 곧장 바뀐다.
+  // (자동매매/실전 패널은 더 이상 여기서 옮겨 붙이지 않는다 — 그 패널들은
+  // 이제 #app 밖, body 맨 끝에 항상 고정되어 있고 각자 알아서 그 자리를
+  // 지킨다: autoTradingPanel.js, kisLiveOrderPanel.js 참고.)
 
   app.className = "app-shell";
   const nextContent = document.createElement("div");
@@ -242,8 +239,6 @@ function render() {
       <div class="system-panel"><div class="panel-title-row"><div><span class="eyebrow">KIS RISK & EXECUTION</span><h3>모의투자 주문 제어</h3></div></div><div class="execution-model"><span>주문 경계</span><strong>KIS PAPER · MANUAL ONLY</strong><small>실전주문 비활성 · 모의 자동매매 연결 · clientOrderId 멱등성</small></div><div class="control-row danger-row"><div><strong>킬 스위치</strong><span>KIS 모의계좌 신규·정정 주문 즉시 차단</span></div><button class="toggle danger ${snapshot.system.killSwitch ? "on" : ""}" data-action="kill" ${busy || !paperAvailable ? "disabled" : ""}><span></span></button></div><div class="risk-list"><div><span>1회 최대</span><strong>${fmt(snapshot.riskLimits.maxOrderQuantity)}주</strong></div><div><span>최대 주문금액</span><strong>${fmt(snapshot.riskLimits.maxOrderValue / 10000)}만원</strong></div><div><span>일일 주문</span><strong>${fmt(snapshot.riskLimits.maxDailyOrders)}건</strong></div><div><span>일일 손실 제한</span><strong>-${fmt(snapshot.riskLimits.maxDailyLoss / 10000)}만원</strong></div><div><span>취소 가능 주문</span><strong>${fmt(account.openOrderCount)}건</strong></div><div><span>매도 예약</span><strong>${fmt(account.reservedSellQuantity)}주</strong></div></div></div>
     </section><footer><span>시세·호가·체결은 KIS 실전계좌 읽기 전용 데이터입니다.</span><span>이 화면의 잔고와 주문은 KIS 모의투자입니다. 모의계좌 자동매매는 아래 패널에서 켜고 끌 수 있습니다. 실전(실제 자금) 주문은 이중 안전플래그로 잠긴 별도 카나리 패널에서만 가능합니다.</span></footer>`;
 
-  const nextExecutionGrid = nextContent.querySelector(".execution-grid");
-  if (nextExecutionGrid) externalPanels.forEach((node) => nextExecutionGrid.append(node));
   app.replaceChildren(...nextContent.childNodes);
 
   if (activeId) {
@@ -343,7 +338,7 @@ app.addEventListener("click", (event) => {
       originalOrderNumber: actionElement.dataset.orderNumber,
       orderOrganizationNumber: actionElement.dataset.orderOrganizationNumber,
       quantity: Number(actionElement.dataset.cancelQuantity),
-      exchange: "KRX",
+      exchange: "SOR",
       allQuantity: true,
     };
     const confirmed = window.confirm(`KIS 모의주문 ${cancelBody.originalOrderNumber}의 취소 가능 수량 ${cancelBody.quantity}주를 전부 취소할까요?`);

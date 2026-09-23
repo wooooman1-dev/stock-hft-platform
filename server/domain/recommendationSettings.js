@@ -1,8 +1,17 @@
+// maxUniverse/maxEnriched는 원래 각각 30/8이었다. 실시간으로 정밀 확인하는
+// 종목이 8개뿐이면 그중 매수 조건을 동시에 만족하는 종목이 거의 안 나와서
+// 자동매매가 하루 종일 몇 건 못 냈다(2026-09-17). 실시간 구독 한도(최대 20개,
+// kisRealtimeMarketDataClient.js)에 여유를 두면서 후보군을 넓히기 위해 올렸다.
+// 2026-09-23: WATCH 단계의 확신도 완화를 되돌리면서(진입 품질 문제로 9연패)
+// 다시 좁아진 진입 기회를 품질을 낮추지 않고 넓히려고 15→18로 한 번 더 올린다
+// — ENTRY_READY 판정 대상 종목 자체를 늘려서, "동시에 다 맞는 순간"이 나올 후보를
+// 넓히는 쪽이다. 20(구독 한도)까지 채우면 정밀분석 한 바퀴(요청 간격 1초 기준
+// 약 19초)가 캐시 주기(15초)를 넘어서므로 18에서 멈춘다.
 export const DEFAULT_RECOMMENDATION_SETTINGS = Object.freeze({
   schemaVersion: 1,
   cacheTtlMs: 15_000,
-  maxUniverse: 30,
-  maxEnriched: 8,
+  maxUniverse: 50,
+  maxEnriched: 18,
   minimumTradingValue: 1_000_000_000,
   targetNetProfitBps: 300,
   buyCommissionBps: 1.40527,

@@ -85,6 +85,7 @@ function paperClient(fetchImpl, options = {}) {
     requestSpacingMs: options.requestSpacingMs ?? 0,
     readRetryDelayMs: options.readRetryDelayMs ?? 0,
     dailyOrdersCacheMs: options.dailyOrdersCacheMs ?? 1_000,
+    balanceCacheMs: options.balanceCacheMs ?? 0,
   });
 }
 
@@ -108,6 +109,56 @@ test("paper balance uses VTS URL, paper credentials, and VTTC8434R", async () =>
   assert.equal(calls[0].options.headers.appkey, "paper-key");
   assert.equal(balance.positions[0].quantity, 2);
   assert.equal(balance.summary.evaluationProfitLoss, 2000);
+});
+
+// 2026-09-23: 화면 폴링(3초)·자동매매 평가(5초)·계좌 새로고침(5초)이 각자 독립적으로
+// getBalance를 불러서 "허용 가능한 초당 거래건수를 초과" 오류가 반복됐다. 짧은
+// 캐시로 겹친 호출을 하나로 합쳐 실제 KIS 호출 수를 줄인다.
+test("balance calls within the cache window share one KIS request", async () => {
+  const calls = [];
+  const client = paperClient(async (url) => {
+    calls.push(String(url));
+    return jsonResponse({
+      rt_cd: "0",
+      output1: [],
+      output2: [{ dnca_tot_amt: "900000", evlu_pfls_smtl_amt: "0", tot_evlu_amt: "900000" }],
+      ctx_area_fk100: "", ctx_area_nk100: "",
+    });
+  }, { balanceCacheMs: 2_000 });
+
+  const [first, second] = await Promise.all([client.getBalance(), client.getBalance()]);
+  assert.equal(calls.length, 1, "동시에 겹친 호출은 KIS에 한 번만 나가야 한다");
+  assert.deepEqual(first, second);
+
+  await client.getBalance();
+  assert.equal(calls.length, 1, "캐시 시간 안의 다음 호출도 KIS를 다시 부르면 안 된다");
+});
+
+test("a fresh order invalidates the balance cache so the next getBalance call is not stale", async () => {
+  let balanceCalls = 0;
+  const client = paperClient(async (url) => {
+    if (String(url).includes("inquire-balance")) {
+      balanceCalls += 1;
+      return jsonResponse({
+        rt_cd: "0",
+        output1: [],
+        output2: [{ dnca_tot_amt: "900000", evlu_pfls_smtl_amt: "0", tot_evlu_amt: "900000" }],
+        ctx_area_fk100: "", ctx_area_nk100: "",
+      });
+    }
+    return jsonResponse({
+      rt_cd: "0",
+      output: { odno: "1", ord_tmd: "091500", krx_fwdg_ord_orgno: "00950" },
+    });
+  }, { balanceCacheMs: 2_000 });
+
+  await client.getBalance();
+  assert.equal(balanceCalls, 1);
+  await client.submitOrder({
+    side: "BUY", symbol: "005930", type: "MARKET", quantity: 1, referencePrice: 70_000, exchange: "SOR",
+  });
+  await client.getBalance();
+  assert.equal(balanceCalls, 2, "주문 직후에는 캐시된 옛 잔고 대신 다시 조회해야 한다");
 });
 
 test("paper buy uses latest VTTC0012U and required exchange field", async () => {

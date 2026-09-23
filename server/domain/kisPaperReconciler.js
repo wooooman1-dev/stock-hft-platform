@@ -14,8 +14,11 @@ export class KisPaperReconciliationError extends Error {
   }
 }
 
+// 30초로는 부족했다 — 2026-09-18에 정상 주문(삼성전자 3주)이 실제로 체결 확인까지
+// 약 100초 걸렸는데, 그 87초째에 "의심스러운 상태"로 잘못 차단됐다(저널 기록으로
+// 확인). 실제 관측된 최악값보다 여유 있게 180초로 올린다.
 export class KisPaperReconciler {
-  constructor({ journal, now = Date.now, brokerVisibilityGraceMs = 30_000 } = {}) {
+  constructor({ journal, now = Date.now, brokerVisibilityGraceMs = 180_000 } = {}) {
     if (!journal || typeof journal.append !== "function" || typeof journal.readAll !== "function") {
       throw new TypeError("append/readAll을 제공하는 실행 저널이 필요합니다.");
     }
@@ -267,7 +270,7 @@ function evaluateState({
     ));
   }
 
-  if (baseline) comparePositions({ baseline, orders, positions, issues });
+  if (baseline) comparePositions({ baseline, orders, positions, issues, pending, checkedAt, graceMs });
   compareCancelableOrders({ cancelableOrders, brokerByKey, brokerByNumber, issues });
 
   return {
@@ -358,16 +361,42 @@ function compareCancelFields({ order, ageMs, graceMs, issues, pending }) {
   }
 }
 
-function comparePositions({ baseline, orders, positions, issues }) {
+// expected는 KIS 당일 주문내역(orders)에서, actual은 KIS 잔고(positions)에서 온다 —
+// 이 비교는 우리 앱이 아니라 KIS의 두 응답끼리 대조하는 것이다. 체결 직후에는 이
+// 둘이 서로 다른 속도로 반영돼 잠깐 어긋난다(2026-09-21·22에 POSITION_QUANTITY_MISMATCH로
+// 5건 전부 이 패턴이었다 — 방금 낸 주문의 심볼에서만, 체결 직후에만 발생). 다른
+// 대조 항목들과 달리 이 검사만 유예(grace) 없이 즉시 latch됐다 — 그래서 실제로는
+// 몇 초 안에 저절로 맞아떨어질 어긋남이 그날 하루 종일(최대 몇 시간) 신규 진입을
+// 막았다. 해당 심볼에 최근 주문이 있었고 graceMs 이내면 PENDING으로 미루고,
+// 그 창을 넘겨도 어긋나 있으면 그대로 MISMATCH로 latch한다.
+function comparePositions({ baseline, orders, positions, issues, pending, checkedAt, graceMs }) {
   const opening = new Map((baseline?.openingPositions ?? []).map((item) => [text(item?.symbol), number(item?.quantity)]));
   const fills = aggregateNetFills(orders);
   const actual = new Map(positions.map((item) => [text(item?.symbol), number(item?.quantity)]));
   const symbols = new Set([...opening.keys(), ...fills.keys(), ...actual.keys()]);
   symbols.delete(null);
+  const latestOrderedAtBySymbol = new Map();
+  for (const order of orders) {
+    const symbol = text(order?.symbol);
+    const orderedAt = number(order?.orderedAt);
+    if (!symbol || !Number.isFinite(orderedAt)) continue;
+    if (orderedAt > (latestOrderedAtBySymbol.get(symbol) ?? 0)) {
+      latestOrderedAtBySymbol.set(symbol, orderedAt);
+    }
+  }
   for (const symbol of symbols) {
     const expectedQuantity = (opening.get(symbol) ?? 0) + (fills.get(symbol) ?? 0);
     const actualQuantity = actual.get(symbol) ?? 0;
-    if (expectedQuantity !== actualQuantity) {
+    if (expectedQuantity === actualQuantity) continue;
+    const lastOrderedAt = latestOrderedAtBySymbol.get(symbol) ?? 0;
+    const ageMs = lastOrderedAt > 0 ? Math.max(0, checkedAt - lastOrderedAt) : null;
+    if (ageMs !== null && ageMs <= graceMs) {
+      pending.push(issue(
+        "POSITION_QUANTITY_PENDING",
+        `${symbol} 최근 주문의 KIS 잔고 반영을 기다리는 중입니다 (예상 ${expectedQuantity}주, 현재 ${actualQuantity}주).`,
+        { symbol, expectedQuantity, actualQuantity, ageMs },
+      ));
+    } else {
       issues.push(issue(
         "POSITION_QUANTITY_MISMATCH",
         `${symbol} 예상 보유수량 ${expectedQuantity}주와 KIS 실제 보유수량 ${actualQuantity}주가 다릅니다.`,

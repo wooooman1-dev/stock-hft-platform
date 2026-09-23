@@ -171,6 +171,55 @@ test("a balance quantity that diverges from the persisted opening position and f
   assert.ok(mismatch.issues.some((item) => item.code === "POSITION_QUANTITY_MISMATCH"));
 });
 
+test("a balance mismatch right after a fresh order for that symbol is pending, not blocked", () => {
+  const journal = new MemoryJournal();
+  const reconciler = new KisPaperReconciler({ journal, now: () => NOW, brokerVisibilityGraceMs: 30_000 });
+  reconciler.reconcile(reconcileInput({
+    commands: [acceptedCommand()],
+    orders: [brokerOrder()],
+    quantity: 1,
+  }));
+
+  const recentOrder = { ...brokerOrder(), orderedAt: NOW - 5_000 };
+  const pending = reconciler.reconcile(reconcileInput({
+    commands: [acceptedCommand()],
+    orders: [recentOrder],
+    quantity: 0,
+  }));
+  assert.equal(pending.status, "PENDING");
+  assert.ok(pending.pending.some((item) => item.code === "POSITION_QUANTITY_PENDING"));
+  assert.ok(!pending.issues.some((item) => item.code === "POSITION_QUANTITY_MISMATCH"));
+  // PENDING은 대사가 맞아떨어지면 다음 확인에서 사람 개입 없이 그냥 풀린다 —
+  // MISMATCH처럼 latch되어 사람이 직접 해제해야 하는 상태가 아니다.
+  const resolved = reconciler.reconcile(reconcileInput({
+    commands: [acceptedCommand()],
+    orders: [recentOrder],
+    quantity: 1,
+  }));
+  assert.equal(resolved.status, "CONSISTENT");
+  assert.equal(resolved.blocked, false);
+});
+
+test("a balance mismatch that outlives the grace period for that symbol still blocks", () => {
+  const journal = new MemoryJournal();
+  const reconciler = new KisPaperReconciler({ journal, now: () => NOW, brokerVisibilityGraceMs: 30_000 });
+  reconciler.reconcile(reconcileInput({
+    commands: [acceptedCommand()],
+    orders: [brokerOrder()],
+    quantity: 1,
+  }));
+
+  const staleOrder = { ...brokerOrder(), orderedAt: NOW - 60_000 };
+  const mismatch = reconciler.reconcile(reconcileInput({
+    commands: [acceptedCommand()],
+    orders: [staleOrder],
+    quantity: 0,
+  }));
+  assert.equal(mismatch.status, "MISMATCH");
+  assert.equal(mismatch.blocked, true);
+  assert.ok(mismatch.issues.some((item) => item.code === "POSITION_QUANTITY_MISMATCH"));
+});
+
 test("a newly accepted journal order receives a 30-second broker visibility grace period", () => {
   let clock = NOW;
   const journal = new MemoryJournal();

@@ -33,10 +33,26 @@ const REVISE_CANCEL_TR_ID = "VTTC0013U";
 const DAILY_ORDERS_TR_ID = "VTTC0081R";
 const CONTINUATION_HEADERS = new Set(["M", "F"]);
 const HISTORY_EXCHANGES = new Set(["KRX", "NXT", "SOR", "ALL"]);
-const DEFAULT_REQUEST_SPACING_MS = 650;
+// KIS 모의투자 계좌는 초당 1건으로 제한된다(실전은 초당 20건) — 650ms는 그
+// 한도를 넘어서 "초당 거래건수 초과"(EGW00201)를 반복적으로 유발했다
+// (2026-09-17). 정확히 1000ms에 맞추면 요청이 마침 초 경계에 걸릴 때 여전히
+// 여유가 없으므로 약간의 안전 여유를 둔다.
+const DEFAULT_REQUEST_SPACING_MS = 1_100;
 const DEFAULT_READ_RETRY_DELAY_MS = 1_200;
 const DEFAULT_DAILY_ORDERS_CACHE_MS = 1_000;
+// 잔고 조회는 캐시가 전혀 없어서, 화면 폴링(3초)·자동매매 평가 주기(5초)·
+// kisMainWorkspace 계좌 새로고침(5초)이 각자 독립적으로 호출을 쌓았다 —
+// 요청 큐가 간격은 지켜도 계속 거의 꽉 차 있다보니 "허용 가능한 초당
+// 거래건수를 초과" 오류가 반복됐다(2026-09-23). getDailyOrders와 같은
+// 방식으로 짧게 캐시해 같은 순간에 겹친 호출을 하나로 합친다.
+const DEFAULT_BALANCE_CACHE_MS = 2_000;
 const KIS_RATE_LIMIT_CODE = "EGW00201";
+// KIS 모의투자 잔고·주문내역 조회가 평소보다 느릴 때 10초를 살짝 넘겨 응답하는
+// 것을 직접 확인했다(우리 앱을 거치지 않고 직접 호출해서 10.5초만에 성공 —
+// 2026-09-18). 10초 타임아웃은 그 순간 딱 걸려서 매번 "요청 시간 초과"로
+// 잘못 처리되고 있었다 — KIS가 막힌 게 아니라 우리가 응답 직전에 먼저
+// 포기하고 있었다. 여유를 넉넉히 둔다.
+const DEFAULT_TIMEOUT_MS = 20_000;
 
 export class KisPaperTradingClient {
   constructor({
@@ -44,10 +60,11 @@ export class KisPaperTradingClient {
     tokenStore,
     fetchImpl = globalThis.fetch,
     now = Date.now,
-    timeoutMs = 10_000,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
     requestSpacingMs = DEFAULT_REQUEST_SPACING_MS,
     readRetryDelayMs = DEFAULT_READ_RETRY_DELAY_MS,
     dailyOrdersCacheMs = DEFAULT_DAILY_ORDERS_CACHE_MS,
+    balanceCacheMs = DEFAULT_BALANCE_CACHE_MS,
   }) {
     if (config?.mode !== KIS_PAPER_MODE_TRADING || !config.enabled) {
       throw new TypeError("KIS PAPER_TRADING 설정이 필요합니다.");
@@ -66,12 +83,15 @@ export class KisPaperTradingClient {
     this.requestSpacingMs = nonNegativeInteger(requestSpacingMs, "requestSpacingMs");
     this.readRetryDelayMs = nonNegativeInteger(readRetryDelayMs, "readRetryDelayMs");
     this.dailyOrdersCacheMs = nonNegativeInteger(dailyOrdersCacheMs, "dailyOrdersCacheMs");
+    this.balanceCacheMs = nonNegativeInteger(balanceCacheMs, "balanceCacheMs");
     this.tokenRequest = null;
     this.requestQueue = Promise.resolve();
     this.lastAuthorizedRequestStartedAt = 0;
     this.dailyOrdersRequests = new Map();
     this.dailyOrdersCache = new Map();
     this.dailyOrdersCacheGeneration = 0;
+    this.balanceCache = null;
+    this.balanceRequest = null;
   }
 
   status() {
@@ -87,7 +107,29 @@ export class KisPaperTradingClient {
     };
   }
 
+  // 계정은 하나뿐이라 getDailyOrders처럼 쿼리별 키가 필요 없다 — 캐시 항목 하나로 충분하다.
   async getBalance() {
+    if (this.balanceCache && this.balanceCacheMs > 0
+      && Date.now() - this.balanceCache.cachedAt <= this.balanceCacheMs) {
+      return structuredClone(this.balanceCache.value);
+    }
+    if (this.balanceRequest) return structuredClone(await this.balanceRequest);
+
+    const request = this.fetchBalance()
+      .then((balance) => {
+        if (this.balanceCacheMs > 0) {
+          this.balanceCache = { cachedAt: Date.now(), value: structuredClone(balance) };
+        }
+        return balance;
+      })
+      .finally(() => {
+        if (this.balanceRequest === request) this.balanceRequest = null;
+      });
+    this.balanceRequest = request;
+    return structuredClone(await request);
+  }
+
+  async fetchBalance() {
     const pages = [];
     let fk100 = "";
     let nk100 = "";
@@ -453,6 +495,9 @@ export class KisPaperTradingClient {
     this.dailyOrdersCacheGeneration += 1;
     this.dailyOrdersCache.clear();
     this.dailyOrdersRequests.clear();
+    // 주문이 나가면 잔고도 곧 바뀌므로, 캐시된 옛 잔고를 다음 조회에서 그대로
+    // 돌려주지 않게 같이 비운다(진행 중인 조회가 있으면 그건 그대로 마무리되게 둔다).
+    this.balanceCache = null;
   }
 
   async rawRequest(operation, url, options) {

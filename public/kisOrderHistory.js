@@ -6,6 +6,33 @@ let scheduled = false;
 let stopped = false;
 
 const fmt = (value) => Math.round(Number(value) || 0).toLocaleString("ko-KR");
+
+function formatKisOrderDateTime(dateValue, timeValue) {
+  const date = String(dateValue ?? "").trim();
+  if (date.length !== 8) return "-";
+  const month = date.slice(4, 6);
+  const day = date.slice(6, 8);
+  const time = String(timeValue ?? "").trim();
+  if (time.length < 4) return `${month}/${day}`;
+  const padded = time.padEnd(6, "0").slice(0, 6);
+  return `${month}/${day} ${padded.slice(0, 2)}:${padded.slice(2, 4)}:${padded.slice(4, 6)}`;
+}
+
+function formatTimestampKst(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms)) return "-";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(ms));
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${map.month}/${map.day} ${map.hour}:${map.minute}:${map.second}`;
+}
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({
   "&": "&amp;",
   "<": "&lt;",
@@ -74,6 +101,7 @@ function brokerOrderRow(order, cancelableOrders) {
     order?.rejectedQuantity ? `거절 ${order.rejectedQuantity}주` : null,
   ].filter(Boolean).join(" · ");
   return `<div class="order-row" title="${escapeHtml(title)}">
+    <span>${escapeHtml(formatKisOrderDateTime(order?.orderDate, order?.orderTime))}</span>
     <span class="${sideClass}">${sideText} ${orderQuantity}주</span>
     <span>${escapeHtml(orderTypeText(order))}</span>
     <span>${escapeHtml(order?.orderNumber ?? "-")} · ${escapeHtml(executionText)}</span>
@@ -105,6 +133,7 @@ function journalFallbackRow(command) {
       : status === "UNKNOWN_RESULT" ? "결과 불명"
         : status === "REJECTED" ? "거절" : "오류";
   return `<div class="order-row" title="KIS 주문·체결조회 실패로 실행 저널을 표시합니다.">
+    <span>${escapeHtml(formatTimestampKst(command?.at))}</span>
     <span>${escapeHtml(action)}</span>
     <span>${escapeHtml(type)}</span>
     <span>${escapeHtml(result?.orderNumber ?? request?.originalOrderNumber ?? "-")} · 체결조회 대기</span>
@@ -165,7 +194,7 @@ function renderOrderHistory() {
     ? "오늘 KIS 주문·체결내역이 없습니다."
     : "KIS 체결내역을 불러오지 못했고 실행 저널에도 주문 명령이 없습니다.";
 
-  list.innerHTML = `<div class="table-head"><span>주문</span><span>유형·가격</span><span>주문번호·체결</span><span>상태</span><span>제어</span></div>${rows.join("") || `<div class="empty-list">${escapeHtml(emptyText)}</div>`}`;
+  list.innerHTML = `<div class="table-head"><span>시각</span><span>주문</span><span>유형·가격</span><span>주문번호·체결</span><span>상태</span><span>제어</span></div>${rows.join("") || `<div class="empty-list">${escapeHtml(emptyText)}</div>`}`;
   list.dataset.kisOrderHistorySignature = latestSignature;
   note.innerHTML = historyLoaded && !historyError
     ? "주문 전 최종 확인을 거칩니다. 목록은 KIS 모의계좌의 당일 주문·체결조회 결과입니다. 체결수량·평균체결가·미체결·취소 상태를 증권사 기준으로 표시합니다."

@@ -8,7 +8,11 @@ const FILL_EVENT = "BROKER_FILL_OBSERVED";
  * costBasisIncompleteQuantity로 별도 집계된다.
  */
 export class KisPaperPerformanceTracker {
-  constructor({ journal, now = Date.now, costModel = {} } = {}) {
+  // resetAt: 이 시각 이전 이벤트는 성과 통계(승률·총순이익·최대낙폭)에서 제외한다.
+  // 실행 저널 자체는 그대로 둔다 — 대사·킬 스위치 복구가 전체 이력에 의존하므로
+  // 저널을 자르면 안 되고, 화면에 보여줄 집계 범위만 조정한다(2026-09-23, 초기
+  // 오류가 있던 기간의 손익이 지금 성과를 계속 가려서 "오늘부터 새로" 요청).
+  constructor({ journal, now = Date.now, costModel = {}, resetAt = null } = {}) {
     if (!journal || typeof journal.append !== "function" || typeof journal.readAll !== "function") {
       throw new TypeError("append/readAll을 제공하는 실행 저널이 필요합니다.");
     }
@@ -16,8 +20,14 @@ export class KisPaperPerformanceTracker {
     this.journal = journal;
     this.now = now;
     this.costModel = { ...costModel };
+    this.resetAt = normalizeResetAt(resetAt);
     this.observedExecutedQuantity = new Map();
     this.replayJournal();
+  }
+
+  setResetAt(timestamp) {
+    this.resetAt = normalizeResetAt(timestamp);
+    return this.resetAt;
   }
 
   replayJournal() {
@@ -76,6 +86,7 @@ export class KisPaperPerformanceTracker {
     return computePerformanceReport(this.journal.readAll(), {
       now: this.now(),
       costModel: this.costModel,
+      resetAt: this.resetAt,
       ...(recentLimit === undefined ? {} : { recentLimit }),
     });
   }
@@ -100,15 +111,24 @@ const DEFAULT_COST_MODEL = Object.freeze({
   sellTaxBps: 20,
 });
 
-export function computePerformanceReport(events, { now = Date.now(), costModel = {}, recentLimit = 20 } = {}) {
+export function computePerformanceReport(events, {
+  now = Date.now(), costModel = {}, recentLimit = 20, resetAt = null,
+} = {}) {
   const costs = { ...DEFAULT_COST_MODEL, ...costModel };
   const operational = computeOperationalStats(events, now);
-  const equitySnapshots = events
+  const resetAtMs = normalizeResetAt(resetAt);
+  // 체결이 실제로 일어난 시각(orderedAt) 기준으로 자른다 — 우리가 그걸 관측해
+  // 저널에 적은 시각(capturedAt)이 아니라, "몇 시부터 집계할지"는 사용자가
+  // 체감하는 거래 시각과 맞아야 한다("오늘부터 새로" 요청과 같은 기준).
+  const scopedEvents = resetAtMs === null
+    ? events
+    : events.filter((event) => eventReferenceTimestamp(event) >= resetAtMs);
+  const equitySnapshots = scopedEvents
     .filter((event) => event.type === EQUITY_EVENT)
     .map((event) => event.payload)
     .sort((left, right) => left.capturedAt - right.capturedAt);
 
-  const fillEvents = events
+  const fillEvents = scopedEvents
     .filter((event) => event.type === FILL_EVENT)
     .map((event) => event.payload)
     .sort((left, right) => (left.orderedAt ?? left.capturedAt) - (right.orderedAt ?? right.capturedAt));
@@ -213,6 +233,7 @@ export function computePerformanceReport(events, { now = Date.now(), costModel =
 
   return {
     generatedAt: now,
+    resetAt: resetAtMs,
     operational,
     costModel: {
       ...costs,
@@ -276,8 +297,24 @@ function computeOperationalStats(events, now) {
   };
 }
 
+// null/undefined는 "필터 없음"이고, 0은 유효한(비록 드문) 타임스탬프다 —
+// Number(null)이 0이 되는 함정을 피하려고 null 여부를 먼저 따로 본다.
+function normalizeResetAt(value) {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function fillKey(organizationNumber, orderNumber) {
   return `${text(organizationNumber) ?? "*"}:${text(orderNumber) ?? ""}`;
+}
+
+// resetAt 필터링용 기준 시각. 체결 이벤트는 orderedAt(체결 시각)을 우선하고, 그게
+// 없으면 capturedAt(관측 시각)으로, 스냅샷류는 capturedAt으로, 그것도 없으면
+// 봉투(envelope)의 timestamp로 떨어진다.
+function eventReferenceTimestamp(event) {
+  const payload = event?.payload ?? {};
+  return number(payload.orderedAt ?? payload.capturedAt ?? event?.timestamp);
 }
 
 function koreaDateKey(timestamp) {
