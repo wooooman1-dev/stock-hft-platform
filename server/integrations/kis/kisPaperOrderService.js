@@ -163,9 +163,33 @@ export class KisPaperOrderService {
   }
 
   async getBalance() {
-    const balance = await this.client.getBalance();
+    let balance;
+    try {
+      balance = await this.client.getBalance();
+    } catch (error) {
+      // performReconciliation()의 Promise.all 안에서 실패한 경우만 저널에 남기고
+      // 있었다 — getBalance()를 직접 호출하는 경로(자동매매 평가 주기, 화면
+      // 잔고 폴링)에서 KIS 잔고조회 자체가 실패하면 원인이 전혀 안 남았다
+      // (2026-09-23, "한국투자 잔고 조회 요청 시간이 초과되었습니다"가 그냥
+      // 사라짐). 여기서도 같은 방식으로 남긴다.
+      this.journalReconciliationFailure(error);
+      throw error;
+    }
     await this.refreshReconciliation({ balance, force: false });
     return balance;
+  }
+
+  journalReconciliationFailure(error) {
+    const checkedAt = this.now();
+    try {
+      this.journal.append(RECONCILIATION_UNAVAILABLE_EVENT, {
+        day: koreaDateKey(checkedAt),
+        checkedAt,
+        error: safeError(error),
+      }, checkedAt);
+    } catch {
+      // 저널 기록 실패가 원래 에러 처리를 막지 않게 한다.
+    }
   }
 
   // protectiveExit: 손절·익절·트레일링 스톱·최대 보유시간·강제청산처럼 이미 보유한
@@ -440,16 +464,7 @@ export class KisPaperOrderService {
       // 대조가 2분간 안 되면서 킬 스위치가 걸렸는데, 원인(어느 KIS 호출이 왜
       // 실패했는지)을 나중에 전혀 확인할 수 없었다. 다음에 같은 일이 생기면
       // 원인을 찾을 수 있도록 여기서 저널에 남긴다.
-      const checkedAt = this.now();
-      try {
-        this.journal.append(RECONCILIATION_UNAVAILABLE_EVENT, {
-          day: koreaDateKey(checkedAt),
-          checkedAt,
-          error: safeError(error),
-        }, checkedAt);
-      } catch {
-        // 저널 기록 실패가 원래 에러 처리를 막지 않게 한다 — 계좌 대조는 그대로 진행.
-      }
+      this.journalReconciliationFailure(error);
       return this.reconciler.markUnavailable(error);
     }
   }

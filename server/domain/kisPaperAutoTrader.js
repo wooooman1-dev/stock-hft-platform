@@ -27,6 +27,7 @@ export class KisPaperAutoTrader {
     orderService,
     settings = DEFAULT_AUTO_TRADING_SETTINGS,
     costModel = {},
+    realtimeClient = null,
     now = Date.now,
   } = {}) {
     if (!orderService || typeof orderService.submitOrder !== "function") {
@@ -48,7 +49,40 @@ export class KisPaperAutoTrader {
     // 같은 종목에 또 진입하지 않는다. 종목별로 따로 대기한다(동시 보유 여러 종목).
     this.pendingOrders = new Map();
     this.holdings = new Map();
+    // 이미 매도 제출한 종목은 KIS 잔고 반영이 끝날 때까지(최대 수십~100초) 다시
+    // 팔지 않는다(2026-09-23, 356680 종목이 5초 뒤 다음 평가 주기에서 아직 반영
+    // 안 된 잔고를 보고 또 매도를 내 REJECTED된 실제 사례로 확인). ACCEPTED로
+    // 확정된 매도만 붙잡아두고, REJECTED·결과불명·전송실패는 바로 풀어 재시도를
+    // 허용한다 — resolvePositions()가 더 이상 보유가 아님을 확인하면 완전히 지운다.
+    this.exitingSymbols = new Set();
+    // 청산된 종목은 같은 거래일 안에는 다시 사지 않는다(2026-09-23, 실측 데이터로
+    // 확인 — 변동성 큰 한 종목에서 손절 후에도 반복 재진입해 손실이 쌓인 정황).
+    // ACCEPTED로 확정된 매도만 기록한다 — REJECTED·전송실패는 그 종목이 아직
+    // 실제로 청산되지 않았을 수 있어 재시도가 계속 허용돼야 한다.
+    this.exitedSymbolsToday = new Map(); // symbol -> KST 거래일 키
     this.decisions = [];
+    // 잔고 폴링(5초)보다 자주 오는 실시간 체결 틱으로 보유 종목의 고점을 갱신하고,
+    // 트레일링 스톱을 그 즉시 재평가한다(2026-09-23, "응 적용해"로 승인됨) — 폴링
+    // 주기 사이의 고점·반전을 놓치지 않기 위해서다.
+    this.realtimeClient = realtimeClient;
+    this.onRealtimeMarketData = null;
+    this.bindRealtimeClient();
+  }
+
+  bindRealtimeClient() {
+    if (!this.realtimeClient || typeof this.realtimeClient.on !== "function") return;
+    this.onRealtimeMarketData = (snapshot) => this.handleRealtimeTick(snapshot);
+    this.realtimeClient.on("marketData", this.onRealtimeMarketData);
+  }
+
+  unbindRealtimeClient() {
+    if (!this.realtimeClient || typeof this.realtimeClient.off !== "function" || !this.onRealtimeMarketData) return;
+    this.realtimeClient.off("marketData", this.onRealtimeMarketData);
+    this.onRealtimeMarketData = null;
+  }
+
+  stop() {
+    this.unbindRealtimeClient();
   }
 
   updateSettings(settings) {
@@ -76,15 +110,34 @@ export class KisPaperAutoTrader {
   }
 
   // 사람이 원인을 확인하고 풀어줄 때까지 멈춘다. 자동 해제는 하지 않는다.
+  //
+  // halt는 지금까지 메모리(this.halt)에만 있었다 — 화면에 "멈춤"이 잠깐 떴다가
+  // 사라지면 그게 실제로 멈췄다가 사람이 풀어서 그런 건지, 아니면 화면이 잘못
+  // 보여준 건지 나중에 확인할 방법이 전혀 없었다(2026-09-23, "멈춤이 아닌데
+  // 멈춤이라고 뜨면 문제 아니냐"는 지적). 걸릴 때·풀릴 때를 전부 실행 저널에
+  // 남겨서, 다음에 같은 일이 생기면 추측 없이 저널로 확인할 수 있게 한다.
   setHalt(code, message, detail = null) {
     if (this.halt) return this.halt;
     this.halt = { code, message, detail, at: this.now() };
+    this.journalHaltTransition("AUTO_TRADER_HALTED", this.halt);
     return this.halt;
   }
 
   clearHalt() {
+    const previous = this.halt;
     this.halt = null;
+    if (previous) {
+      this.journalHaltTransition("AUTO_TRADER_HALT_CLEARED", { ...previous, clearedAt: this.now() });
+    }
     return this.status();
+  }
+
+  journalHaltTransition(type, payload) {
+    try {
+      this.orderService.journal?.append(type, payload, this.now());
+    } catch {
+      // 저널 기록 실패가 halt 처리 자체를 막지 않게 한다.
+    }
   }
 
   // 한 번의 평가 주기. 주문을 최대 1건 낸다. 겹쳐 호출되면 뒤의 호출은 건너뛴다.
@@ -215,9 +268,15 @@ export class KisPaperAutoTrader {
     const positions = Array.isArray(balance?.positions) ? balance.positions : [];
     const held = positions.filter((item) => Number(item?.quantity) > 0);
     const heldSymbols = new Set(held.map((item) => String(item.symbol ?? "")));
-    // 잔고에 반영된 매수는 대기 목록에서 뺀다.
+    // 잔고에 반영된 매수는 대기 목록에서 뺀다 — 이때 실제 매수 제출 시각을
+    // 기억해뒀다가 아래에서 포지션에 실어 보낸다(30분 카운트를 이 시각부터
+    // 세기 위해서. "우리가 잔고에서 처음 본 시각"이 아니다).
+    const knownBuyAtBySymbol = new Map();
     for (const symbol of [...this.pendingOrders.keys()]) {
-      if (heldSymbols.has(symbol)) this.pendingOrders.delete(symbol);
+      if (heldSymbols.has(symbol)) {
+        knownBuyAtBySymbol.set(symbol, this.pendingOrders.get(symbol)?.at ?? null);
+        this.pendingOrders.delete(symbol);
+      }
     }
     // 더 이상 들고 있지 않은 종목의 위험 추적기·표시용 스냅샷은 정리한다.
     for (const symbol of [...this.riskTrackers.keys()]) {
@@ -226,17 +285,39 @@ export class KisPaperAutoTrader {
     for (const symbol of [...this.holdings.keys()]) {
       if (!heldSymbols.has(symbol)) this.holdings.delete(symbol);
     }
+    // 완전히 청산된 종목만 매도-진행중 표시를 지운다 — 아직 보유 중이면(부분
+    // 반영·재시도 대기 등) 계속 막아둔다.
+    for (const symbol of [...this.exitingSymbols]) {
+      if (!heldSymbols.has(symbol)) this.exitingSymbols.delete(symbol);
+    }
+    // 날짜가 바뀌면(다음 거래일 KST 자정 이후) 당일 재진입 금지 기록도 자동으로 풀린다.
+    const today = kstDayKey(this.now());
+    for (const [symbol, dayKey] of [...this.exitedSymbolsToday]) {
+      if (dayKey !== today) this.exitedSymbolsToday.delete(symbol);
+    }
+    // 추천 상위 목록에서 밀려나도(recommendationScanner의 watchSymbols는 랭킹
+    // 상위 종목만 구독한다) 보유 중인 동안은 실시간 체결 틱을 계속 받는다 —
+    // 5초 잔고 폴링만으로는 폴링 사이의 고점·반전을 놓친다.
+    if (this.realtimeClient && typeof this.realtimeClient.watchSymbols === "function") {
+      this.realtimeClient.watchSymbols([...heldSymbols]);
+    }
     // 화면에 종목코드만 보이면 무엇을 들고 있는지 알 수 없다.
-    return held.map((target) => ({
-      symbol: String(target.symbol ?? ""),
-      name: target.name ? String(target.name) : null,
-      quantity: Math.trunc(Number(target.quantity)),
-      averagePrice: Number(target.averagePrice),
-      currentPrice: Number(target.currentPrice),
-      evaluationAmount: numberOrNull(target.evaluationAmount),
-      evaluationProfitLoss: numberOrNull(target.evaluationProfitLoss),
-      evaluationProfitLossRate: numberOrNull(target.evaluationProfitLossRate),
-    }));
+    return held.map((target) => {
+      const symbol = String(target.symbol ?? "");
+      return {
+        symbol,
+        name: target.name ? String(target.name) : null,
+        quantity: Math.trunc(Number(target.quantity)),
+        averagePrice: Number(target.averagePrice),
+        currentPrice: Number(target.currentPrice),
+        evaluationAmount: numberOrNull(target.evaluationAmount),
+        evaluationProfitLoss: numberOrNull(target.evaluationProfitLoss),
+        evaluationProfitLossRate: numberOrNull(target.evaluationProfitLossRate),
+        // 이 포지션의 리스크 추적기가 이번 주기에 새로 만들어질 때만 쓰인다
+        // (이미 추적 중이면 무시됨) — 첫 확인 시각 대신 실제 매수 제출 시각.
+        knownOpenedAt: knownBuyAtBySymbol.get(symbol) ?? null,
+      };
+    });
   }
 
   // 주문 직후 잔고 반영 지연 구간(settlementGraceMs)이 지나도 잔고에 안 잡혔으면
@@ -267,6 +348,7 @@ export class KisPaperAutoTrader {
       quantity: position.quantity,
       lastPrice,
       timestamp: at,
+      openedAt: position.knownOpenedAt,
     });
     this.holdings.set(position.symbol, {
       symbol: position.symbol,
@@ -328,6 +410,14 @@ export class KisPaperAutoTrader {
         evaluated.push({
           symbol, name: candidate?.name ?? null,
           eligible: false, reason: "ALREADY_HELD_OR_PENDING",
+        });
+        continue;
+      }
+      // 오늘 이미 한 번 청산된 종목이다 — 승패 무관하게 같은 날 재진입하지 않는다.
+      if (symbol && this.exitedSymbolsToday.has(symbol)) {
+        evaluated.push({
+          symbol, name: candidate?.name ?? null,
+          eligible: false, reason: "EXITED_TODAY",
         });
         continue;
       }
@@ -432,11 +522,24 @@ export class KisPaperAutoTrader {
       stopLossBps: this.settings.stopLossBps,
       takeProfitBps: this.settings.takeProfitBps,
       trailingStopBps: this.settings.trailingStopBps,
+      trailingConfirmMs: this.settings.trailingConfirmMs,
       maxHoldingMs: this.settings.maxHoldingMs,
     };
   }
 
   async submit({ side, symbol, name = null, quantity, referencePrice, reason, at, diagnostics = null, orderBookSnapshot = null }) {
+    // 이 종목에 이미 매도를 내고 잔고 반영을 기다리는 중이면 또 내지 않는다
+    // (356680 중복매도 REJECTED 사례). 이 체크와 exitingSymbols.add는 그 사이에
+    // await이 없어 원자적이다 — 주기 평가와 실시간 틱이 동시에 들어와도 안전하다.
+    if (side === "SELL") {
+      if (this.exitingSymbols.has(symbol)) {
+        return this.record({
+          action: "HOLD", at, symbol, name, quantity, reason,
+          detail: "이미 매도 제출 후 잔고 반영을 기다리는 중입니다.", skipped: "EXIT_IN_FLIGHT",
+        });
+      }
+      this.exitingSymbols.add(symbol);
+    }
     const clientOrderId = `AUTO:${side}:${symbol}:${at}`;
     // await 이전에 기록한다. 제출이 끝난 뒤에 갱신하면 그 사이의 평가가 옛 값을 보고
     // 같은 주문을 또 낸다.
@@ -465,6 +568,9 @@ export class KisPaperAutoTrader {
         reason,
       });
     } catch (error) {
+      // 제출 자체가 실패하면(전송 오류 등) KIS에 도달했는지조차 알 수 없다 — 잡아두면
+      // 이 종목은 영원히 매도를 재시도 못 하게 된다. 재시도를 허용한다.
+      if (side === "SELL") this.exitingSymbols.delete(symbol);
       // 이미 멈춘 상태에서 청산이 거부되는 것은 새로운 사고가 아니라
       // 멈춤의 결과다. 원인을 덮어쓰지 않고 별개 사유로 드러낸다.
       if (side === "SELL" && this.halt) {
@@ -480,9 +586,60 @@ export class KisPaperAutoTrader {
     if (result?.status === "UNKNOWN_RESULT" && this.settings.haltOnUnknownResult) {
       this.setHalt("UNKNOWN_RESULT", "주문 결과가 불확실합니다. 해소 후 재개하세요.", { clientOrderId });
     }
+    // ACCEPTED로 확정된 매도만 잔고 반영을 기다리며 계속 붙잡아둔다(resolvePositions가
+    // 청산 확인 시 지운다). REJECTED·결과불명은 이 종목을 계속 보호하지 못하는 채로
+    // 방치할 수 없으므로 즉시 풀어 다음 주기에 다시 시도할 수 있게 한다.
+    if (side === "SELL") {
+      if (result?.status === "ACCEPTED") {
+        this.exitedSymbolsToday.set(symbol, kstDayKey(at));
+      } else {
+        this.exitingSymbols.delete(symbol);
+      }
+    }
     return this.record({
       action: "ORDER", at, side, symbol, name, quantity, reason, clientOrderId,
       referencePrice, status: result?.status ?? null, diagnostics,
+    });
+  }
+
+  // 잔고 폴링(5초 주기)이 아니라 실시간 체결 틱으로 보유 종목의 고점을 갱신하고,
+  // 그 자리에서 즉시 보호청산 조건을 재평가한다. 폴링 주기 하나를 통째로 놓치는
+  // 순간의 고점·반전을 잡기 위해서다(2026-09-23, "응 적용해"로 승인).
+  handleRealtimeTick(snapshot) {
+    if (!this.settings.enabled) return;
+    const symbol = String(snapshot?.symbol ?? "");
+    if (!symbol || !this.holdings.has(symbol) || this.exitingSymbols.has(symbol)) return;
+    const price = positiveNumber(snapshot?.trade?.currentPrice);
+    if (price === null) return;
+
+    const tracker = this.riskTrackers.get(symbol);
+    if (!tracker) return;
+    const at = this.now();
+    const risk = tracker.observeTick({ price, timestamp: at });
+
+    const holding = this.holdings.get(symbol);
+    this.holdings.set(symbol, {
+      ...holding,
+      currentPrice: price,
+      peakPrice: risk.peakPrice,
+      returnBps: holding.averagePrice > 0
+        ? ((price - holding.averagePrice) / holding.averagePrice) * 10_000
+        : null,
+    });
+
+    const intent = evaluatePositionRiskExit({
+      account: { position: { quantity: holding.quantity, averagePrice: holding.averagePrice } },
+      settings: this.riskSettings(),
+      now: at,
+      lastPrice: price,
+      positionRiskState: risk,
+    });
+    if (!intent) return;
+    // 호출자(marketData 이벤트)는 결과를 기다리지 않는다 — submit()은 내부에서
+    // 모든 실패를 잡아 record()로 남기므로 여기서 예외가 새어나가지 않는다.
+    void this.submit({
+      side: "SELL", symbol, name: holding.name, quantity: intent.quantity,
+      referencePrice: price, reason: intent.reason, at, diagnostics: intent.diagnostics,
     });
   }
 
@@ -504,6 +661,11 @@ function quoteAgeMs(candidate, at) {
   const latest = numberOrNull(candidate?.realtime?.latestAt ?? candidate?.fetchedAt);
   if (latest === null) return null;
   return Math.max(0, Number(at) - latest);
+}
+
+// KST 달력일 키(자정 경계) — 당일 재진입 금지 판단에 쓴다.
+function kstDayKey(timestamp) {
+  return Math.floor((Number(timestamp) + 9 * 60 * 60 * 1_000) / 86_400_000);
 }
 
 function positiveNumber(value) {

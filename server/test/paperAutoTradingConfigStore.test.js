@@ -60,6 +60,21 @@ test("persists performanceResetAt without erasing settings/limits, and clearing 
   assert.equal(store.load().performanceResetAt, null);
 });
 
+test("persists recommendationSettings without erasing settings/limits/performanceResetAt", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pulsehft-auto-trading-config-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const store = new PaperAutoTradingConfigStore(join(dir, "config.json"));
+
+  store.save({ settings: { cooldownMs: 1 }, limits: { maxDailyOrders: 1 }, performanceResetAt: 1_700_000_000_000 });
+  store.save({ recommendationSettings: { minimumExecutionStrength: 80 } });
+
+  const loaded = store.load();
+  assert.equal(loaded.settings.cooldownMs, 1);
+  assert.equal(loaded.limits.maxDailyOrders, 1);
+  assert.equal(loaded.performanceResetAt, 1_700_000_000_000);
+  assert.equal(loaded.recommendationSettings.minimumExecutionStrength, 80);
+});
+
 test("a corrupt config file is reported, not silently ignored", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pulsehft-auto-trading-config-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

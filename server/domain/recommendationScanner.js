@@ -56,6 +56,13 @@ export class RecommendationScanner {
     this.bindRealtimeResearch();
   }
 
+  // 화면에서 실시간 확인 문턱(예: 체결강도)을 조절할 수 있도록 런타임에 바꾼다.
+  // 다음 attachRealtime() 호출부터(다음 폴링/재조회 시) 바로 적용된다.
+  updateSettings(partial) {
+    this.settings = normalizeRecommendationSettings({ ...this.settings, ...partial });
+    return publicRecommendationSettings(this.settings);
+  }
+
   status() {
     const dataStatus = this.dataClient?.status?.() ?? {
       enabled: false,
@@ -341,6 +348,7 @@ export class RecommendationScanner {
     const realtime = evaluateRealtimeConfirmation(candidate, realtimeSnapshot, {
       now: this.now(),
       staleAfterMs: realtimeSnapshot?.staleAfterMs,
+      minimumExecutionStrength: this.settings.minimumExecutionStrength,
     });
     this.trackRealtimeState(candidate, realtime, source);
     return {
@@ -389,6 +397,7 @@ export class RecommendationScanner {
       const realtime = evaluateRealtimeConfirmation(candidate, snapshot, {
         now: this.now(),
         staleAfterMs: snapshot?.staleAfterMs,
+        minimumExecutionStrength: this.settings.minimumExecutionStrength,
       });
       this.trackRealtimeState(candidate, realtime, "MARKET_DATA");
     };

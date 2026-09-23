@@ -47,9 +47,9 @@ export class PaperAutoTradingConfigStore {
     return payload;
   }
 
-  // settings/limits/performanceResetAt 중 넘어온 것만 병합해 저장한다(나머지
-  // 저장되어 있는 값을 서로 덮어쓰지 않도록).
-  save({ settings, limits, performanceResetAt } = {}) {
+  // settings/limits/performanceResetAt/recommendationSettings 중 넘어온 것만
+  // 병합해 저장한다(나머지 저장되어 있는 값을 서로 덮어쓰지 않도록).
+  save({ settings, limits, performanceResetAt, recommendationSettings } = {}) {
     const current = this.load() ?? {};
     const next = {
       ...(settings !== undefined ? { settings } : { settings: current.settings }),
@@ -57,6 +57,11 @@ export class PaperAutoTradingConfigStore {
       ...(performanceResetAt !== undefined
         ? { performanceResetAt }
         : current.performanceResetAt !== undefined ? { performanceResetAt: current.performanceResetAt } : {}),
+      ...(recommendationSettings !== undefined
+        ? { recommendationSettings }
+        : current.recommendationSettings !== undefined
+          ? { recommendationSettings: current.recommendationSettings }
+          : {}),
     };
     const directory = dirname(this.filePath);
     mkdirSync(directory, { recursive: true });

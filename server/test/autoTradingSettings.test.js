@@ -18,7 +18,7 @@ test("설계 기본값을 그대로 사용한다", () => {
   assert.equal(settings.positionSizeRatio, 0.1);
   assert.equal(settings.stopLossBps, 100);
   assert.equal(settings.takeProfitBps, 150);
-  assert.equal(settings.trailingStopBps, 70);
+  assert.equal(settings.trailingStopBps, 100);
   assert.equal(settings.maxHoldingMs, 1_800_000);
   assert.equal(settings.forcedExitTime, "15:15");
   assert.equal(settings.staleQuoteMs, 5_000);

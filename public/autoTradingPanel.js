@@ -15,12 +15,13 @@ let scheduled = false;
 let showSettings = false;
 let limits = null;
 let limitBounds = null;
+let recommendationSettings = null;
 let allTrades = null;
 let loadingAllTrades = false;
 // 이 패널 자신도 3초마다 폴링해서 다시 그리므로(refresh() → render()), 입력
 // 중이던 값과 커서를 DOM에만 의존해 지킬 수 없다. 모듈 상태로 들고 있다가
 // 렌더 후 복원한다.
-const draft = { strategy: {}, limits: {} };
+const draft = { strategy: {}, limits: {}, recommendation: {} };
 let focusState = null;
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({
@@ -106,14 +107,16 @@ async function refresh() {
     ]);
     status = next;
     if (status) {
-      const [nextBalance, nextPerformance, nextLimits] = await Promise.all([
+      const [nextBalance, nextPerformance, nextLimits, nextRecommendationSettings] = await Promise.all([
         api("/api/kis/paper/balance").catch(() => null),
         api("/api/kis/paper/performance").catch(() => null),
         api("/api/kis/paper/limits").catch(() => null),
+        api("/api/recommendations/settings").catch(() => null),
       ]);
       balance = nextBalance;
       performance = nextPerformance;
       if (nextLimits) { limits = nextLimits.limits; limitBounds = nextLimits.bounds; }
+      if (nextRecommendationSettings) recommendationSettings = nextRecommendationSettings;
       status.paperService = paper?.service ?? null;
     }
   } catch {
@@ -460,6 +463,18 @@ const LIMIT_FIELDS = [
   ["maxOrderValue", "1회 최대 금액", "원", ""],
 ];
 
+// 자동매매가 아니라 매수추천 스캐너(recommendationScanner)의 실시간 확인 문턱이다
+// — 별도 설정 저장소(/api/recommendations/settings)로 나간다(2026-09-23).
+const RECOMMENDATION_FIELDS = [
+  ["minimumExecutionStrength", "체결강도 문턱", "", "100 = 매수·매도 체결량 동률. 반전형은 낮을수록 더 이른 단계에서 통과"],
+];
+
+function settingsSource(group) {
+  if (group === "limits") return limits ?? {};
+  if (group === "recommendation") return recommendationSettings ?? {};
+  return status?.settings ?? {};
+}
+
 function fieldRow(key, label, unit, hint, value, group) {
   const drafted = draft[group]?.[key];
   const source = drafted !== undefined ? drafted : value;
@@ -479,13 +494,12 @@ function fieldRow(key, label, unit, hint, value, group) {
 // 중이거나(draft에 값이 있음) 포커스가 가 있는 칸은 건드리지 않는다 — 그 외에는
 // 저장 직후나 다음 폴링에서 값이 바뀌어도 화면에 그대로 반영되게 한다.
 function syncSettingsFields(form) {
-  const strategy = status?.settings ?? {};
   for (const input of form.querySelectorAll("[data-at-field]")) {
     const key = input.dataset.atField;
-    const group = input.dataset.atGroup === "limits" ? "limits" : "strategy";
+    const group = input.dataset.atGroup in draft ? input.dataset.atGroup : "strategy";
     if (draft[group][key] !== undefined) continue;
     if (document.activeElement === input) continue;
-    const source = group === "limits" ? limits?.[key] : strategy[key];
+    const source = settingsSource(group)[key];
     const next = source === null || source === undefined ? "" : String(source);
     if (input.value !== next) input.value = next;
   }
@@ -502,6 +516,11 @@ function settingsHtml() {
     <div class="at-fields">
       ${LIMIT_FIELDS.map(([k, l, u, h]) => fieldRow(k, l, u, h, limits?.[k], "limits")).join("")}
     </div>
+    <div class="at-section-title" style="margin-top:12px">매수추천 실시간 확인</div>
+    <div class="at-fields">
+      ${RECOMMENDATION_FIELDS.map(([k, l, u, h]) =>
+        fieldRow(k, l, u, h, recommendationSettings?.[k], "recommendation")).join("")}
+    </div>
     <div class="at-save-row">
       <button type="button" class="at-btn at-btn-save" data-at-action="save" ${busy ? "disabled" : ""}>저장</button>
       <button type="button" class="at-btn at-btn-ghost" data-at-action="reload-settings">현재값 불러오기</button>
@@ -509,16 +528,18 @@ function settingsHtml() {
     </div>`;
 }
 
-// 입력값을 모아 전략 설정과 한도를 각각 저장한다. 빈 칸은 null(해제)로 보낸다.
+// 입력값을 모아 전략 설정·한도·추천 스캐너 설정을 각각 저장한다. 빈 칸은 null(해제)로 보낸다.
 async function saveSettings(panel) {
   const strategy = {};
   const nextLimits = {};
+  const nextRecommendationSettings = {};
+  const targetByGroup = { strategy, limits: nextLimits, recommendation: nextRecommendationSettings };
   for (const input of panel.querySelectorAll("[data-at-field]")) {
     const key = input.dataset.atField;
-    const group = input.dataset.atGroup === "limits" ? "limits" : "strategy";
+    const group = input.dataset.atGroup in draft ? input.dataset.atGroup : "strategy";
     const drafted = draft[group][key];
     const raw = String(drafted !== undefined ? drafted : input.value).trim();
-    const target = group === "limits" ? nextLimits : strategy;
+    const target = targetByGroup[group];
     if (raw === "") { target[key] = null; continue; }
     target[key] = key === "forcedExitTime" ? raw : Number(raw);
   }
@@ -532,9 +553,15 @@ async function saveSettings(panel) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(strategy),
   });
+  await api("/api/recommendations/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(nextRecommendationSettings),
+  });
   message = { tone: "ok", text: "설정을 저장했습니다." };
   draft.strategy = {};
   draft.limits = {};
+  draft.recommendation = {};
   focusState = null;
   await refresh();
 }
@@ -543,7 +570,7 @@ async function saveSettings(panel) {
 document.addEventListener("input", (event) => {
   const input = event.target.closest?.("[data-at-field]");
   if (!input) return;
-  const group = input.dataset.atGroup === "limits" ? "limits" : "strategy";
+  const group = input.dataset.atGroup in draft ? input.dataset.atGroup : "strategy";
   draft[group][input.dataset.atField] = input.value;
   captureFocus(input);
 });
@@ -571,6 +598,7 @@ document.addEventListener("click", (event) => {
   if (action === "reload-settings") {
     draft.strategy = {};
     draft.limits = {};
+    draft.recommendation = {};
     focusState = null;
     render();
   }

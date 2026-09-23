@@ -5,10 +5,16 @@ import { KisPaperAutoTrader } from "../domain/kisPaperAutoTrader.js";
 const COST = { buyCommissionBps: 1.40527, sellCommissionBps: 1.40527, sellTaxBps: 20 };
 const BASE = 1_789_000_000_000; // 임의 기준 시각
 
+function fakeJournal() {
+  const events = [];
+  return { events, append(type, payload, timestamp) { events.push({ type, payload, timestamp }); } };
+}
+
 function fakeService(overrides = {}) {
   const submitted = [];
   return {
     submitted,
+    journal: overrides.journal ?? fakeJournal(),
     status: () => ({
       killSwitch: false,
       manualKillSwitch: false,
@@ -22,6 +28,19 @@ function fakeService(overrides = {}) {
       if (overrides.throwOnSubmit) throw new Error("네트워크 실패");
       return { clientOrderId: input.clientOrderId, status: overrides.submitStatus ?? "ACCEPTED" };
     },
+  };
+}
+
+function fakeRealtimeClient() {
+  const listeners = {};
+  const watchCalls = [];
+  return {
+    listeners,
+    watchCalls,
+    on(event, listener) { listeners[event] = listener; },
+    off(event, listener) { if (listeners[event] === listener) delete listeners[event]; },
+    watchSymbols(items) { watchCalls.push([...items]); },
+    emit(event, payload) { listeners[event]?.(payload); },
   };
 }
 
@@ -231,6 +250,24 @@ test("대사 불일치와 킬 스위치에서도 멈춘다", async () => {
     assert.equal(decision.action, "HALTED", `${label}에서 멈춰야 한다`);
     assert.equal(service.submitted.length, 0);
   }
+});
+
+// 2026-09-23: halt는 메모리(this.halt)에만 있어서, 화면에 "멈춤"이 떴다가
+// 사라지면 실제로 멈췄다 풀린 건지 화면이 잘못 보여준 건지 나중에 확인할
+// 방법이 없었다. 걸릴 때·풀릴 때를 전부 저널에 남기는지 확인한다.
+test("멈춤이 걸리고 풀리는 매 순간이 실행 저널에 남는다", async () => {
+  const service = fakeService({ status: { manualKillSwitch: true } });
+  const auto = trader({}, service);
+
+  await auto.evaluate({ candidates: [candidate()], balance: balance() });
+  const halted = service.journal.events.find((e) => e.type === "AUTO_TRADER_HALTED");
+  assert.ok(halted, "멈춘 순간이 저널에 남아야 한다");
+  assert.equal(halted.payload.code, "KILL_SWITCH");
+
+  auto.clearHalt();
+  const cleared = service.journal.events.find((e) => e.type === "AUTO_TRADER_HALT_CLEARED");
+  assert.ok(cleared, "풀린 순간도 저널에 남아야 한다");
+  assert.equal(cleared.payload.code, "KILL_SWITCH");
 });
 
 // 2026-09-23: 대사가 PENDING(방금 낸 주문이 아직 KIS에 반영되는 중, 최대 180초 —
@@ -486,4 +523,245 @@ test("잔고 반영이 끝내 안 되면 유예시간 뒤 정상 흐름으로 �
   const after = await auto.evaluate({ candidates: [fresh], balance: balance() });
   assert.equal(after.action, "ORDER", "유예시간이 지나면 다시 진입할 수 있어야 한다");
   assert.equal(auto.status().pendingOrders[0]?.symbol, "005930");
+});
+
+// 2026-09-23: "잔고에서 처음 확인한 시각"이 아니라 "실제 매수 제출 시각"부터
+// 30분(maxHoldingMs)을 세야 한다는 지적에 따른 회귀 테스트. KIS 잔고 반영이
+// 늦어서 매수 제출과 잔고에 처음 보이는 시점 사이에 시간차가 있어도, 보유시간은
+// 매수 제출 시각부터 계산돼야 한다.
+test("최대 보유시간은 잔고 반영이 늦어도 실제 매수 제출 시각부터 센다", async () => {
+  const service = fakeService();
+  let tick = BASE;
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 600_000, maxHoldingMs: 300_000, forcedExitTime: null },
+    costModel: COST,
+    now: () => tick,
+  });
+
+  const submitted = await auto.evaluate({ candidates: [candidate()], balance: balance() });
+  assert.equal(submitted.action, "ORDER");
+
+  // KIS 잔고 반영이 90초 늦었다 — 그 사이 평가에서는 잔고가 계속 비어 있다가,
+  // 90초 뒤에야 balance에 포지션이 처음 나타난다고 가정한다.
+  tick = BASE + 90_000;
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 70_050 }];
+  const firstSeen = await auto.evaluate({ candidates: [], balance: balance(1_000_000, held) });
+  assert.equal(firstSeen.action, "HOLD", "아직 최대 보유시간(5분) 전이라 유지해야 한다");
+
+  // 매수 제출(BASE) 기준으로는 5분 40초가 지났다 — 잔고에 처음 보인 시각(BASE+90s)
+  // 기준으로는 아직 4분 10초라 옛날 방식이면 여기서 안 팔렸어야 한다.
+  tick = BASE + 340_000;
+  const afterFiveMinutes = await auto.evaluate({ candidates: [], balance: balance(1_000_000, held) });
+  assert.equal(afterFiveMinutes.action, "ORDER");
+  assert.equal(afterFiveMinutes.reason, "MAX_HOLDING_TIME");
+  assert.equal(afterFiveMinutes.diagnostics.heldMs, 340_000, "매수 제출 시각(BASE)부터 센 값이어야 한다");
+});
+
+// 2026-09-23: 356680(엑스게이트) 실사고 — 매도 제출(14:14:15) 뒤 잔고 반영 전
+// 다음 5초 평가(14:14:39 이전)가 같은 손절 조건을 또 보고 매도를 또 내
+// "모의투자 잔고내역이..."로 REJECTED됐다. 잔고 반영 전까지는 같은 종목에
+// 또 매도를 내면 안 된다.
+test("이미 매도 제출한 종목은 잔고 반영 전까지 다시 매도하지 않는다", async () => {
+  const service = fakeService();
+  const auto = trader({ maxConcurrentPositions: 5, stopLossBps: 100, forcedExitTime: null }, service);
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 69_000 }];
+
+  const first = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(first.action, "ORDER");
+  assert.equal(first.side, "SELL");
+  assert.equal(service.submitted.length, 1);
+
+  // 잔고 반영이 아직 안 끝나 balance가 그대로인 채 다음 주기가 돈다(실사고 재현).
+  const second = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(second.action, "HOLD");
+  assert.equal(second.skipped, "EXIT_IN_FLIGHT");
+  assert.equal(service.submitted.length, 1, "잔고 반영 전에는 같은 종목을 또 팔면 안 된다");
+});
+
+test("매도가 REJECTED되면 즉시 풀려 다음 주기에 다시 시도할 수 있다", async () => {
+  const service = fakeService({ submitStatus: "REJECTED" });
+  const auto = trader({ maxConcurrentPositions: 5, stopLossBps: 100, forcedExitTime: null }, service);
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 69_000 }];
+
+  const first = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(first.status, "REJECTED");
+
+  const second = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(second.action, "ORDER", "REJECTED 뒤에는 다시 매도를 시도해야 한다");
+  assert.equal(service.submitted.length, 2);
+});
+
+test("전송 자체가 실패해도 매도-진행중 표시가 풀려 재시도할 수 있다", async () => {
+  const service = fakeService({ throwOnSubmit: true });
+  const auto = trader({ maxConcurrentPositions: 5, stopLossBps: 100, forcedExitTime: null }, service);
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 69_000 }];
+
+  const first = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(first.action, "ORDER_ERROR");
+
+  // 첫 실패로 이미 halt됐지만(ORDER_FAILED), 그 뒤로도 보호청산 재시도 자체는
+  // 계속 나가야 한다 — halt는 신규 진입만 막는다. 이미 halt된 뒤의 청산 실패는
+  // halt의 결과이므로 원인을 덮어쓰지 않고 EXIT_BLOCKED로 구분해 보고한다.
+  const second = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(second.action, "EXIT_BLOCKED");
+  assert.equal(service.submitted.length, 2, "재시도 제출 자체는 나가야 한다");
+});
+
+// 2026-09-23: "고점에서 팔지를 않는다"는 지적에 따라, 5초 잔고 폴링만으로는 폴링
+// 사이의 고점·반전을 놓칠 수 있어 실시간 체결 틱으로도 보호청산을 재평가하게
+// 했다("응 적용해"로 승인).
+test("실시간 체결 틱이 폴링 주기 사이에서도 트레일링 스톱을 즉시 발동시킨다", async () => {
+  const service = fakeService();
+  const realtime = fakeRealtimeClient();
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: {
+      enabled: true, trailingStopBps: 35, trailingConfirmMs: 0, forcedExitTime: null,
+      stopLossBps: null, takeProfitBps: null, maxHoldingMs: null,
+    },
+    costModel: COST,
+    realtimeClient: realtime,
+    now: () => BASE,
+  });
+
+  // 폴링 한 번으로 고점(진입가 대비 약 43bp — armed 문턱 35bp를 넘음)을 만든다.
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 70_300 }];
+  await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(service.submitted.length, 0, "고점 경신 중에는 팔면 안 된다");
+
+  // 다음 폴링(5초 뒤)을 기다리지 않고, 실시간 틱으로 신고점 뒤 첫 하락을 알린다.
+  realtime.emit("marketData", { symbol: "005930", trade: { currentPrice: 70_299 } });
+
+  assert.equal(service.submitted.length, 1, "실시간 틱만으로 즉시 매도가 나가야 한다");
+  assert.equal(service.submitted[0].symbol, "005930");
+  // submit()은 비동기라 이 시점엔 orderService.submitOrder까지만 동기로 끝나 있다
+  // (실제 제출 여부는 이미 위에서 확인됨) — reason은 제출된 주문 자체에 실려 있다.
+  assert.equal(service.submitted[0].reason, "TRAILING_STOP");
+});
+
+test("보유 중이 아닌 종목의 틱이나 가격 없는 틱은 무시한다", async () => {
+  const service = fakeService();
+  const realtime = fakeRealtimeClient();
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: { enabled: true, trailingStopBps: 1, trailingConfirmMs: 0 },
+    costModel: COST,
+    realtimeClient: realtime,
+    now: () => BASE,
+  });
+
+  realtime.emit("marketData", { symbol: "005930", trade: { currentPrice: 70_000 } });
+  assert.equal(service.submitted.length, 0, "추적 중인 보유가 없으면 아무 일도 없어야 한다");
+
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 70_100 }];
+  await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+
+  realtime.emit("marketData", { symbol: "005930", trade: { currentPrice: null } });
+  realtime.emit("marketData", { symbol: "000660", trade: { currentPrice: 50_000 } });
+  assert.equal(service.submitted.length, 0, "가격 없는 틱·다른 종목 틱은 무시해야 한다");
+});
+
+test("보유 종목이 바뀌면 실시간 구독 대상도 함께 갱신된다", async () => {
+  const service = fakeService();
+  const realtime = fakeRealtimeClient();
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: { enabled: true, maxConcurrentPositions: 5 },
+    costModel: COST,
+    realtimeClient: realtime,
+    now: () => BASE,
+  });
+
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 70_050 }];
+  await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.deepEqual(realtime.watchCalls.at(-1), ["005930"]);
+
+  // 청산돼 더 이상 보유가 아니면 구독 목록에서도 빠져야 한다.
+  await auto.evaluate({ candidates: [], balance: balance(10_000_000, []) });
+  assert.deepEqual(realtime.watchCalls.at(-1), []);
+});
+
+test("실시간 client가 있으면 marketData를 구독하고 stop()에서 해지한다", () => {
+  const service = fakeService();
+  const realtime = fakeRealtimeClient();
+  const auto = new KisPaperAutoTrader({
+    orderService: service, costModel: COST, realtimeClient: realtime, now: () => BASE,
+  });
+  assert.equal(typeof realtime.listeners.marketData, "function");
+  auto.stop();
+  assert.equal(realtime.listeners.marketData, undefined);
+});
+
+// 2026-09-23: 실측 21건을 대조해보니 변동성 큰 한 종목(072950)에 재진입이 몰려
+// 손실이 반복 누적됐다 — 승패 무관, 청산된 종목은 같은 거래일에는 다시 사지 않는다.
+test("청산된 종목은 같은 날 다시 매수 후보에서 제외된다", async () => {
+  const service = fakeService();
+  const auto = trader(
+    { maxConcurrentPositions: 5, stopLossBps: 100, forcedExitTime: null, cooldownMs: 0 },
+    service,
+  );
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 69_000 }];
+
+  const sell = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(sell.action, "ORDER");
+  assert.equal(sell.side, "SELL");
+  assert.equal(sell.status, "ACCEPTED");
+
+  // 잔고 반영 후(더 이상 보유 없음) 같은 종목 후보가 다시 와도 재진입하면 안 된다.
+  const again = await auto.evaluate({ candidates: [candidate()], balance: balance() });
+  assert.equal(again.action, "SKIP");
+  assert.equal(again.reason, "NO_ELIGIBLE_CANDIDATE");
+  assert.equal(again.evaluated[0].reason, "EXITED_TODAY");
+  assert.equal(service.submitted.length, 1, "당일 재진입 금지 종목은 다시 매수하면 안 된다");
+});
+
+test("REJECTED된 매도는 당일 재진입 금지 기록을 남기지 않는다", async () => {
+  const service = fakeService({ submitStatus: "REJECTED" });
+  const auto = trader(
+    { maxConcurrentPositions: 5, stopLossBps: 100, forcedExitTime: null, cooldownMs: 0 },
+    service,
+  );
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 69_000 }];
+
+  const rejected = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(rejected.status, "REJECTED");
+
+  const again = await auto.evaluate({ candidates: [candidate()], balance: balance() });
+  assert.equal(again.action, "ORDER", "REJECTED는 당일 재진입을 막으면 안 된다");
+  assert.equal(again.side, "BUY");
+});
+
+test("날짜가 바뀌면(다음 거래일) 같은 종목 재진입이 다시 허용된다", async () => {
+  const service = fakeService();
+  let tick = BASE;
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: {
+      enabled: true, cooldownMs: 0, settlementGraceMs: 0, stopLossBps: 100, forcedExitTime: null,
+      maxConcurrentPositions: 5,
+    },
+    costModel: COST,
+    now: () => tick,
+  });
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 69_000 }];
+
+  const sell = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(sell.status, "ACCEPTED");
+
+  const sameDay = await auto.evaluate({ candidates: [candidate()], balance: balance() });
+  assert.equal(sameDay.evaluated?.[0]?.reason, "EXITED_TODAY");
+
+  // 다음 거래일(KST 자정 경계를 넘김)로 넘어가면 다시 허용된다. 호가 시각도
+  // 같이 옮겨줘야 한다 — 안 옮기면 24시간 묵은 호가로 보여 STALE_QUOTE로
+  // 막히는데, 그건 이 테스트가 확인하려는 것(당일 재진입 금지 해제)과 별개다.
+  tick = BASE + 24 * 60 * 60 * 1_000;
+  const nextDay = await auto.evaluate({
+    candidates: [candidate({
+      realtime: { state: "ENTRY_READY", latestAt: tick, metrics: { currentPrice: 70_000, spreadBps: 14 } },
+    })],
+    balance: balance(),
+  });
+  assert.equal(nextDay.action, "ORDER");
+  assert.equal(nextDay.side, "BUY");
 });

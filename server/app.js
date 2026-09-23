@@ -6,7 +6,7 @@ import { ExecutionJournal } from "./domain/executionJournal.js";
 import { InstrumentCatalog } from "./domain/instrumentCatalog.js";
 import { KisMainWorkspace } from "./domain/kisMainWorkspace.js";
 import { RecommendationScanner } from "./domain/recommendationScanner.js";
-import { loadRecommendationSettings } from "./domain/recommendationSettings.js";
+import { loadRecommendationSettings, publicRecommendationSettings } from "./domain/recommendationSettings.js";
 import { createRealtimeResearchJournal } from "./domain/realtimeResearchJournal.js";
 import { MarketRuntime } from "./domain/runtime.js";
 import { loadPaperCostModel } from "./domain/paperTrader.js";
@@ -142,6 +142,13 @@ const mainRealtimeClient = realtimeCoordinator?.createView(
   "main-workspace",
   { priority: 100 },
 ) ?? null;
+// 자동매매가 실제로 들고 있는 포지션의 고점·반전은 추천 랭킹(우선순위 10)보다
+// 먼저 지켜야 한다 — 랭킹 상위에서 밀려나도 보유 중인 동안은 구독이 유지돼야
+// 실시간 트레일링 스톱(2026-09-23)이 계속 작동한다.
+const heldPositionsRealtimeClient = realtimeCoordinator?.createView(
+  "held-positions",
+  { priority: 50 },
+) ?? null;
 
 const realtimeResearchJournal = createRealtimeResearchJournal({
   dataDir,
@@ -233,6 +240,9 @@ const paperAutoTradingConfigStore = new PaperAutoTradingConfigStore(
   join(dataDir, "paper-auto-trading-config.json"),
 );
 const persistedPaperAutoTradingConfig = paperAutoTradingConfigStore.load();
+if (persistedPaperAutoTradingConfig?.recommendationSettings) {
+  recommendationScanner.updateSettings(persistedPaperAutoTradingConfig.recommendationSettings);
+}
 
 const kisPaperOrderService = kisPaperClient
   ? new KisPaperOrderService({
@@ -261,6 +271,7 @@ const kisPaperAutoTrader = kisPaperOrderService
     orderService: kisPaperOrderService,
     settings: autoTradingSettings,
     costModel: autoTradingCostModel,
+    realtimeClient: heldPositionsRealtimeClient,
   })
   : null;
 let autoTradingTimer = null;
@@ -665,6 +676,29 @@ const server = createServer(async (request, response) => {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       return json(response, 200, await recommendationScanner.refresh({ force: true }));
     }
+    // 화면 설정 폼이 후보 목록 전체(무거움)를 안 받고 설정값만 가볍게 읽도록 한다.
+    if (request.method === "GET" && url.pathname === "/api/recommendations/settings") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      return json(response, 200, publicRecommendationSettings(recommendationScanner.settings));
+    }
+    // 실시간 확인 문턱(예: 체결강도)을 화면에서 조절할 수 있게 한다(2026-09-23).
+    if (request.method === "POST" && url.pathname === "/api/recommendations/settings") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const body = await readJson(request);
+      let next;
+      try {
+        next = recommendationScanner.updateSettings(body);
+      } catch (error) {
+        return json(response, error?.statusCode ?? 400, {
+          error: error instanceof Error ? error.message : String(error),
+          code: error?.code ?? "INVALID_RECOMMENDATION_SETTINGS",
+        });
+      }
+      // 저장은 원본(계산된 costModel이 안 섞인) 설정만 한다 — 다음 기동 때 그대로
+      // 다시 normalizeRecommendationSettings에 넣을 수 있어야 하기 때문이다.
+      paperAutoTradingConfigStore.save({ recommendationSettings: recommendationScanner.settings });
+      return json(response, 200, next);
+    }
     if (request.method === "GET" && url.pathname === "/api/recommendations/research/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       return json(response, 200, realtimeResearchJournal.status());
@@ -1063,6 +1097,7 @@ function shutdown() {
   if (autoTradingTimer) clearInterval(autoTradingTimer);
   mainWorkspace.stop();
   recommendationScanner.stop();
+  kisPaperAutoTrader?.stop();
   realtimeCoordinator?.stop();
   runtime.stop();
   for (const client of eventClients) client.end();

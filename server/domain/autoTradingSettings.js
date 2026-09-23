@@ -24,7 +24,22 @@ export const DEFAULT_AUTO_TRADING_SETTINGS = Object.freeze({
   // 보호 청산. null이면 해당 청산을 쓰지 않는다.
   stopLossBps: 100,
   takeProfitBps: 150,
-  trailingStopBps: 70,
+  // "고점 대비 X% 빠지면 판다"가 아니라 "진입가 대비 X% 이상 오른 적이 있으면
+  // (armed) 그 뒤 신고점을 못 찍고 조금이라도 빠지는 순간 즉시 판다"는 뜻이다
+  // (strategyPolicy.js, 2026-09-23 변경). 그래서 이 숫자는 "얼마나 밀리면
+  // 파는가"가 아니라 "얼마나 올라야 이 보호를 켤 것인가"다. 처음엔 왕복비용
+  // (약 23bp) 대비 여유만 두고 35bp로 뒀는데, 실측 21건(2026-09-23)을 대조해보니
+  // TRAILING_STOP 청산이 평균 순손실(-7.1bp 총수익 기준)이었고, 보호청산 개입
+  // 없이 최대보유시간까지 그냥 들고 간 MAX_HOLDING_TIME만 유일하게 순이익
+  // (+43.9bp)이었다 — armed 문턱이 너무 낮아 이익을 조기에 잘라내고 있었다는
+  // 뜻이다. 손절폭(stopLossBps)과 같은 수준으로 올려 "이익 거래"와 "손실 거래"의
+  // 크기를 맞춘다(armed 이후 즉시매도 메커니즘 자체는 그대로).
+  trailingStopBps: 100,
+  // armed된 뒤 고점 밑으로 내려온 상태가 이 시간만큼 유지돼야 진짜 하락으로
+  // 인정한다(0=유예 없이 즉시). 실시간 틱으로 더 자주 확인하게 되면서
+  // (kisPaperAutoTrader.js의 realtimeClient 연동, 2026-09-23) 찰나의 호가
+  // 흔들림 하나에 바로 팔리는 걸 막는 debounce다.
+  trailingConfirmMs: 1_500,
   maxHoldingMs: 1_800_000,
   // 장 종료 전 강제 청산 시각(KST, HH:MM). null이면 강제 청산하지 않는다.
   forcedExitTime: "15:15",
@@ -62,6 +77,7 @@ const EDITABLE_KEYS = Object.freeze([
   "stopLossBps",
   "takeProfitBps",
   "trailingStopBps",
+  "trailingConfirmMs",
   "maxHoldingMs",
   "forcedExitTime",
   "staleQuoteMs",
@@ -95,6 +111,7 @@ export function loadAutoTradingSettings(env = process.env) {
     stopLossBps: env.PULSEHFT_AUTO_TRADING_STOP_LOSS_BPS,
     takeProfitBps: env.PULSEHFT_AUTO_TRADING_TAKE_PROFIT_BPS,
     trailingStopBps: env.PULSEHFT_AUTO_TRADING_TRAILING_STOP_BPS,
+    trailingConfirmMs: env.PULSEHFT_AUTO_TRADING_TRAILING_CONFIRM_MS,
     maxHoldingMs: env.PULSEHFT_AUTO_TRADING_MAX_HOLDING_MS,
     forcedExitTime: env.PULSEHFT_AUTO_TRADING_FORCED_EXIT_TIME,
     staleQuoteMs: env.PULSEHFT_AUTO_TRADING_STALE_QUOTE_MS,
@@ -134,6 +151,7 @@ export function normalizeAutoTradingSettings(input = {}) {
     stopLossBps: nullableNumberInRange(merged.stopLossBps, 1, 10_000, "stopLossBps"),
     takeProfitBps: nullableNumberInRange(merged.takeProfitBps, 1, 10_000, "takeProfitBps"),
     trailingStopBps: nullableNumberInRange(merged.trailingStopBps, 1, 10_000, "trailingStopBps"),
+    trailingConfirmMs: integerInRange(merged.trailingConfirmMs, 0, 60_000, "trailingConfirmMs"),
     maxHoldingMs: nullableIntegerInRange(merged.maxHoldingMs, 1_000, 86_400_000, "maxHoldingMs"),
     forcedExitTime: forcedExitTimeValue(merged.forcedExitTime),
     staleQuoteMs: integerInRange(merged.staleQuoteMs, 100, 600_000, "staleQuoteMs"),

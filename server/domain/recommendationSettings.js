@@ -23,6 +23,12 @@ export const DEFAULT_RECOMMENDATION_SETTINGS = Object.freeze({
   maximumVwapExtensionBps: 500,
   maximumRecentRiseBps: 300,
   upperLimitProximityBps: 500,
+  // ENTRY_READY 판정의 실시간 체결강도 문턱(realtimeConfirmationEngine.js). 100은
+  // "매수 체결량이 매도 체결량과 같거나 더 많아야 함"이라 반전형 후보는 반등이
+  // 막 시작된 순간엔 거의 못 넘었다(2026-09-23, 호가 불균형은 여유 있게 통과하는데
+  // 체결강도만 못 넘어 8분간 20여 회 평가 전부 적격 후보 0건). 화면에서 조절할 수
+  // 있도록 설정으로 뺀다.
+  minimumExecutionStrength: 80,
 });
 
 export class RecommendationSettingsError extends Error {
@@ -50,6 +56,7 @@ export function loadRecommendationSettings(env = process.env) {
     maximumVwapExtensionBps: env.PULSEHFT_RECOMMENDATION_MAX_VWAP_EXTENSION_BPS,
     maximumRecentRiseBps: env.PULSEHFT_RECOMMENDATION_MAX_RECENT_RISE_BPS,
     upperLimitProximityBps: env.PULSEHFT_RECOMMENDATION_UPPER_LIMIT_PROXIMITY_BPS,
+    minimumExecutionStrength: env.PULSEHFT_RECOMMENDATION_MIN_EXECUTION_STRENGTH,
   });
 }
 
@@ -82,6 +89,7 @@ export function normalizeRecommendationSettings(input = {}) {
     maximumVwapExtensionBps: numberInRange(merged.maximumVwapExtensionBps, 50, 3_000, "VWAP 상단 이격 차단 기준"),
     maximumRecentRiseBps: numberInRange(merged.maximumRecentRiseBps, 20, 2_000, "최근 급등 차단 기준"),
     upperLimitProximityBps: numberInRange(merged.upperLimitProximityBps, 10, 3_000, "상한가 근접 차단 기준"),
+    minimumExecutionStrength: numberInRange(merged.minimumExecutionStrength, 0, 500, "체결강도 문턱"),
   };
   if (normalized.maxEnriched > normalized.maxUniverse) {
     throw new RecommendationSettingsError("정밀 분석 후보 수는 1차 후보 수보다 클 수 없습니다.");
