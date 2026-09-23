@@ -16,6 +16,8 @@ const ORDER_BOOK = Object.freeze({
   path: "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
   trId: "FHKST01010200",
 });
+// 당일 분봉 전용 시장구분. 통합("UN")은 NXT 미상장 종목에서 빈 응답을 준다.
+const MINUTE_BAR_MARKET = "J";
 const MINUTE_BARS = Object.freeze({
   path: "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
   trId: "FHKST03010200",
@@ -191,10 +193,13 @@ export class KisRecommendationDataClient {
     };
   }
 
-  async getMinuteBars({ symbol, market = "UN", hour = currentKoreaTime() }) {
+  // 당일 분봉은 반드시 "J"(주식·ETF·ETN)로 조회한다. "UN"(KRX+NXT 통합)으로 조회하면
+  // NXT 미상장 종목이 30행 전부 O=H=L=C=V=0인 빈 응답으로 돌아와, 평가 단계에서
+  // "분봉 8개 미만"으로 조용히 차단된다(2026-09-10 확인).
+  async getMinuteBars({ symbol, market = MINUTE_BAR_MARKET, hour = currentKoreaTime() }) {
     const normalizedSymbol = normalizeSymbol(symbol);
     const payload = await this.getJson(MINUTE_BARS, {
-      FID_COND_MRKT_DIV_CODE: normalizeMarket(market),
+      FID_COND_MRKT_DIV_CODE: MINUTE_BAR_MARKET,
       FID_INPUT_ISCD: normalizedSymbol,
       FID_INPUT_HOUR_1: normalizeHour(hour),
       FID_PW_DATA_INCU_YN: "Y",
@@ -344,6 +349,7 @@ function addRows(target, rows, rankField) {
       accumulatedVolume: 0,
       accumulatedTradingValue: 0,
       executionStrength: null,
+      volumeTurnoverRate: null,
     };
     target.set(normalized.symbol, {
       ...previous,
@@ -362,7 +368,12 @@ function normalizeRankingRow(row) {
     changePercent: firstNumber(row.prdy_ctrt, row.prdy_vrss_rt, row.rsfl_rate),
     accumulatedVolume: firstNumber(row.acml_vol, row.acml_tr_qty) ?? 0,
     accumulatedTradingValue: firstNumber(row.acml_tr_pbmn, row.acml_tr_amt) ?? 0,
-    executionStrength: firstNumber(row.tday_rltv, row.vol_tnrt, row.cttr),
+    // cttr(체결강도)와 vol_tnrt(거래량회전율)는 완전히 다른 지표다. 예전에는
+    // firstNumber(tday_rltv, vol_tnrt, cttr)로 묶어 읽어서, 거래량순위에서 온 종목은
+    // 회전율이 체결강도 자리에 들어갔다(삼성전자 0.06 등). 회전율은 별도 필드로 분리하고
+    // 체결강도는 진짜 체결강도 필드에서만 읽는다.
+    executionStrength: firstNumber(row.cttr, row.tday_rltv),
+    volumeTurnoverRate: firstNumber(row.vol_tnrt),
   };
 }
 

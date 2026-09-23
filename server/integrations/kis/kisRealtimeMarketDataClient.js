@@ -4,6 +4,12 @@ import { KIS_MODE_PROD_READ_ONLY } from "./kisConfig.js";
 const APPROVAL_PATH = "/oauth2/Approval";
 const PROD_WEBSOCKET_URL = "ws://ops.koreainvestment.com:21000/tryitout";
 const APPROVAL_MAX_AGE_MS = 23 * 60 * 60 * 1_000;
+// KIS는 App Key당 WebSocket 세션을 하나만 허용한다. 다른 세션이 점유 중이면
+// 핸드셰이크는 통과시키고 구독 응답에서 이 메시지로 거절한다. 재시도로는 절대 풀리지 않는다.
+const APPKEY_IN_USE_PATTERN = /ALREADY\s+IN\s+USE/i;
+// KIS WebSocket header.tr_type — 등록과 해지만 유효하다.
+const KIS_TR_TYPE_SUBSCRIBE = "1";
+const KIS_TR_TYPE_UNSUBSCRIBE = "2";
 
 export const KIS_REALTIME_TR = Object.freeze({
   KRX: Object.freeze({ orderBook: "H0STASP0", trade: "H0STCNT0" }),
@@ -66,6 +72,7 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
     reconnectMaxMs = 30_000,
     maxSymbols = 8,
     websocketUrl = PROD_WEBSOCKET_URL,
+    errorRepeatIntervalMs = 60_000,
   } = {}) {
     super();
     if (config?.mode !== KIS_MODE_PROD_READ_ONLY || !config.enabled) {
@@ -87,6 +94,7 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
     this.staleAfterMs = positiveInteger(staleAfterMs, "staleAfterMs");
     this.reconnectBaseMs = positiveInteger(reconnectBaseMs, "reconnectBaseMs");
     this.reconnectMaxMs = positiveInteger(reconnectMaxMs, "reconnectMaxMs");
+    this.errorRepeatIntervalMs = positiveInteger(errorRepeatIntervalMs, "errorRepeatIntervalMs");
     this.maxSymbols = maxSymbols;
     this.websocketUrl = normalizeWebSocketUrl(websocketUrl);
     this.state = "IDLE";
@@ -95,6 +103,11 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
     this.connectPromise = null;
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
+    // 구독 응답이 성공하기 전까지는 "연결됨"으로 보지 않는다(백오프 리셋 기준).
+    this.subscriptionEstablished = false;
+    // 재시도로 풀 수 없는 차단 사유. 설정되면 재연결을 멈춘다.
+    this.blockedReason = null;
+    this.errorRepeat = null;
     this.approvalKey = null;
     this.approvalIssuedAt = null;
     this.approvalRequest = null;
@@ -127,6 +140,9 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
       lastMessageAt: this.lastMessageAt,
       freshestDataAgeMs: freshest > 0 ? Math.max(0, this.now() - freshest) : null,
       reconnectAttempt: this.reconnectAttempt,
+      subscriptionEstablished: this.subscriptionEstablished,
+      blocked: this.blockedReason !== null,
+      blockedReason: this.blockedReason ? { ...this.blockedReason } : null,
       lastError: this.lastError ? { ...this.lastError } : null,
       trIds: structuredClone(KIS_REALTIME_TR),
       automaticOrderConnected: false,
@@ -138,8 +154,14 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
     const previous = this.desired;
     this.desired = next;
     if (isOpen(this.socket)) {
-      for (const [key, item] of previous) if (!next.has(key)) this.sendVenueSubscriptions(item, "0");
-      for (const [key, item] of next) if (!previous.has(key)) this.sendVenueSubscriptions(item, "1");
+      // KIS 규격: tr_type "1" = 등록, "2" = 해지. "0"은 유효하지 않아
+      // "JSON PARSING ERROR : invalid tr_type"으로 거절되고 구독이 해제되지 않는다.
+      for (const [key, item] of previous) {
+        if (!next.has(key)) this.sendVenueSubscriptions(item, KIS_TR_TYPE_UNSUBSCRIBE);
+      }
+      for (const [key, item] of next) {
+        if (!previous.has(key)) this.sendVenueSubscriptions(item, KIS_TR_TYPE_SUBSCRIBE);
+      }
     }
     if (!this.started) this.start();
     else void this.ensureConnected();
@@ -149,6 +171,8 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
   start() {
     if (this.started) return this.status();
     this.started = true;
+    this.blockedReason = null;
+    this.reconnectAttempt = 0;
     if (this.state === "STOPPED") this.state = "IDLE";
     void this.ensureConnected();
     return this.status();
@@ -156,6 +180,8 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
 
   stop() {
     this.started = false;
+    this.blockedReason = null;
+    this.subscriptionEstablished = false;
     if (this.reconnectTimer) this.clearTimeoutImpl(this.reconnectTimer);
     this.reconnectTimer = null;
     const socket = this.socket;
@@ -192,7 +218,7 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
   }
 
   async ensureConnected() {
-    if (!this.started || this.desired.size === 0 || isOpen(this.socket)) return;
+    if (!this.started || this.desired.size === 0 || isOpen(this.socket) || this.blockedReason) return;
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = this.connect().finally(() => { this.connectPromise = null; });
     return this.connectPromise;
@@ -234,11 +260,14 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
       }, this.timeoutMs);
       addSocketListener(socket, "open", () => {
         if (socket !== this.socket) return finish();
-        this.reconnectAttempt = 0;
+        // 백오프는 소켓 open이 아니라 구독 확립(rt_cd === "0") 시점에 리셋한다.
+        // KIS는 핸드셰이크를 통과시킨 뒤 구독 응답에서 거절하므로, open에서 리셋하면
+        // 거절 루프가 최소 지연으로 무한 반복된다(2026-08-04 사고: 225분간 13,057회).
+        this.subscriptionEstablished = false;
         this.lastConnectedAt = this.now();
         this.lastError = null;
         this.setState("CONNECTED");
-        for (const item of this.desired.values()) this.sendVenueSubscriptions(item, "1", approvalKey);
+        for (const item of this.desired.values()) this.sendVenueSubscriptions(item, KIS_TR_TYPE_SUBSCRIBE, approvalKey);
         finish();
       });
       addSocketListener(socket, "message", (event) => {
@@ -326,7 +355,7 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
         body: { input: { tr_id: trId, tr_key: symbol } },
       }));
       const key = `${trId}:${symbol}`;
-      if (trType === "1") this.activeSubscriptions.add(key);
+      if (trType === KIS_TR_TYPE_SUBSCRIBE) this.activeSubscriptions.add(key);
       else this.activeSubscriptions.delete(key);
     } catch (error) {
       this.recordError(error, "KIS_REALTIME_SUBSCRIPTION_SEND_FAILED");
@@ -360,12 +389,62 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
       return;
     }
     const rtCode = text(payload?.body?.rt_cd);
-    if (rtCode && rtCode !== "0") {
-      this.recordError(
-        new Error(redact(firstText(payload?.body?.msg1, payload?.body?.msg_cd, "WebSocket 구독 거절"), this.config)),
-        "KIS_REALTIME_SUBSCRIPTION_REJECTED",
-      );
+    if (!rtCode) return;
+    if (rtCode === "0") {
+      // 첫 구독 성공이 곧 실제 연결 확립이다. 이 시점에만 백오프를 리셋한다.
+      if (!this.subscriptionEstablished) {
+        this.subscriptionEstablished = true;
+        this.reconnectAttempt = 0;
+        this.setState("CONNECTED");
+      }
+      return;
     }
+    const message = redact(
+      firstText(payload?.body?.msg1, payload?.body?.msg_cd, "WebSocket 구독 거절"),
+      this.config,
+    );
+    if (APPKEY_IN_USE_PATTERN.test(message)) {
+      this.blockForAppKeyInUse(message);
+      return;
+    }
+    this.recordError(new Error(message), "KIS_REALTIME_SUBSCRIPTION_REJECTED");
+  }
+
+  // 재시도로 풀리지 않는 거절이므로 재연결을 멈추고 원인을 상태로 노출한다.
+  // 무한 재시도는 저널을 폭주시키고(2026-08-04 120MB) 실제 원인을 가린다.
+  blockForAppKeyInUse(message) {
+    if (this.blockedReason) return;
+    this.blockedReason = {
+      code: "KIS_REALTIME_APPKEY_IN_USE",
+      message,
+      at: this.now(),
+    };
+    this.recordError(new Error(message), "KIS_REALTIME_APPKEY_IN_USE");
+    if (this.reconnectTimer) {
+      this.clearTimeoutImpl(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const socket = this.socket;
+    this.socket = null;
+    this.subscriptionEstablished = false;
+    this.activeSubscriptions.clear();
+    if (socket && (isOpen(socket) || isConnecting(socket))) {
+      try { socket.close(1000, "KIS App Key already in use"); } catch { /* no-op */ }
+    }
+    this.lastDisconnectedAt = this.now();
+    this.setState("BLOCKED");
+  }
+
+  // 점유 세션이 정리된 뒤 운영자가 재시도할 수 있게 한다.
+  clearBlock() {
+    if (!this.blockedReason) return this.status();
+    this.blockedReason = null;
+    this.reconnectAttempt = 0;
+    if (this.started) {
+      this.setState("IDLE");
+      void this.ensureConnected();
+    }
+    return this.status();
   }
 
   applyOrderBook(record, venue, trId) {
@@ -446,7 +525,7 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
   }
 
   scheduleReconnect() {
-    if (!this.started || this.desired.size === 0 || this.reconnectTimer) return;
+    if (!this.started || this.desired.size === 0 || this.reconnectTimer || this.blockedReason) return;
     this.reconnectAttempt += 1;
     const delay = Math.min(this.reconnectMaxMs, this.reconnectBaseMs * (2 ** Math.min(8, this.reconnectAttempt - 1)));
     this.reconnectTimer = this.setTimeoutImpl(() => {
@@ -466,8 +545,25 @@ export class KisRealtimeMarketDataClient extends EventEmitter {
     this.emit("status", this.status());
   }
 
+  // 같은 에러가 연속 반복되면 첫 건과 errorRepeatIntervalMs 간격의 요약만 내보낸다.
+  // 억제해도 lastError는 항상 최신이며 repeatCount로 실제 발생 횟수를 남긴다.
   recordError(error, code) {
-    this.lastError = { code: typeof error?.code === "string" ? error.code : code, message: redact(errorMessage(error), this.config), at: this.now() };
+    const resolvedCode = typeof error?.code === "string" ? error.code : code;
+    const message = redact(errorMessage(error), this.config);
+    const at = this.now();
+    const key = `${resolvedCode}::${message}`;
+    const repeat = this.errorRepeat && this.errorRepeat.key === key ? this.errorRepeat : null;
+    if (repeat) {
+      repeat.count += 1;
+      const due = at - repeat.lastEmittedAt >= this.errorRepeatIntervalMs;
+      this.lastError = { code: resolvedCode, message, at, repeatCount: repeat.count, suppressed: !due };
+      if (!due) return;
+      repeat.lastEmittedAt = at;
+      this.emit("errorState", { ...this.lastError });
+      return;
+    }
+    this.errorRepeat = { key, count: 1, lastEmittedAt: at };
+    this.lastError = { code: resolvedCode, message, at, repeatCount: 1, suppressed: false };
     this.emit("errorState", { ...this.lastError });
   }
 }

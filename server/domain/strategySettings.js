@@ -8,7 +8,13 @@ export const DEFAULT_STRATEGY_SETTINGS = Object.freeze({
   stopLossBps: null,
   takeProfitBps: null,
   trailingStopBps: null,
+  // 트레일링 스톱이 armed된 뒤 고점 밑으로 내려온 게 이 시간만큼 유지돼야 진짜
+  // 하락으로 인정한다(2026-09-23). 0이면 유예 없이 첫 틱에서 바로 판다. 실시간
+  // 틱(observeTick) 사용 시 찰나의 호가 흔들림에 과민반응하는 걸 막는 용도다.
+  trailingConfirmMs: 0,
   maxHoldingMs: null,
+  approvalMode: "AUTO",
+  approvalExpiryMs: 15_000,
 });
 
 const EDITABLE_KEYS = Object.freeze([
@@ -20,8 +26,13 @@ const EDITABLE_KEYS = Object.freeze([
   "stopLossBps",
   "takeProfitBps",
   "trailingStopBps",
+  "trailingConfirmMs",
   "maxHoldingMs",
+  "approvalMode",
+  "approvalExpiryMs",
 ]);
+
+const APPROVAL_MODES = new Set(["AUTO", "SEMI_AUTO"]);
 
 export class StrategySettingsError extends Error {
   constructor(message, code = "INVALID_STRATEGY_SETTINGS") {
@@ -107,10 +118,23 @@ export function normalizeStrategySettings(
       10_000,
       "트레일링 스톱",
     ),
+    trailingConfirmMs: integerInRange(
+      merged.trailingConfirmMs,
+      0,
+      60_000,
+      "트레일링 확인 시간",
+    ),
     maxHoldingMs: optionalSafeIntegerAtLeast(
       merged.maxHoldingMs,
       1_000,
       "최대 보유시간",
+    ),
+    approvalMode: approvalModeValue(merged.approvalMode),
+    approvalExpiryMs: integerInRange(
+      merged.approvalExpiryMs,
+      3_000,
+      300_000,
+      "승인 대기 만료시간",
     ),
   });
 }
@@ -131,6 +155,14 @@ function integerInRange(value, minimum, maximum, label) {
 function optionalIntegerInRange(value, minimum, maximum, label) {
   if (value === null) return null;
   return integerInRange(value, minimum, maximum, label);
+}
+
+function approvalModeValue(value) {
+  const text = String(value ?? "").trim().toUpperCase();
+  if (!APPROVAL_MODES.has(text)) {
+    throw new StrategySettingsError("승인 모드는 AUTO 또는 SEMI_AUTO여야 합니다.");
+  }
+  return text;
 }
 
 function optionalSafeIntegerAtLeast(value, minimum, label) {

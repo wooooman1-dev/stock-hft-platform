@@ -28,7 +28,7 @@
 - 시장가: 반대편 표시호가를 최우선 가격부터 소비하는 IOC
 - 지정가: 가격이 교차하면 체결하고 잔량은 GTC 대기
 - 전략 청산: 열린 주문을 먼저 취소한 뒤 전체 보유수량 시장가 IOC 제출
-- 수수료·세금, 실제 주문 큐 순서, 숨은 유동성은 아직 미반영
+- 수수료·세금·시장가 슬리피지는 환경변수로 구성 가능한 참고 모델로 반영(실제 주문 큐 순서, 숨은 유동성은 아직 미반영)
 
 세부 규칙은 `docs/PAPER_EXECUTION_MODEL.md`와 `docs/STRATEGY_SETTINGS.md`를 확인하세요.
 
@@ -83,13 +83,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\configure-kis-pape
 ```text
 GET  /api/kis/paper/status
 GET  /api/kis/paper/balance
+GET  /api/kis/paper/performance
+GET  /api/kis/paper/fill-comparison
 POST /api/kis/paper/orders
 POST /api/kis/paper/orders/revise
 POST /api/kis/paper/orders/cancel
 POST /api/kis/paper/kill-switch
 ```
 
-실전 주문은 존재하지 않으며 한국투자 모의주문은 자동전략에 연결되지 않습니다. 상세 설정, 요청 형식, 수동 검증 절차는 `docs/KIS_PAPER_TRADING.md`를 확인하세요.
+한국투자 모의주문은 자동전략에 연결되지 않습니다. 상세 설정, 요청 형식, 수동 검증 절차는 `docs/KIS_PAPER_TRADING.md`를 확인하세요.
+
+실전 주문은 사용자가 명시적으로 승인한 1주 카나리 단계로만 존재하며, `PULSEHFT_KIS_LIVE_MODE`와 `PULSEHFT_KIS_LIVE_ORDER_ENABLED`를 모두 켜야 동작하고 자동전략에는 연결되지 않습니다. 상세 내용은 `docs/KIS_LIVE_TRADING.md`를 확인하세요.
+
+```text
+GET  /api/kis/live/status
+GET  /api/kis/live/balance
+GET  /api/kis/live/performance
+POST /api/kis/live/orders
+POST /api/kis/live/orders/revise
+POST /api/kis/live/orders/cancel
+POST /api/kis/live/orders/resolve-unknown
+POST /api/kis/live/kill-switch
+```
+
+`GET /api/kis/paper/fill-comparison`은 주문 제출 시점에 캡처한 KIS 10단계 호가를 내부 `SIMULATION` 체결 엔진에 그대로 통과시켜 계산한 가상 체결가·체결량을, 이후 KIS가 보고한 실제 체결과 비교합니다. 예측이나 자동 판정이 아니라 두 체결모델의 차이를 확인하는 진단 전용 리포트입니다.
 
 ## 실행 저널
 
@@ -106,6 +123,12 @@ BROKER_RISK_BASELINE
 BROKER_ORDER_COMMAND
 BROKER_ORDER_RESULT
 BROKER_ORDER_UNKNOWN
+BROKER_ORDER_UNKNOWN_RESOLVED
+BROKER_RECONCILIATION_BASELINE
+BROKER_RECONCILIATION_MISMATCH
+BROKER_RECONCILIATION_ACKNOWLEDGED
+BROKER_EQUITY_SNAPSHOT
+BROKER_FILL_OBSERVED
 ```
 
 주문 명령 기록에 실패하면 증권사 요청을 보내지 않습니다. 증권사 요청 후 결과를 확정할 수 없거나 결과 저널 기록에 실패하면 `UNKNOWN_RESULT`와 킬 스위치로 전환하고 자동 재시도하지 않습니다. API 키·시크릿·토큰·계좌번호 원문은 저널과 API 응답에 기록하지 않습니다.
@@ -135,13 +158,28 @@ GET  /api/kis/status
 GET  /api/kis/quote?symbol=005930&market=UN
 GET  /api/kis/paper/status
 GET  /api/kis/paper/balance
+GET  /api/kis/paper/performance
+GET  /api/kis/paper/fill-comparison
 POST /api/kis/paper/orders
 POST /api/kis/paper/orders/revise
 POST /api/kis/paper/orders/cancel
 POST /api/kis/paper/kill-switch
+GET  /api/kis/live/status
+GET  /api/kis/live/balance
+GET  /api/kis/live/performance
+POST /api/kis/live/orders
+POST /api/kis/live/orders/revise
+POST /api/kis/live/orders/cancel
+POST /api/kis/live/orders/resolve-unknown
+POST /api/kis/live/kill-switch
 GET  /api/strategy/settings
 PUT  /api/strategy/settings
 POST /api/strategy/settings/reset
+GET  /api/strategy/settings/history
+POST /api/strategy/settings/restore/:version
+GET  /api/strategy/pending-approvals
+POST /api/strategy/pending-approvals/:id/approve
+POST /api/strategy/pending-approvals/:id/reject
 POST /api/paper/orders
 POST /api/paper/orders/:orderId/cancel
 POST /api/paper/reset

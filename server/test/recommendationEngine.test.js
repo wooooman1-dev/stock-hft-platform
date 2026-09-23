@@ -113,3 +113,65 @@ test("급등·VWAP 과이격·상한가 근접 후보는 감시 점수와 무관
 function bar(time, open, high, low, close, volume) {
   return { time, open, high, low, close, volume };
 }
+
+// 2026-09-10 확인: 통합 시장구분으로 분봉을 조회하면 30행이 전부 0으로 돌아왔는데,
+// 평가 단계가 이를 "분봉 8개 미만"으로 뭉개 데이터 결함이 전략 판정처럼 보였다.
+test("분봉 응답이 전부 빈 값이면 데이터 결함으로 구분해 표시한다", () => {
+  const zeroBars = Array.from({ length: 30 }, (_, i) => ({
+    time: String(90000 + i), open: 0, high: 0, low: 0, close: 0, volume: 0,
+  }));
+  const result = evaluateRecommendationCandidate({
+    symbol: "036930",
+    currentPrice: 202500,
+    accumulatedTradingValue: 76_995_647_250,
+    executionStrength: 118,
+    tickSize: 500,
+    orderBook: { bestBid: 202000, bestAsk: 202500, tickSize: 500 },
+    minuteBars: zeroBars,
+  });
+  const joined = result.blockReasons.join(" | ");
+  assert.match(joined, /분봉 응답 30건이 모두 빈 값/);
+  assert.doesNotMatch(joined, /분봉 데이터 8개 미만/, "빈 응답을 개수 부족으로 뭉개면 안 된다");
+});
+
+test("분봉이 실제로 모자란 경우는 종전대로 개수 부족으로 표시한다", () => {
+  const fewBars = Array.from({ length: 3 }, (_, i) => ({
+    time: String(90000 + i), open: 100, high: 101, low: 99, close: 100, volume: 10,
+  }));
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930",
+    currentPrice: 100,
+    accumulatedTradingValue: 76_995_647_250,
+    executionStrength: 118,
+    tickSize: 1,
+    orderBook: { bestBid: 99, bestAsk: 100, tickSize: 1 },
+    minuteBars: fewBars,
+  });
+  const joined = result.blockReasons.join(" | ");
+  assert.match(joined, /분봉 데이터 8개 미만/);
+  assert.doesNotMatch(joined, /모두 빈 값/);
+});
+
+// REST 체결강도는 순위 API마다 필드가 달라 결측될 수 있다. 그러나 ENTRY_READY의
+// 체결강도 게이트는 실시간 체결이 판정하므로, REST 결측만으로 차단해서는 안 된다.
+test("REST 체결강도 결측은 차단하지 않고 dataCompleteness로만 드러낸다", () => {
+  const bars = Array.from({ length: 20 }, (_, i) => ({
+    time: String(90000 + i), open: 100, high: 101, low: 99, close: 100, volume: 10,
+  }));
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930",
+    currentPrice: 100,
+    accumulatedTradingValue: 76_995_647_250,
+    executionStrength: null,
+    tickSize: 1,
+    orderBook: { bestBid: 99, bestAsk: 100, tickSize: 1 },
+    minuteBars: bars,
+  });
+  assert.equal(
+    result.blockReasons.some((reason) => reason.includes("체결강도")),
+    false,
+    "REST 체결강도 결측으로 차단하면 안 된다",
+  );
+  assert.equal(result.dataCompleteness.complete, 5);
+  assert.equal(result.dataCompleteness.total, 6);
+});

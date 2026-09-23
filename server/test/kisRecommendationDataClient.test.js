@@ -224,3 +224,65 @@ function response(payload, status = 200) {
     async json() { return payload; },
   };
 }
+
+// 2026-09-10 확인: "UN"(KRX+NXT 통합)으로 분봉을 조회하면 NXT 미상장 종목이
+// 30행 전부 O=H=L=C=V=0인 빈 응답으로 돌아온다. 분봉은 항상 "J"로 조회해야 한다.
+test("당일 분봉은 market 인자와 무관하게 항상 J로 조회한다", async () => {
+  const urls = [];
+  const fake = {
+    config: { baseUrl: "https://example.test", appKey: "app", appSecret: "secret" },
+    async getAccessToken() { return "token"; },
+    async request(url) {
+      urls.push(url);
+      return response({ rt_cd: "0", output1: {}, output2: [] });
+    },
+  };
+  const client = new KisRecommendationDataClient({ client: fake, now: () => 999 });
+
+  await client.getMinuteBars({ symbol: "036930", market: "UN", hour: "095500" });
+  await client.getMinuteBars({ symbol: "005930", market: "NX", hour: "095500" });
+
+  assert.equal(urls.length, 2);
+  for (const url of urls) {
+    assert.equal(
+      url.searchParams.get("FID_COND_MRKT_DIV_CODE"),
+      "J",
+      `분봉 조회는 J여야 한다 (받은 값: ${url.searchParams.get("FID_COND_MRKT_DIV_CODE")})`,
+    );
+  }
+});
+
+// 2026-09-10 확인: cttr(체결강도)와 vol_tnrt(거래량회전율)를 한 필드로 묶어 읽어
+// 거래량순위에서 온 종목은 회전율이 체결강도 자리에 들어갔다(삼성전자 0.06 등).
+test("거래량회전율을 체결강도로 읽지 않는다", () => {
+  const merged = mergeRankingRows({
+    volumeRows: [{
+      ...row("005930", "삼성전자", "265250", "-1.58", "7166481", "1919895699500"),
+      vol_tnrt: "0.06",
+    }],
+    fluctuationRows: [],
+    powerRows: [],
+    limit: 10,
+    fetchedAt: 1234,
+  });
+  const samsung = merged.find((item) => item.symbol === "005930");
+  assert.equal(samsung.executionStrength, null, "회전율만 있으면 체결강도는 비어야 한다");
+  assert.equal(samsung.volumeTurnoverRate, 0.06, "회전율은 별도 필드로 보존해야 한다");
+});
+
+test("체결강도는 cttr에서 읽는다", () => {
+  const merged = mergeRankingRows({
+    volumeRows: [{
+      ...row("000660", "SK하이닉스", "200000", "3.0", "500000", "100000000000"),
+      cttr: "142.7",
+      vol_tnrt: "1.9",
+    }],
+    fluctuationRows: [],
+    powerRows: [],
+    limit: 10,
+    fetchedAt: 1234,
+  });
+  const hynix = merged.find((item) => item.symbol === "000660");
+  assert.equal(hynix.executionStrength, 142.7);
+  assert.equal(hynix.volumeTurnoverRate, 1.9);
+});

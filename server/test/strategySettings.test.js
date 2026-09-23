@@ -115,3 +115,69 @@ test("reset writes the documented defaults", () => {
     assert.deepEqual(store.load(), DEFAULT_STRATEGY_SETTINGS);
   });
 });
+
+test("every save appends a version to the append-only history with the previous and next settings", () => {
+  withTemporaryDirectory((directory) => {
+    let clock = 1_000;
+    const store = new StrategySettingsStore(join(directory, "strategy-settings.json"), { now: () => clock });
+    assert.deepEqual(store.history(), []);
+
+    clock = 2_000;
+    store.save({ ...DEFAULT_STRATEGY_SETTINGS, orderQuantity: 20 });
+    clock = 3_000;
+    store.save({ ...DEFAULT_STRATEGY_SETTINGS, orderQuantity: 20, cooldownMs: 9_000 });
+
+    const history = store.history();
+    assert.equal(history.length, 2);
+    assert.equal(history[0].version, 1);
+    assert.equal(history[0].timestamp, 2_000);
+    assert.deepEqual(history[0].previous, DEFAULT_STRATEGY_SETTINGS);
+    assert.equal(history[0].next.orderQuantity, 20);
+    assert.equal(history[1].version, 2);
+    assert.equal(history[1].timestamp, 3_000);
+    assert.equal(history[1].previous.orderQuantity, 20);
+    assert.equal(history[1].next.cooldownMs, 9_000);
+  });
+});
+
+test("restoring a prior version re-applies it as a new version instead of rewriting history", () => {
+  withTemporaryDirectory((directory) => {
+    const store = new StrategySettingsStore(join(directory, "strategy-settings.json"));
+    store.save({ ...DEFAULT_STRATEGY_SETTINGS, orderQuantity: 20 });
+    store.save({ ...DEFAULT_STRATEGY_SETTINGS, orderQuantity: 30 });
+
+    const restored = store.restore(1);
+    assert.equal(restored.orderQuantity, 20);
+    assert.equal(store.load().orderQuantity, 20);
+
+    const history = store.history();
+    assert.equal(history.length, 3);
+    assert.equal(history[2].version, 3);
+    assert.equal(history[2].previous.orderQuantity, 30);
+    assert.equal(history[2].next.orderQuantity, 20);
+  });
+});
+
+test("restoring an unknown version is rejected", () => {
+  withTemporaryDirectory((directory) => {
+    const store = new StrategySettingsStore(join(directory, "strategy-settings.json"));
+    store.save({ ...DEFAULT_STRATEGY_SETTINGS, orderQuantity: 20 });
+    assert.throws(
+      () => store.restore(99),
+      (error) => error.code === "STRATEGY_SETTINGS_VERSION_NOT_FOUND",
+    );
+  });
+});
+
+test("a corrupt history file is never silently skipped", () => {
+  withTemporaryDirectory((directory) => {
+    const filePath = join(directory, "strategy-settings.json");
+    const store = new StrategySettingsStore(filePath);
+    store.save({ ...DEFAULT_STRATEGY_SETTINGS, orderQuantity: 20 });
+    writeFileSync(`${filePath}.history.jsonl`, "not json\n", "utf8");
+    assert.throws(
+      () => store.history(),
+      (error) => error.code === "STRATEGY_SETTINGS_HISTORY_CORRUPT",
+    );
+  });
+});
