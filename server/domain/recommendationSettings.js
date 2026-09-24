@@ -29,6 +29,12 @@ export const DEFAULT_RECOMMENDATION_SETTINGS = Object.freeze({
   // 체결강도만 못 넘어 8분간 20여 회 평가 전부 적격 후보 0건). 화면에서 조절할 수
   // 있도록 설정으로 뺀다.
   minimumExecutionStrength: 80,
+  // 신규상장/공모주 당일 종목은 상장 초반 상승폭이 표준 변동성 가드(당일 상승률,
+  // 상한가 근접)를 거의 항상 넘는다. 이 종목에 한해 가드를 완화해 스캐너가
+  // 걸러내지 않도록 한다(2026-09-24, 사용자 요청).
+  newlyListedWindowDays: 20,
+  newlyListedMaximumDailyRisePercent: 30,
+  newlyListedUpperLimitProximityBps: 50,
 });
 
 export class RecommendationSettingsError extends Error {
@@ -57,6 +63,11 @@ export function loadRecommendationSettings(env = process.env) {
     maximumRecentRiseBps: env.PULSEHFT_RECOMMENDATION_MAX_RECENT_RISE_BPS,
     upperLimitProximityBps: env.PULSEHFT_RECOMMENDATION_UPPER_LIMIT_PROXIMITY_BPS,
     minimumExecutionStrength: env.PULSEHFT_RECOMMENDATION_MIN_EXECUTION_STRENGTH,
+    newlyListedWindowDays: env.PULSEHFT_RECOMMENDATION_NEWLY_LISTED_WINDOW_DAYS,
+    newlyListedMaximumDailyRisePercent:
+      env.PULSEHFT_RECOMMENDATION_NEWLY_LISTED_MAX_DAILY_RISE_PERCENT,
+    newlyListedUpperLimitProximityBps:
+      env.PULSEHFT_RECOMMENDATION_NEWLY_LISTED_UPPER_LIMIT_PROXIMITY_BPS,
   });
 }
 
@@ -90,6 +101,19 @@ export function normalizeRecommendationSettings(input = {}) {
     maximumRecentRiseBps: numberInRange(merged.maximumRecentRiseBps, 20, 2_000, "최근 급등 차단 기준"),
     upperLimitProximityBps: numberInRange(merged.upperLimitProximityBps, 10, 3_000, "상한가 근접 차단 기준"),
     minimumExecutionStrength: numberInRange(merged.minimumExecutionStrength, 0, 500, "체결강도 문턱"),
+    newlyListedWindowDays: integerInRange(merged.newlyListedWindowDays, 0, 60, "신규상장 인정 기간"),
+    newlyListedMaximumDailyRisePercent: numberInRange(
+      merged.newlyListedMaximumDailyRisePercent,
+      1,
+      30,
+      "신규상장 당일 상승률 차단 기준",
+    ),
+    newlyListedUpperLimitProximityBps: numberInRange(
+      merged.newlyListedUpperLimitProximityBps,
+      10,
+      3_000,
+      "신규상장 상한가 근접 차단 기준",
+    ),
   };
   if (normalized.maxEnriched > normalized.maxUniverse) {
     throw new RecommendationSettingsError("정밀 분석 후보 수는 1차 후보 수보다 클 수 없습니다.");

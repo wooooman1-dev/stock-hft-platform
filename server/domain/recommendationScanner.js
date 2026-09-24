@@ -160,6 +160,7 @@ export class RecommendationScanner {
         this.dataClient,
         this.settings.maxUniverse,
         this.now,
+        this.settings.newlyListedWindowDays,
       );
     } catch (error) {
       this.value = {
@@ -262,7 +263,11 @@ export class RecommendationScanner {
     const generatedAt = this.now();
     candidates.sort((a, b) => {
       const stageOrder = stagePriority(b.stage) - stagePriority(a.stage);
+      // 같은 단계라면 신규상장/공모주 당일 종목을 우선 노출한다(사용자 요청,
+      // 2026-09-24) — 초반 상승폭이 커 진입 기회로서의 가치가 더 크다.
+      const newlyListedOrder = Number(b.isNewlyListed) - Number(a.isNewlyListed);
       return stageOrder
+        || newlyListedOrder
         || b.score - a.score
         || b.accumulatedTradingValue - a.accumulatedTradingValue;
     });
@@ -454,15 +459,15 @@ export class RecommendationScanner {
   }
 }
 
-async function collectUniverseSnapshot(dataClient, limit, now) {
+async function collectUniverseSnapshot(dataClient, limit, now, newlyListedWindowDays) {
   if (typeof dataClient.getUniverseSnapshot === "function") {
-    const snapshot = await dataClient.getUniverseSnapshot({ limit });
+    const snapshot = await dataClient.getUniverseSnapshot({ limit, newlyListedWindowDays });
     if (!Array.isArray(snapshot?.candidates)) {
       throw new TypeError("getUniverseSnapshot 응답에 candidates 배열이 필요합니다.");
     }
     return snapshot;
   }
-  const candidates = await dataClient.getUniverse({ limit });
+  const candidates = await dataClient.getUniverse({ limit, newlyListedWindowDays });
   return {
     fetchedAt: now(),
     limit,

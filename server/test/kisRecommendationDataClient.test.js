@@ -37,6 +37,63 @@ test("거래대금·등락률·체결강도 순위를 병합하고 종목 마스
   assert.equal(hynix.securityType, "주식");
 });
 
+test("신규상장 종목은 예비 점수가 올라가 병합 결과에서 우선순위가 높아진다", async () => {
+  const newlyListed = new Map([
+    ["069500", { symbol: "069500", name: "새내기전자", listingDate: "2026-09-10", daysSinceListing: 5 }],
+  ]);
+  const withoutBoost = mergeRankingRows({
+    volumeRows: [row("005930", "삼성전자", "70000", "1.5", "1000000", "70000000000")],
+    fluctuationRows: [],
+    powerRows: [],
+    limit: 10,
+    fetchedAt: 1234,
+  });
+  const withBoost = mergeRankingRows({
+    volumeRows: [row("005930", "삼성전자", "70000", "1.5", "1000000", "70000000000")],
+    fluctuationRows: [row("069500", "새내기전자", "30000", "20.0", "500000", "10000000000")],
+    powerRows: [],
+    limit: 10,
+    fetchedAt: 1234,
+    newlyListed,
+  });
+  const samsung = withoutBoost.find((item) => item.symbol === "005930");
+  const rookie = withBoost.find((item) => item.symbol === "069500");
+  assert.equal(rookie.isNewlyListed, true);
+  assert.equal(rookie.daysSinceListing, 5);
+  assert.equal(rookie.listingDate, "2026-09-10");
+  assert.equal(samsung.isNewlyListed, false);
+  // 신규상장 부스트(+25)가 없으면 거래대금이 훨씬 큰 삼성전자보다 순위가 낮아야
+  // 정상이라, 부스트가 실제로 순위를 뒤집는지 확인한다.
+  assert.ok(rookie.preliminaryScore > samsung.preliminaryScore);
+});
+
+test("getRecentListings는 예탁원 공모주청약일정 응답에서 상장일 이내 종목만 반환한다", async () => {
+  const fake = {
+    config: { baseUrl: "https://example.test", appKey: "app", appSecret: "secret" },
+    async getAccessToken() { return "token"; },
+    async request(url) {
+      assert.equal(url.pathname, "/uapi/domestic-stock/v1/ksdinfo/pub-offer");
+      return response({
+        rt_cd: "0",
+        output1: [
+          { sht_cd: "069500", isin_name: "새내기전자", list_dt: "2026/09/10" },
+          { sht_cd: "005930", isin_name: "삼성전자", list_dt: "19750611" },
+          { sht_cd: "999999", isin_name: "상장예정", list_dt: "2099/01/01" },
+        ],
+      });
+    },
+  };
+  const client = new KisRecommendationDataClient({ client: fake, now: () => Date.parse("2026-09-24T00:00:00Z") });
+  const listings = await client.getRecentListings({ windowDays: 20 });
+  assert.equal(listings.size, 1);
+  assert.deepEqual(listings.get("069500"), {
+    symbol: "069500",
+    name: "새내기전자",
+    listingDate: "2026-09-10",
+    daysSinceListing: 14,
+  });
+});
+
 test("호가와 분봉 응답을 정규화한다", async () => {
   const requests = [];
   const fake = {

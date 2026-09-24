@@ -110,6 +110,42 @@ test("급등·VWAP 과이격·상한가 근접 후보는 감시 점수와 무관
   assert.ok(result.blockReasons.some((reason) => reason.includes("상한가")));
 });
 
+test("신규상장 종목은 당일 상승률·상한가 근접 가드가 완화되지만 VWAP 이격 가드는 유지된다", () => {
+  const bars = Array.from({ length: 10 }, (_, index) => bar(
+    `09${String(index).padStart(2, "0")}00`,
+    10000 + index * 100,
+    10100 + index * 100,
+    9950 + index * 100,
+    10050 + index * 100,
+    1000,
+  ));
+  const result = evaluateRecommendationCandidate({
+    symbol: "069500",
+    name: "새내기전자",
+    isNewlyListed: true,
+    daysSinceListing: 3,
+    listingDate: "2026-09-21",
+    currentPrice: 12500,
+    previousClose: 10000,
+    openPrice: 10100,
+    highPrice: 12600,
+    lowPrice: 10000,
+    upperLimitPrice: 13000,
+    changePercent: 25,
+    accumulatedTradingValue: 100_000_000_000,
+    executionStrength: 140,
+    tickSize: 10,
+    orderBook: { bestBid: 12490, bestAsk: 12500, totalBidSize: 20000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.equal(result.isNewlyListed, true);
+  assert.equal(result.daysSinceListing, 3);
+  assert.equal(result.blockReasons.some((reason) => reason.includes("당일 상승률")), false);
+  assert.equal(result.blockReasons.some((reason) => reason.includes("상한가")), false);
+  assert.ok(result.blockReasons.some((reason) => reason.includes("VWAP")));
+});
+
 function bar(time, open, high, low, close, volume) {
   return { time, open, high, low, close, volume };
 }

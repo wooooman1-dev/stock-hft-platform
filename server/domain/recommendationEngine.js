@@ -25,6 +25,9 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
     symbol: candidate.symbol,
     name: candidate.name,
     market: candidate.market,
+    isNewlyListed: candidate.isNewlyListed,
+    daysSinceListing: candidate.daysSinceListing,
+    listingDate: candidate.listingDate,
     candidateType: selected.type,
     stage,
     score,
@@ -175,8 +178,15 @@ function buildBlockReasons(candidate, bars, orderBook, derived, settings, barSup
   // 없으면 powerScore가 0이 될 뿐이고 결측 자체는 dataCompleteness로 드러난다.
   if (orderBook.bestBid === null || orderBook.bestAsk === null) reasons.push("최우선 호가 없음");
   if (orderBook.spreadTicks !== null && orderBook.spreadTicks > 3) reasons.push("스프레드 3틱 초과");
-  if (candidate.changePercent !== null && candidate.changePercent > settings.maximumDailyRisePercent) {
-    reasons.push(`당일 상승률 ${settings.maximumDailyRisePercent}% 초과`);
+  // 신규상장/공모주 당일 종목은 상장 초반 상승폭이 표준 가드를 거의 항상 넘는다.
+  // 이 두 가드만 완화된 문턱을 쓴다(사용자 승인, 2026-09-24). VWAP 이격·최근
+  // 급등 가드는 신규상장 여부와 무관하게 그대로 적용한다 — 장중 과열 추격은
+  // 여전히 걸러야 한다.
+  const dailyRiseCap = candidate.isNewlyListed
+    ? settings.newlyListedMaximumDailyRisePercent
+    : settings.maximumDailyRisePercent;
+  if (candidate.changePercent !== null && candidate.changePercent > dailyRiseCap) {
+    reasons.push(`당일 상승률 ${dailyRiseCap}% 초과`);
   }
   if (derived.vwapExtensionBps !== null && derived.vwapExtensionBps > settings.maximumVwapExtensionBps) {
     reasons.push(`VWAP 상단 이격 ${settings.maximumVwapExtensionBps}bp 초과`);
@@ -184,8 +194,11 @@ function buildBlockReasons(candidate, bars, orderBook, derived, settings, barSup
   if (derived.recentReturnBps > settings.maximumRecentRiseBps) {
     reasons.push(`최근 4개 분봉 상승 ${settings.maximumRecentRiseBps}bp 초과`);
   }
-  if (derived.upperLimitDistanceBps !== null && derived.upperLimitDistanceBps <= settings.upperLimitProximityBps) {
-    reasons.push(`상한가 ${settings.upperLimitProximityBps}bp 이내 근접`);
+  const upperLimitCap = candidate.isNewlyListed
+    ? settings.newlyListedUpperLimitProximityBps
+    : settings.upperLimitProximityBps;
+  if (derived.upperLimitDistanceBps !== null && derived.upperLimitDistanceBps <= upperLimitCap) {
+    reasons.push(`상한가 ${upperLimitCap}bp 이내 근접`);
   }
   if (candidate.fetchedAt !== null && candidate.evaluatedAt - candidate.fetchedAt > 60_000) {
     reasons.push("시세 데이터 60초 초과 지연");
@@ -284,6 +297,9 @@ function normalizeCandidate(input) {
     fluctuationRank: integerOrNull(input.fluctuationRank),
     volumePowerRank: integerOrNull(input.volumePowerRank),
     tradingHalted: Boolean(input.tradingHalted),
+    isNewlyListed: Boolean(input.isNewlyListed),
+    daysSinceListing: integerOrNull(input.daysSinceListing),
+    listingDate: input.listingDate ? String(input.listingDate) : null,
     tickSize: positiveOrNull(input.tickSize) ?? 1,
     orderBook: input.orderBook,
     minuteBars: input.minuteBars,
