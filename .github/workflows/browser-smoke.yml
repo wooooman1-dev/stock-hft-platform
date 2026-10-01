@@ -1,0 +1,327 @@
+name: Browser Smoke
+
+on:
+  push:
+    branches:
+      - feat/recommendation-tabs
+  pull_request:
+    branches:
+      - feat/realtime-record-replay
+
+permissions:
+  contents: read
+
+jobs:
+  browser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run repository checks
+        run: npm run check
+
+      - name: Start PulseHFT
+        shell: bash
+        run: |
+          npm start > server.log 2>&1 &
+          echo $! > server.pid
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:8787/health > health.json; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          cat server.log
+          exit 1
+
+      - name: Render pages in real Chrome
+        shell: bash
+        run: |
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"
+          test -n "$CHROME"
+          echo "Chrome=$CHROME"
+
+          set +e
+          timeout 30s "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-main \
+            --virtual-time-budget=8000 \
+            --dump-dom \
+            'http://127.0.0.1:8787/?static=1&ci=main' \
+            > browser-main.html 2> browser-main.log
+          MAIN_DOM_EXIT=$?
+
+          timeout 30s "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-main-shot \
+            --virtual-time-budget=8000 \
+            --window-size=1600,1000 \
+            --screenshot=browser-main.png \
+            'http://127.0.0.1:8787/?static=1&ci=main' \
+            2>> browser-main.log
+          MAIN_SHOT_EXIT=$?
+
+          timeout 30s "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-isolated \
+            --virtual-time-budget=8000 \
+            --dump-dom \
+            'http://127.0.0.1:8787/?static=1&noRecommendationTabs=1&ci=isolated' \
+            > browser-isolated.html 2> browser-isolated.log
+          ISOLATED_DOM_EXIT=$?
+
+          timeout 30s "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --user-data-dir=/tmp/pulsehft-chrome-isolated-shot \
+            --virtual-time-budget=8000 \
+            --window-size=1600,1000 \
+            --screenshot=browser-isolated.png \
+            'http://127.0.0.1:8787/?static=1&noRecommendationTabs=1&ci=isolated' \
+            2>> browser-isolated.log
+          ISOLATED_SHOT_EXIT=$?
+          set -e
+
+          printf 'MAIN_DOM_EXIT=%s\nMAIN_SHOT_EXIT=%s\nISOLATED_DOM_EXIT=%s\nISOLATED_SHOT_EXIT=%s\n' \
+            "$MAIN_DOM_EXIT" "$MAIN_SHOT_EXIT" "$ISOLATED_DOM_EXIT" "$ISOLATED_SHOT_EXIT" \
+            | tee browser-exits.txt
+
+          test -s browser-main.html
+          test -s browser-isolated.html
+
+      - name: Assert rendered DOM
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          function verify(path, { expectTabs }) {
+            const html = fs.readFileSync(path, 'utf8');
+            const checks = {
+              bytes: Buffer.byteLength(html),
+              appShell: /id="app" class="app-shell"/.test(html),
+              topbar: /class="topbar"/.test(html),
+              instrument: /class="instrument"/.test(html),
+              loadingScreen: /id="app" class="loading-screen"/.test(html),
+              runtimeError: /data-pulsehft-runtime-error/.test(html),
+              tabs: /recommendation-workspace-tabs/.test(html),
+            };
+            console.log(path, checks);
+            if (!checks.appShell) throw new Error(`${path}: app-shell was not rendered`);
+            if (!checks.topbar) throw new Error(`${path}: topbar was not rendered`);
+            if (!checks.instrument) throw new Error(`${path}: instrument was not rendered`);
+            if (checks.loadingScreen) throw new Error(`${path}: loading screen remained active`);
+            if (checks.runtimeError) throw new Error(`${path}: runtime diagnostic reported a failure`);
+            if (checks.tabs !== expectTabs) {
+              throw new Error(`${path}: tabs=${checks.tabs}, expected ${expectTabs}`);
+            }
+          }
+
+          verify('browser-main.html', { expectTabs: true });
+          verify('browser-isolated.html', { expectTabs: false });
+          NODE
+
+      - name: Exercise workspace tab interaction in real Chrome
+        shell: bash
+        run: |
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)"
+          test -n "$CHROME"
+
+          "$CHROME" \
+            --headless=new \
+            --no-sandbox \
+            --disable-gpu \
+            --disable-extensions \
+            --remote-debugging-port=9222 \
+            --remote-allow-origins='*' \
+            --user-data-dir=/tmp/pulsehft-chrome-interaction \
+            'http://127.0.0.1:8787/?static=1&ci=interaction' \
+            > browser-interaction.log 2>&1 &
+          echo $! > browser-interaction.pid
+
+          for attempt in $(seq 1 50); do
+            if curl --fail --silent http://127.0.0.1:9222/json/list > browser-targets.json; then
+              break
+            fi
+            sleep 0.2
+          done
+          test -s browser-targets.json
+
+          node <<'NODE'
+          const fs = await import('node:fs');
+
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const targets = await fetch('http://127.0.0.1:9222/json/list').then((response) => response.json());
+          const target = targets.find((item) => item.type === 'page' && item.url.includes('127.0.0.1:8787'));
+          if (!target?.webSocketDebuggerUrl) throw new Error('PulseHFT Chrome target was not found');
+
+          const socket = new WebSocket(target.webSocketDebuggerUrl);
+          await new Promise((resolve, reject) => {
+            socket.addEventListener('open', resolve, { once: true });
+            socket.addEventListener('error', reject, { once: true });
+          });
+
+          let sequence = 0;
+          const pending = new Map();
+          socket.addEventListener('message', (event) => {
+            const message = JSON.parse(event.data);
+            if (!message.id || !pending.has(message.id)) return;
+            const request = pending.get(message.id);
+            pending.delete(message.id);
+            if (message.error) request.reject(new Error(message.error.message));
+            else request.resolve(message.result);
+          });
+
+          function send(method, params = {}) {
+            const id = ++sequence;
+            return new Promise((resolve, reject) => {
+              pending.set(id, { resolve, reject });
+              socket.send(JSON.stringify({ id, method, params }));
+            });
+          }
+
+          async function evaluate(expression) {
+            const response = await send('Runtime.evaluate', {
+              expression,
+              awaitPromise: true,
+              returnByValue: true,
+            });
+            if (response.exceptionDetails) {
+              throw new Error(response.exceptionDetails.text || 'Chrome evaluation failed');
+            }
+            return response.result?.value;
+          }
+
+          async function waitFor(expression, label, timeoutMs = 10_000) {
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeoutMs) {
+              if (await evaluate(expression)) return;
+              await sleep(100);
+            }
+            throw new Error(`Timed out waiting for ${label}`);
+          }
+
+          await send('Runtime.enable');
+          await waitFor(
+            `Boolean(
+              document.querySelector('#app.app-shell')
+              && document.querySelector('[data-recommendation-tab="main"]')
+              && document.querySelector('[data-recommendation-tab="recommendations"]')
+            )`,
+            'workspace tabs',
+          );
+
+          await evaluate(`
+            window.__pulseMainTab = document.querySelector('[data-recommendation-tab="main"]');
+            window.__pulseRecommendationTab = document.querySelector('[data-recommendation-tab="recommendations"]');
+            true;
+          `);
+
+          for (let iteration = 0; iteration < 10; iteration += 1) {
+            await evaluate(`
+              document.querySelector('[data-recommendation-tab="recommendations"]').click();
+              true;
+            `);
+            await waitFor(
+              `document.body.classList.contains('recommendation-view-active')`,
+              `recommendation view ${iteration}`,
+            );
+            await sleep(300);
+
+            const recommendationState = await evaluate(`({
+              mainConnected: window.__pulseMainTab?.isConnected === true,
+              recommendationConnected: window.__pulseRecommendationTab?.isConnected === true,
+              mainStable: window.__pulseMainTab === document.querySelector('[data-recommendation-tab="main"]'),
+              recommendationStable: window.__pulseRecommendationTab === document.querySelector('[data-recommendation-tab="recommendations"]'),
+              activeView: localStorage.getItem('pulsehft.activeWorkspaceView'),
+            })`);
+            if (
+              !recommendationState.mainConnected
+              || !recommendationState.recommendationConnected
+              || !recommendationState.mainStable
+              || !recommendationState.recommendationStable
+              || recommendationState.activeView !== 'RECOMMENDATIONS'
+            ) {
+              throw new Error(`Recommendation tab became unstable: ${JSON.stringify(recommendationState)}`);
+            }
+
+            await evaluate(`
+              document.querySelector('[data-recommendation-tab="main"]').click();
+              true;
+            `);
+            await waitFor(
+              `!document.body.classList.contains('recommendation-view-active')`,
+              `main view ${iteration}`,
+            );
+            await sleep(300);
+
+            const mainState = await evaluate(`({
+              mainConnected: window.__pulseMainTab?.isConnected === true,
+              recommendationConnected: window.__pulseRecommendationTab?.isConnected === true,
+              mainStable: window.__pulseMainTab === document.querySelector('[data-recommendation-tab="main"]'),
+              recommendationStable: window.__pulseRecommendationTab === document.querySelector('[data-recommendation-tab="recommendations"]'),
+              activeView: localStorage.getItem('pulsehft.activeWorkspaceView'),
+              appShell: document.querySelector('#app')?.classList.contains('app-shell') === true,
+            })`);
+            if (
+              !mainState.mainConnected
+              || !mainState.recommendationConnected
+              || !mainState.mainStable
+              || !mainState.recommendationStable
+              || mainState.activeView !== 'MAIN'
+              || !mainState.appShell
+            ) {
+              throw new Error(`Main tab became unstable: ${JSON.stringify(mainState)}`);
+            }
+          }
+
+          const finalState = await evaluate(`({
+            bodyClass: document.body.className,
+            activeView: localStorage.getItem('pulsehft.activeWorkspaceView'),
+            mainTab: document.querySelector('[data-recommendation-tab="main"]')?.outerHTML ?? null,
+            recommendationTab: document.querySelector('[data-recommendation-tab="recommendations"]')?.outerHTML ?? null,
+            portalConnected: document.querySelector('.recommendation-tabs-portal')?.isConnected === true,
+          })`);
+          fs.writeFileSync('browser-interaction.json', JSON.stringify(finalState, null, 2));
+          console.log(finalState);
+          socket.close();
+          NODE
+
+      - name: Upload browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsehft-browser-smoke
+          path: |
+            health.json
+            server.log
+            browser-exits.txt
+            browser-main.html
+            browser-main.log
+            browser-main.png
+            browser-isolated.html
+            browser-isolated.log
+            browser-isolated.png
+            browser-targets.json
+            browser-interaction.log
+            browser-interaction.json
+          if-no-files-found: warn
