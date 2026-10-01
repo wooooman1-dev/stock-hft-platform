@@ -94,6 +94,50 @@ test("getRecentListings는 예탁원 공모주청약일정 응답에서 상장�
   });
 });
 
+// 2026-10-01: "상장할 종목 리스트가 보여야지, 날짜도 보여야하고 미리 알 수
+// 있어야지" 요청으로 추가 — getRecentListings()와 달리 상장 전(list_dt가
+// 미래거나 아직 빈) 종목도 전부 보여주고, 청약기간·확정공모가·주관사를 그대로
+// 돌려준다.
+test("getPublicOfferingSchedule은 상장 전/후 가리지 않고 청약 일정을 전부 돌려주고 청약 시작일순으로 정렬한다", async () => {
+  const fake = {
+    config: { baseUrl: "https://example.test", appKey: "app", appSecret: "secret" },
+    async getAccessToken() { return "token"; },
+    async request(url) {
+      assert.equal(url.pathname, "/uapi/domestic-stock/v1/ksdinfo/pub-offer");
+      return response({
+        rt_cd: "0",
+        output1: [
+          {
+            sht_cd: "468670", isin_name: "브릴스", fix_subscr_pri: "       19500",
+            subscr_dt: "2026/09/17 ~ 2026/09/18", list_dt: "2026/10/01", lead_mgr: "아이비케이투자증권",
+          },
+          {
+            // 아직 공모가·상장일이 확정되지 않은 경우 — list_dt가 빈 문자열로 온다.
+            sht_cd: "179880", isin_name: "멜콘", fix_subscr_pri: "       12300",
+            subscr_dt: "2026/10/01 ~ 2026/10/02", list_dt: "", lead_mgr: "대신증권",
+          },
+        ],
+      });
+    },
+  };
+  const client = new KisRecommendationDataClient({ client: fake, now: () => Date.parse("2026-09-24T00:00:00Z") });
+  const schedule = await client.getPublicOfferingSchedule();
+  assert.equal(schedule.items.length, 2);
+  // 청약 시작일이 이른 468670(09/17)이 179880(10/01)보다 먼저 와야 한다.
+  assert.equal(schedule.items[0].symbol, "468670");
+  assert.deepEqual(schedule.items[0], {
+    symbol: "468670",
+    name: "브릴스",
+    fixedOfferPrice: 19500,
+    subscriptionStart: "2026-09-17",
+    subscriptionEnd: "2026-09-18",
+    listingDate: "2026-10-01",
+    leadManager: "아이비케이투자증권",
+  });
+  assert.equal(schedule.items[1].symbol, "179880");
+  assert.equal(schedule.items[1].listingDate, null, "상장일 미확정은 null(화면에서 '미정')이어야 한다");
+});
+
 test("호가와 분봉 응답을 정규화한다", async () => {
   const requests = [];
   const fake = {

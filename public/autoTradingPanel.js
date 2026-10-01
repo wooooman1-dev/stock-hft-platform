@@ -467,6 +467,7 @@ const LIMIT_FIELDS = [
 // — 별도 설정 저장소(/api/recommendations/settings)로 나간다(2026-09-23).
 const RECOMMENDATION_FIELDS = [
   ["minimumExecutionStrength", "체결강도 문턱", "", "100 = 매수·매도 체결량 동률. 반전형은 낮을수록 더 이른 단계에서 통과"],
+  ["maximumRealtimeChaseBps", "추격 제한(VWAP 이격)", "bp", "실시간 확인 단계에서 VWAP 대비 이 이상 벌어지면 진입 차단. 낮을수록 보수적, 높을수록 강한 추세 추격 허용"],
 ];
 
 function settingsSource(group) {

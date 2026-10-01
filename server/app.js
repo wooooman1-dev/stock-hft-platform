@@ -279,6 +279,11 @@ const kisPaperAutoTrader = kisPaperOrderService
   : null;
 let autoTradingTimer = null;
 
+// 공모주청약일정은 하루에도 거의 안 바뀌는 데이터라, 매수추천 팝업을 열 때마다
+// KIS를 다시 부르지 않게 짧게 캐시한다(2026-10-01).
+let ipoScheduleCache = null;
+const IPO_SCHEDULE_CACHE_MS = 10 * 60 * 1_000;
+
 const kisLiveOrderService = kisLiveClient && kisLiveConfiguration.orderEnabled
   ? new KisLiveOrderService({
     client: kisLiveClient,
@@ -711,6 +716,28 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/recommendations/research/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       return json(response, 200, realtimeResearchJournal.status());
+    }
+    // 매수추천 팝업 하단에 보여줄 공모주 청약 일정 — 상장 전 종목까지 포함한다
+    // (2026-10-01, "상장할 종목 리스트가 보여야지, 날짜도 보여야하고 미리
+    // 알 수 있어야지" 요청).
+    if (request.method === "GET" && url.pathname === "/api/recommendations/ipo-schedule") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      if (!recommendationDataClient) {
+        return json(response, 200, { fetchedAt: null, items: [], enabled: false });
+      }
+      const now = Date.now();
+      if (!ipoScheduleCache || now - ipoScheduleCache.cachedAt > IPO_SCHEDULE_CACHE_MS) {
+        try {
+          const schedule = await recommendationDataClient.getPublicOfferingSchedule();
+          ipoScheduleCache = { cachedAt: now, value: { ...schedule, enabled: true } };
+        } catch (error) {
+          return json(response, error?.statusCode ?? 502, {
+            error: error instanceof Error ? error.message : String(error),
+            code: error?.code ?? "KIS_IPO_SCHEDULE_FAILED",
+          });
+        }
+      }
+      return json(response, 200, ipoScheduleCache.value);
     }
     if (request.method === "GET" && url.pathname === "/api/kis/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;

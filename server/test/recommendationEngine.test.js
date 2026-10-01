@@ -110,6 +110,42 @@ test("급등·VWAP 과이격·상한가 근접 후보는 감시 점수와 무관
   assert.ok(result.blockReasons.some((reason) => reason.includes("상한가")));
 });
 
+// 2026-10-01: "상승추세 종목을 빨리 찾아야 하는데 못 찾는 것 같다"는 지적으로
+// 추가 — 한 번도 안 쉬고(눌림 없이) 꾸준히 신고점을 갱신하는 패턴은 PULLBACK/
+// REVERSAL 둘 다 핵심 가산점(눌림·반등 전제)을 못 받는다. MOMENTUM 경로가 이
+// 패턴을 잡아내 CONFIRMATION_REQUIRED까지 끌어올리는지 확인한다.
+test("눌림 없이 꾸준히 신고점을 갱신하는 후보는 MOMENTUM으로 분류되고 진입 확인 문턱에 도달한다", () => {
+  const bars = [
+    bar("090000", 10000, 10050, 9995, 10040, 1000),
+    bar("090100", 10040, 10090, 10030, 10080, 1000),
+    bar("090200", 10080, 10130, 10070, 10120, 1000),
+    bar("090300", 10120, 10170, 10110, 10160, 1000),
+    bar("090400", 10160, 10210, 10150, 10200, 1000),
+    bar("090500", 10200, 10250, 10190, 10240, 1000),
+    bar("090600", 10240, 10290, 10230, 10280, 1000),
+    bar("090700", 10280, 10330, 10270, 10320, 1000),
+    bar("090800", 10320, 10370, 10310, 10360, 1000),
+    bar("090900", 10360, 10410, 10350, 10400, 1000),
+  ];
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930",
+    name: "쉬지않고상승",
+    market: "KRX",
+    currentPrice: 10400,
+    changePercent: 4,
+    accumulatedTradingValue: 20_000_000_000,
+    tickSize: 10,
+    orderBook: { bestBid: 10390, bestAsk: 10400, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.equal(result.microstructure.pullbackDepthBps <= 20, true, "눌림이 거의 없어야 이 테스트의 전제가 성립한다");
+  assert.equal(result.candidateType, "MOMENTUM");
+  assert.notEqual(result.stage, "BLOCKED");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.ok(result.score >= 75);
+});
+
 test("신규상장 종목은 당일 상승률·상한가 근접 가드가 완화되지만 VWAP 이격 가드는 유지된다", () => {
   const bars = Array.from({ length: 10 }, (_, index) => bar(
     `09${String(index).padStart(2, "0")}00`,

@@ -354,6 +354,7 @@ export class RecommendationScanner {
       now: this.now(),
       staleAfterMs: realtimeSnapshot?.staleAfterMs,
       minimumExecutionStrength: this.settings.minimumExecutionStrength,
+      maximumRealtimeChaseBps: this.settings.maximumRealtimeChaseBps,
     });
     this.trackRealtimeState(candidate, realtime, source);
     return {
@@ -403,6 +404,7 @@ export class RecommendationScanner {
         now: this.now(),
         staleAfterMs: snapshot?.staleAfterMs,
         minimumExecutionStrength: this.settings.minimumExecutionStrength,
+        maximumRealtimeChaseBps: this.settings.maximumRealtimeChaseBps,
       });
       this.trackRealtimeState(candidate, realtime, "MARKET_DATA");
     };

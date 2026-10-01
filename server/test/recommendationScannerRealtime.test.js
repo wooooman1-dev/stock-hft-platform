@@ -75,6 +75,56 @@ test("추천 후보를 WebSocket 감시 목록에 등록하고 실시간 분석 
   assert.equal(result.status.dataSources.kis.realtimeConfirmationAvailable, true);
 });
 
+// 2026-10-01: "상승추세 종목을 못 찾는다"는 지적으로 추가 — 실시간 추격 제한
+// (maximumRealtimeChaseBps)이 설정값대로 실제 실시간 확인 호출에 전달되는지
+// 확인한다. VWAP 대비 약 242bp 벌어진 스냅샷은 옛 기본값(150)이면 막히고
+// 새 기본값(300)이면 통과해야 하며, 설정으로 더 타이트하게 되돌리면 다시 막혀야 한다.
+test("maximumRealtimeChaseBps 설정이 실시간 확인에 실제로 전달된다", async () => {
+  const now = 1_000_000;
+  const chaseSnapshot = {
+    symbol: "005930",
+    connectionState: "CONNECTED",
+    connected: true,
+    venue: "KRX",
+    staleAfterMs: 5_000,
+    latestAt: now,
+    orderBookAgeMs: 0,
+    tradeAgeMs: 0,
+    orderBook: {
+      bestAsk: 10_140, bestBid: 10_130, totalAskSize: 12_000, totalBidSize: 18_000, receivedAt: now,
+    },
+    trade: {
+      currentPrice: 10_140,
+      // vwapExtensionBps ≈ (10140-9900)/9900*10000 ≈ 242.4bp — 옛 기본값(150)
+      // 과 새 기본값(300) 사이.
+      weightedAveragePrice: 9_900,
+      executionStrength: 120,
+      accumulatedTradingValue: 20_000_000_000,
+      tradingHalted: false,
+      receivedAt: now,
+    },
+  };
+  const realtimeClient = {
+    status: () => ({ enabled: true, state: "CONNECTED", connected: true, desiredSymbolCount: 1, activeSubscriptionCount: 1, automaticOrderConnected: false }),
+    watchSymbols() {},
+    snapshot: () => chaseSnapshot,
+  };
+
+  const defaultScanner = new RecommendationScanner({
+    dataClient: fakeClient(), realtimeClient, settings, now: () => now, sleep: async () => {},
+  });
+  const defaultResult = await defaultScanner.refresh({ force: true });
+  assert.equal(defaultResult.candidates[0].realtime.state, "ENTRY_READY", "새 기본값(300bp)이면 통과해야 한다");
+
+  const tightScanner = new RecommendationScanner({
+    dataClient: fakeClient(), realtimeClient,
+    settings: { ...settings, maximumRealtimeChaseBps: 150 },
+    now: () => now, sleep: async () => {},
+  });
+  const tightResult = await tightScanner.refresh({ force: true });
+  assert.equal(tightResult.candidates[0].realtime.state, "BLOCKED", "150bp로 되돌리면 추격 제한에 걸려야 한다");
+});
+
 function fakeClient() {
   return {
     status() {

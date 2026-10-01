@@ -156,6 +156,38 @@ export class KisRecommendationDataClient {
     return listings;
   }
 
+  // 공모주 청약 일정을 상장 전/후 가리지 않고 전부 돌려준다. getRecentListings()는
+  // 매매 로직(이미 상장된 신규 종목 식별)용이라 상장 전 종목을 일부러 뺀다 —
+  // 이건 반대로 "상장할 종목을 미리 보고 싶다"는 화면 전용 목록이라, 아직
+  // list_dt가 안 잡힌(미정) 종목까지 청약기간·확정공모가·주관사와 함께 보여준다
+  // (2026-10-01, "날짜도 보여야 하고 미리 알 수 있어야지" 요청으로 추가).
+  async getPublicOfferingSchedule({ pastDays = 10, futureDays = 60 } = {}) {
+    const past = integerInRange(pastDays, 0, 365, "pastDays");
+    const future = integerInRange(futureDays, 0, 365, "futureDays");
+    const today = currentKoreaDate(this.now());
+    const from = shiftDate(today, -past);
+    const to = shiftDate(today, future);
+    const payload = await this.getJson(PUB_OFFER, {
+      SHT_CD: "",
+      CTS: "",
+      F_DT: formatYyyymmdd(from),
+      T_DT: formatYyyymmdd(to),
+    }, "예탁원 공모주청약일정 조회");
+    if (!Array.isArray(payload.output1)) {
+      throw new KisApiError(
+        "한국투자 공모주청약일정 응답에 output1 배열이 없습니다.",
+        "KIS_PUB_OFFER_INVALID_RESPONSE",
+      );
+    }
+    const items = payload.output1
+      .map((row) => normalizePublicOfferingRow(row))
+      .filter((item) => item !== null);
+    // 청약 시작일이 이른 순으로 — 아직 청약일 자체가 비어 있으면(드묾) 맨 뒤로 보낸다.
+    items.sort((a, b) => (a.subscriptionStart ?? "9999-99-99")
+      .localeCompare(b.subscriptionStart ?? "9999-99-99"));
+    return { fetchedAt: this.now(), items };
+  }
+
   async getCandidateDetails({ symbol, market = "UN" }) {
     const normalizedSymbol = normalizeSymbol(symbol);
     // KIS REST 호출 제한을 보호하기 위해 후보 상세 조회는 순차 실행합니다.
@@ -549,6 +581,28 @@ function parseKisDate(value) {
   if (!year || !month || !day) return null;
   const date = new Date(Date.UTC(year, month - 1, day));
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+// 예탁원 공모주청약일정 한 행을 화면 표시용으로 정규화한다. list_dt는 상장일이
+// 아직 확정되지 않은 종목(공모가 확정 전 등)에서는 빈 문자열로 온다 — null로
+// 그대로 둬 "미정"을 화면에서 표현할 수 있게 한다.
+function normalizePublicOfferingRow(row) {
+  const symbol = textOrNull(row.sht_cd);
+  if (!symbol || !/^\d{6}$/.test(symbol)) return null;
+  const [subscriptionStartRaw, subscriptionEndRaw] = String(row.subscr_dt ?? "").split("~");
+  return {
+    symbol,
+    name: textOrNull(row.isin_name) ?? symbol,
+    fixedOfferPrice: numberOrNull(row.fix_subscr_pri),
+    subscriptionStart: formatIsoOrNull(parseKisDate(subscriptionStartRaw)),
+    subscriptionEnd: formatIsoOrNull(parseKisDate(subscriptionEndRaw)),
+    listingDate: formatIsoOrNull(parseKisDate(row.list_dt)),
+    leadManager: textOrNull(row.lead_mgr),
+  };
+}
+
+function formatIsoOrNull(date) {
+  return date ? formatIso(date) : null;
 }
 
 function currentKoreaTime() {

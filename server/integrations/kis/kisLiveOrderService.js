@@ -455,7 +455,7 @@ export class KisLiveOrderService {
     }
 
     const note = optionalNote(input?.note);
-    const history = await this.loadUnknownResolutionEvidence();
+    const history = await this.loadUnknownResolutionEvidence(state.day);
     const tracked = trackedBrokerOrderNumbers(this.commands, clientOrderId);
     const matchedOrder = resolution === "ACCEPTED"
       ? matchAcceptedBrokerOrder({ state, input, history, tracked })
@@ -504,16 +504,23 @@ export class KisLiveOrderService {
     };
   }
 
-  async loadUnknownResolutionEvidence() {
+  // day(실행 저널에 남은 원래 명령의 영업일, "YYYY-MM-DD")를 넘기면 그 날짜의
+  // 주문내역을 조회한다 — 안 넘기면 오늘만 조회해, 당일에 못 풀고 날짜가 넘어간
+  // 결과 불명 주문은 증권사 당일 주문내역에서 영원히 사라져 대조 자체가 불가능해진다
+  // (2026-10-01, 모의투자 쪽에서 같은 버그로 킬 스위치가 이틀째 안 풀린 사례로 확인
+  // — 실전도 같은 구조라 동일하게 고친다).
+  async loadUnknownResolutionEvidence(day) {
     if (typeof this.client.getDailyOrders !== "function") {
       throw new KisLiveOrderServiceError(
         "KIS 당일 주문내역 조회를 사용할 수 없어 주문 결과 불명 상태를 대조할 수 없습니다.",
         { code: "KIS_LIVE_UNKNOWN_RESOLUTION_EVIDENCE_UNAVAILABLE", statusCode: 503 },
       );
     }
+    const dateKey = text(day).replaceAll("-", "");
+    const query = /^\d{8}$/.test(dateKey) ? { startDate: dateKey, endDate: dateKey } : {};
     let history = null;
     try {
-      history = await this.client.getDailyOrders();
+      history = await this.client.getDailyOrders(query);
     } catch (error) {
       throw new KisLiveOrderServiceError(
         `KIS 당일 주문내역을 조회하지 못해 주문 결과 불명 상태를 대조할 수 없습니다: ${safeError(error).message}`,
