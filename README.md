@@ -110,7 +110,7 @@ POST /api/kis/live/kill-switch
 
 ## LS증권 시세 어댑터
 
-`server/brokers/ls/`에 LS증권 Open API 시세 어댑터(OAuth, `t1101` 초기 호가, 실시간 호가·체결 WebSocket)가 있습니다. `createMarketDataSource()`로 만든 시세 소스를 `MarketRuntime`의 `marketSource` 옵션에 넘기면 내부 시뮬레이터 대신 그 시세로 분석·내부 모의체결을 구동하며, 시세 연결이 끊기거나 5초 이상 지연되면 주문과 자동전략을 차단합니다. 메인 화면에는 아직 연결되어 있지 않습니다. 설정은 `docs/LS_OPEN_API_SETUP.md`를 확인하세요.
+`.env`에 `MARKET_MODE=ls`와 `LS_APP_KEY`·`LS_APP_SECRET`을 넣고 실행하면 메인 화면의 현재가·호가·체결·차트·지표가 LS증권 Open API 실시간 시세로 바뀝니다. 모의계좌·주문·추천 스캐너·자동매매는 계속 한국투자 연결을 사용하며, `MARKET_MODE`가 `ls`가 아니면 메인 화면은 KIS 시세를 씁니다. 같은 어댑터(`server/brokers/ls/`)는 내부 `MarketRuntime`의 `marketSource` 옵션으로도 쓸 수 있습니다. 설정은 `docs/LS_OPEN_API_SETUP.md`를 확인하세요.
 
 ## 실행 저널
 

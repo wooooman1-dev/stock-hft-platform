@@ -23,6 +23,7 @@ export class KisMainWorkspace extends EventEmitter {
     quoteClient = null,
     marketDataClient = null,
     realtimeClient = null,
+    marketDataProvider = "KIS",
     paperService = null,
     paperClient = null,
     paperLimits = {},
@@ -38,6 +39,8 @@ export class KisMainWorkspace extends EventEmitter {
     this.quoteClient = quoteClient;
     this.marketDataClient = marketDataClient;
     this.realtimeClient = realtimeClient;
+    // 메인 화면 실시간 시세 공급자. LS는 시세만 바꾸며 계좌·주문은 계속 한국투자 모의투자 경로를 쓴다.
+    this.marketDataProvider = normalizeMarketDataProvider(marketDataProvider);
     this.paperService = paperService;
     this.paperClient = paperClient;
     this.paperLimits = normalizeLimits(paperLimits);
@@ -95,10 +98,9 @@ export class KisMainWorkspace extends EventEmitter {
       realtimeTrade?.currentPrice,
       positiveNumberOr(this.quote?.currentPrice, this.selection.initialPrice),
     );
-    const previousClose = positiveNumberOr(
-      this.quote?.basePrice,
-      this.selection.previousClose,
-    );
+    const previousClose = this.marketDataProvider === "LS"
+      ? positiveNumberOr(realtime?.previousClose, positiveNumberOr(this.quote?.basePrice, this.selection.previousClose))
+      : positiveNumberOr(this.quote?.basePrice, this.selection.previousClose);
     const tickSize = positiveNumberOr(this.quote?.askUnit, this.selection.tickSize);
     const metricTrades = this.trades.filter((trade) => Number.isFinite(trade.timestamp));
     const metrics = book.asks.length > 0 && book.bids.length > 0
@@ -108,7 +110,7 @@ export class KisMainWorkspace extends EventEmitter {
         tickSize,
         now,
       })
-      : structuredClone(EMPTY_METRICS);
+      : emptyMetrics(this.marketDataProvider);
     const account = mapPaperAccount({
       balance: this.balance,
       symbol: this.selection.symbol,
@@ -142,7 +144,7 @@ export class KisMainWorkspace extends EventEmitter {
       instrument: {
         market: this.selection.market,
         securityType: this.selection.securityType,
-        priceSource: "KIS_PROD_READ_ONLY",
+        priceSource: this.marketDataProvider === "LS" ? realtimeStatus.mode ?? "LS_SECURITIES" : "KIS_PROD_READ_ONLY",
         quoteFetchedAt: this.quote?.fetchedAt ?? null,
         selectedAt: this.selection.selectedAt,
         simulation: false,
@@ -173,16 +175,17 @@ export class KisMainWorkspace extends EventEmitter {
         riskState: null,
       },
       system: {
-        mode: "KIS_PROD_READ_ONLY",
+        mode: this.marketDataProvider === "LS" ? realtimeStatus.mode ?? "LS_SECURITIES" : "KIS_PROD_READ_ONLY",
+        marketDataProvider: this.marketDataProvider,
         accountMode: "KIS_PAPER_TRADING",
         feedConnected: Boolean(realtimeStatus.connected),
         feedState: realtimeStatus.state ?? "DISABLED",
         feedStale: Boolean(realtime?.stale),
         marketDataSource: validBook(realtimeBook) || realtimeTrade?.currentPrice
-          ? "KIS_WEBSOCKET"
+          ? `${this.marketDataProvider}_WEBSOCKET`
           : this.quote?.source === "KIS"
             ? "KIS_REST"
-            : "KIS_NOT_CONNECTED",
+            : `${this.marketDataProvider}_NOT_CONNECTED`,
         killSwitch: Boolean(paperStatus.killSwitch),
         unknownResult: Boolean(paperStatus.unknownResult),
         autoPaperTrading: false,
@@ -230,6 +233,8 @@ export class KisMainWorkspace extends EventEmitter {
 
   async performMarketRefresh() {
     if (!this.quoteClient || !this.marketDataClient) {
+      // LS 시세 모드에서는 한국투자 REST 보조 시세가 없어도 LS 실시간 시세로 화면을 구동한다.
+      if (this.marketDataProvider === "LS") return this.snapshot();
       this.marketError = {
         code: "KIS_PROD_READ_ONLY_DISABLED",
         message: "한국투자 실전 시세 읽기 전용 연결이 비활성화되어 있습니다.",
@@ -391,6 +396,7 @@ export class KisMainWorkspace extends EventEmitter {
       this.realtimeClient?.watchSymbols?.([{
         symbol: this.selection.symbol,
         venue: realtimeVenue(this.selection.market),
+        ...(this.marketDataProvider === "LS" ? { market: this.selection.market } : {}),
       }]);
     } catch (error) {
       this.marketError = safeError(error, "KIS_REALTIME_WATCH_FAILED");
@@ -402,12 +408,14 @@ export class KisMainWorkspace extends EventEmitter {
     const onMarketData = (snapshot) => {
       if (snapshot?.symbol !== this.selection.symbol) return;
       this.realtimeSnapshot = snapshot;
+      // LS 모드에서는 REST 갱신이 오류를 지워주지 않으므로, 새 시세가 들어오면 지난 실시간 오류를 내린다.
+      if (this.marketDataProvider === "LS") this.marketError = null;
       this.captureTrade(snapshot.trade, snapshot.orderBook);
       this.emitSnapshot();
     };
     const onStatus = () => this.emitSnapshot();
     const onError = (error) => {
-      this.marketError = safeError(error, "KIS_REALTIME_ERROR");
+      this.marketError = safeError(error, `${this.marketDataProvider}_REALTIME_ERROR`);
       this.emitSnapshot();
     };
     this.realtimeClient.on("marketData", onMarketData);
@@ -638,6 +646,20 @@ function classifyTrade({ price, orderBook, previous }) {
   return previous?.side ?? "BUY";
 }
 
+function normalizeMarketDataProvider(value) {
+  const provider = String(value ?? "KIS").trim().toUpperCase();
+  if (provider !== "KIS" && provider !== "LS") {
+    throw new TypeError("marketDataProvider는 KIS 또는 LS여야 합니다.");
+  }
+  return provider;
+}
+
+function emptyMetrics(provider) {
+  const metrics = structuredClone(EMPTY_METRICS);
+  if (provider === "LS") metrics.reasons = ["LS증권 실제 호가·체결 데이터를 기다리는 중입니다."];
+  return metrics;
+}
+
 function realtimeVenue(market) {
   const value = String(market ?? "").trim().toUpperCase();
   if (value === "NXT" || value === "NX") return "NXT";
@@ -717,7 +739,9 @@ function nullableNumber(value) {
 function safeError(error, fallbackCode) {
   return {
     code: typeof error?.code === "string" ? error.code : fallbackCode,
-    message: error instanceof Error ? error.message : String(error ?? "KIS 연결 오류"),
+    message: error instanceof Error
+      ? error.message
+      : typeof error?.message === "string" ? error.message : String(error ?? "KIS 연결 오류"),
   };
 }
 
