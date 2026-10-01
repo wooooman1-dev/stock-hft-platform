@@ -108,6 +108,10 @@ POST /api/kis/live/kill-switch
 
 `GET /api/kis/paper/fill-comparison`은 주문 제출 시점에 캡처한 KIS 10단계 호가를 내부 `SIMULATION` 체결 엔진에 그대로 통과시켜 계산한 가상 체결가·체결량을, 이후 KIS가 보고한 실제 체결과 비교합니다. 예측이나 자동 판정이 아니라 두 체결모델의 차이를 확인하는 진단 전용 리포트입니다.
 
+## LS증권 시세 어댑터
+
+`server/brokers/ls/`에 LS증권 Open API 시세 어댑터(OAuth, `t1101` 초기 호가, 실시간 호가·체결 WebSocket)가 있습니다. `createMarketDataSource()`로 만든 시세 소스를 `MarketRuntime`의 `marketSource` 옵션에 넘기면 내부 시뮬레이터 대신 그 시세로 분석·내부 모의체결을 구동하며, 시세 연결이 끊기거나 5초 이상 지연되면 주문과 자동전략을 차단합니다. 메인 화면에는 아직 연결되어 있지 않습니다. 설정은 `docs/LS_OPEN_API_SETUP.md`를 확인하세요.
+
 ## 실행 저널
 
 ```text
