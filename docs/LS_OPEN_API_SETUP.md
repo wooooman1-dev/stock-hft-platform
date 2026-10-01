@@ -1,6 +1,6 @@
 # LS증권 Open API 연결 설정
 
-> 현재 상태: 이 어댑터는 `main`에 병합되어 코드와 테스트로 유지되지만, 메인 화면은 한국투자(KIS) 시세 기반 `KisMainWorkspace`로 구동됩니다. LS 시세 소스는 내부 `MarketRuntime`의 `marketSource` 옵션으로만 연결할 수 있고, 서버 기동 경로(`server/app.js`)와 대시보드에는 아직 연결되어 있지 않습니다. 아래 '현재 구현 범위'의 대시보드/health 표시 항목은 초기 버전 기준입니다.
+> 현재 상태: `MARKET_MODE=ls`로 실행하면 메인 화면의 현재가·호가·체결·차트·미세구조 지표가 LS증권 실시간 시세로 구동됩니다(`server/brokers/ls/lsMainRealtimeClient.js`). 바뀌는 것은 메인 화면 시세뿐이며, 모의계좌·주문·추천 스캐너·자동매매는 계속 한국투자(KIS) 연결을 사용합니다. `MARKET_MODE`가 `ls`가 아니면(기본값) 메인 화면은 지금처럼 KIS 시세를 씁니다.
 
 ## 현재 구현 범위
 
@@ -60,7 +60,14 @@ npm start
 Invoke-RestMethod http://localhost:8787/health
 ```
 
-정상 연결 시 `provider`는 `LS_SECURITIES`, `feedConnected`는 `true`로 표시됩니다.
+정상 연결 시 `main.marketDataProvider`는 `LS`, `main.mode`는 `LS_PAPER_DATA`(또는 `LS_LIVE_DATA`), `main.feedConnected`는 `true`로 표시되고, `mainMarketData.realtime`에 LS 연결 상태·마지막 오류가 나옵니다. 화면 상단 연결 표시는 `LS증권 실시간 연결`로 바뀝니다.
+
+참고:
+
+- 종목 시장(KOSPI/KOSDAQ)은 선택 종목 정보로 정하고, 알 수 없으면 `LS_MARKET` 값을 씁니다.
+- ETN(`Q`로 시작하는 코드)은 LS 시세로 조회할 수 없어 오류로 표시됩니다.
+- 연결이 끊기면 2초부터 최대 30초 간격으로 자동 재연결합니다.
+- KIS 실전 시세 키가 설정되어 있으면 분봉 차트·현재가 보조 조회는 계속 KIS REST로 받고, 없으면 LS 시세만으로 화면을 구동합니다.
 
 ## 공식 접속점
 

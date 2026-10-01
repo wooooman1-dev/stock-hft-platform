@@ -9,6 +9,7 @@ import { RecommendationScanner } from "./domain/recommendationScanner.js";
 import { loadRecommendationSettings, publicRecommendationSettings } from "./domain/recommendationSettings.js";
 import { createRealtimeResearchJournal } from "./domain/realtimeResearchJournal.js";
 import { MarketRuntime } from "./domain/runtime.js";
+import { createMainLsRealtimeClient, resolveMainMarketDataProvider } from "./market/createMarketDataSource.js";
 import { loadPaperCostModel } from "./domain/paperTrader.js";
 import { SelectedInstrumentStore } from "./domain/selectedInstrumentStore.js";
 import { StrategySettingsStore } from "./domain/strategySettingsStore.js";
@@ -138,7 +139,9 @@ const recommendationRealtimeClient = realtimeCoordinator?.createView(
   "recommendations",
   { priority: 10 },
 ) ?? null;
-const mainRealtimeClient = realtimeCoordinator?.createView(
+const mainMarketDataProvider = resolveMainMarketDataProvider(process.env);
+const lsMainRealtimeClient = createMainLsRealtimeClient({ env: process.env });
+const mainRealtimeClient = lsMainRealtimeClient ?? realtimeCoordinator?.createView(
   "main-workspace",
   { priority: 100 },
 ) ?? null;
@@ -290,6 +293,7 @@ const mainWorkspace = new KisMainWorkspace({
   quoteClient: kisClient,
   marketDataClient: recommendationDataClient,
   realtimeClient: mainRealtimeClient,
+  marketDataProvider: mainMarketDataProvider,
   paperService: kisPaperOrderService,
   paperClient: kisPaperClient,
   paperLimits: kisPaperConfiguration.limits,
@@ -306,6 +310,7 @@ executionJournal.append("SESSION_STARTED", {
   kisMode: kisConfiguration.mode,
   kisQuoteEnabled: kisConfiguration.enabled,
   kisRealtimeEnabled: Boolean(sharedRealtimeClient),
+  mainMarketDataProvider,
   kisPaperMode: kisPaperConfiguration.mode,
   kisPaperBalanceEnabled: Boolean(kisPaperClient),
   kisPaperOrderEnabled: Boolean(kisPaperOrderService),
@@ -559,6 +564,10 @@ const server = createServer(async (request, response) => {
         mode: "KIS_MARKET_WITH_PAPER",
         clients: eventClients.size,
         main: mainWorkspace.snapshot().system,
+        mainMarketData: {
+          provider: mainMarketDataProvider,
+          realtime: mainRealtimeClient?.status?.() ?? null,
+        },
         kis: getKisHealthStatus(),
         kisPaper: getKisPaperHealthStatus(),
         kisLive: getKisLiveHealthStatus(),
@@ -1099,6 +1108,7 @@ function shutdown() {
   recommendationScanner.stop();
   kisPaperAutoTrader?.stop();
   realtimeCoordinator?.stop();
+  lsMainRealtimeClient?.stop();
   runtime.stop();
   for (const client of eventClients) client.end();
 

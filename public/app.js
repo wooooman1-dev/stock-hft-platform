@@ -35,7 +35,7 @@ async function request(path, body, { method = "POST" } = {}) {
 
 function priceChart(candles) {
   const data = Array.isArray(candles) ? candles.slice(-90) : [];
-  if (data.length < 2) return '<div class="chart-empty">KIS 차트 데이터를 불러오는 중입니다.</div>';
+  if (data.length < 2) return '<div class="chart-empty">차트 데이터를 불러오는 중입니다.</div>';
   const width = 1000;
   const height = 360;
   const padding = { top: 24, right: 72, bottom: 30, left: 14 };
@@ -180,11 +180,13 @@ function render() {
   const disabled = busy || snapshot.system.killSwitch || !paperAvailable ? "disabled" : "";
   const limitDisabled = orderType === "MARKET" ? "disabled" : "";
   const feedConnected = Boolean(snapshot.system.feedConnected);
+  const feedProvider = snapshot.system.marketDataProvider === "LS" ? "LS증권" : "KIS";
+  const feedEyebrow = snapshot.system.marketDataProvider === "LS" ? "LS" : "KIS";
   const feedLabel = feedConnected
-    ? "KIS 실시간 연결"
+    ? `${feedProvider} 실시간 연결`
     : snapshot.system.marketDataSource === "KIS_REST"
       ? "KIS REST 시세"
-      : "KIS 연결 대기";
+      : `${feedProvider} 연결 대기`;
   const dataAge = Number(snapshot.system.latencyMs) || 0;
   const accountNote = account.error?.message
     ? ` · ${escapeHtml(account.error.message)}`
@@ -208,12 +210,12 @@ function render() {
     <header class="topbar"><div class="brand"><div class="pulse-logo">P</div><div><strong>PulseHFT</strong><span>Microstructure & KIS Paper Execution</span></div></div><div class="instrument"><div><span>${snapshot.symbol}</span><strong>${escapeHtml(snapshot.symbolName)}</strong></div><div class="headline-price"><strong>${fmt(snapshot.lastPrice)}</strong><span class="${snapshot.changePercent >= 0 ? "positive-text" : "negative-text"}">${signed(snapshot.changePercent, 2)}%</span></div></div><div class="top-status"><span class="simulation-badge">KIS PROD READ-ONLY</span><span class="connection ${feedConnected ? "connected" : connection}"><i></i>${feedLabel}</span><span class="latency">데이터 ${dataAge.toFixed(0)}ms</span></div></header>
     ${message ? `<div class="toast" data-action="dismiss">${escapeHtml(message)}</div>` : ""}
     ${snapshot.system.killSwitch ? '<div class="kill-banner">KIS 모의투자 킬 스위치가 활성화되어 신규·정정 주문이 차단되었습니다.</div>' : ""}
-    <section class="metric-grid">${metric("가중 호가 불균형", `${signed(metrics.weightedImbalance * 100)}%`, "KIS 1~3호가 가중치 반영", tone(metrics.weightedImbalance))}${metric("체결 흐름", `${signed(metrics.tradeFlow * 100)}%`, "최근 5초 KIS 체결량", tone(metrics.tradeFlow))}${metric("거래 속도", `${metrics.tradesPerSecond.toFixed(1)}/초`, `${fmt(metrics.volumePerSecond)}주/초`)}${metric("모멘텀", `${signed(metrics.momentumBps, 2)}bp`, "최근 KIS 체결 가격 방향", tone(metrics.momentumBps))}${metric("스프레드", `${metrics.spreadTicks.toFixed(0)}틱`, `${fmt(metrics.spread)}원`, metrics.spreadTicks <= 1 ? "positive" : metrics.spreadTicks >= 3 ? "negative" : "neutral")}${metric("초단기 변동성", `${metrics.volatilityBps.toFixed(2)}bp`, "KIS 체결 수익률 표준편차")}</section>
+    <section class="metric-grid">${metric("가중 호가 불균형", `${signed(metrics.weightedImbalance * 100)}%`, `${feedProvider} 1~3호가 가중치 반영`, tone(metrics.weightedImbalance))}${metric("체결 흐름", `${signed(metrics.tradeFlow * 100)}%`, `최근 5초 ${feedProvider} 체결량`, tone(metrics.tradeFlow))}${metric("거래 속도", `${metrics.tradesPerSecond.toFixed(1)}/초`, `${fmt(metrics.volumePerSecond)}주/초`)}${metric("모멘텀", `${signed(metrics.momentumBps, 2)}bp`, `최근 ${feedProvider} 체결 가격 방향`, tone(metrics.momentumBps))}${metric("스프레드", `${metrics.spreadTicks.toFixed(0)}틱`, `${fmt(metrics.spread)}원`, metrics.spreadTicks <= 1 ? "positive" : metrics.spreadTicks >= 3 ? "negative" : "neutral")}${metric("초단기 변동성", `${metrics.volatilityBps.toFixed(2)}bp`, `${feedProvider} 체결 수익률 표준편차`)}</section>
     <section class="workspace-grid">
-      <div class="chart-panel panel"><div class="panel-title-row"><div><span class="eyebrow">KIS INTRADAY MARKET VIEW</span><h3>실시간 가격·체결 구조</h3></div><div class="chart-legend"><span class="up">상승</span><span class="down">하락</span></div></div>${priceChart(snapshot.candles)}</div>
-      <div class="book-panel panel"><div class="panel-title-row"><div><span class="eyebrow">KIS ORDER BOOK</span><h3>10단계 호가</h3></div></div><div class="book-head"><span>가격</span><span>잔량</span></div>${asks.map((level) => bookRow(level, "ask", maxSize)).join("")}<div class="last-price-row"><span>현재가</span><strong>${fmt(snapshot.lastPrice)}</strong></div>${bids.map((level) => bookRow(level, "bid", maxSize)).join("")}</div>
-      <div class="signal-wrap"><div class="signal-panel signal-${metrics.signal.toLowerCase()}"><div class="signal-header"><div><span class="eyebrow">KIS MICROSTRUCTURE SIGNAL</span><h2>${signalLabel}</h2></div><div class="score-ring" style="--score:${metrics.confidence * 3.6}deg"><div><strong>${metrics.score}</strong><small>점수</small></div></div></div><div class="confidence-track"><span style="width:${metrics.confidence}%"></span></div><div class="signal-reasons">${metrics.reasons.slice(0, 4).map((reason) => `<div>• ${escapeHtml(reason)}</div>`).join("")}</div><p>KIS 실제 시세·호가·체결 기반 분석이며 투자 권유가 아닙니다.</p></div></div>
-      <div class="tape-panel panel"><div class="panel-title-row"><div><span class="eyebrow">KIS TIME & SALES</span><h3>실시간 체결</h3></div></div><div class="trade-tape">${snapshot.trades.slice(0, 30).map((trade) => `<div class="trade-row ${String(trade.side).toLowerCase()}"><span>${new Date(trade.timestamp).toLocaleTimeString("ko-KR", { hour12: false, minute: "2-digit", second: "2-digit", fractionalSecondDigits: 1 })}</span><strong>${fmt(trade.price)}</strong><span>${fmt(trade.size)}</span></div>`).join("") || '<div class="empty-list">KIS 실시간 체결을 기다리는 중입니다.</div>'}</div></div>
+      <div class="chart-panel panel"><div class="panel-title-row"><div><span class="eyebrow">${feedEyebrow} INTRADAY MARKET VIEW</span><h3>실시간 가격·체결 구조</h3></div><div class="chart-legend"><span class="up">상승</span><span class="down">하락</span></div></div>${priceChart(snapshot.candles)}</div>
+      <div class="book-panel panel"><div class="panel-title-row"><div><span class="eyebrow">${feedEyebrow} ORDER BOOK</span><h3>10단계 호가</h3></div></div><div class="book-head"><span>가격</span><span>잔량</span></div>${asks.map((level) => bookRow(level, "ask", maxSize)).join("")}<div class="last-price-row"><span>현재가</span><strong>${fmt(snapshot.lastPrice)}</strong></div>${bids.map((level) => bookRow(level, "bid", maxSize)).join("")}</div>
+      <div class="signal-wrap"><div class="signal-panel signal-${metrics.signal.toLowerCase()}"><div class="signal-header"><div><span class="eyebrow">${feedEyebrow} MICROSTRUCTURE SIGNAL</span><h2>${signalLabel}</h2></div><div class="score-ring" style="--score:${metrics.confidence * 3.6}deg"><div><strong>${metrics.score}</strong><small>점수</small></div></div></div><div class="confidence-track"><span style="width:${metrics.confidence}%"></span></div><div class="signal-reasons">${metrics.reasons.slice(0, 4).map((reason) => `<div>• ${escapeHtml(reason)}</div>`).join("")}</div><p>${feedProvider} 실제 시세·호가·체결 기반 분석이며 투자 권유가 아닙니다.</p></div></div>
+      <div class="tape-panel panel"><div class="panel-title-row"><div><span class="eyebrow">${feedEyebrow} TIME & SALES</span><h3>실시간 체결</h3></div></div><div class="trade-tape">${snapshot.trades.slice(0, 30).map((trade) => `<div class="trade-row ${String(trade.side).toLowerCase()}"><span>${new Date(trade.timestamp).toLocaleTimeString("ko-KR", { hour12: false, minute: "2-digit", second: "2-digit", fractionalSecondDigits: 1 })}</span><strong>${fmt(trade.price)}</strong><span>${fmt(trade.size)}</span></div>`).join("") || `<div class="empty-list">${feedProvider} 실시간 체결을 기다리는 중입니다.</div>`}</div></div>
     </section>
     <section class="execution-grid">
       <div class="paper-panel"><div class="panel-title-row"><div><span class="eyebrow">KIS PAPER ACCOUNT</span><h3>KIS 모의계좌 수동 주문</h3></div><button class="ghost-button" data-action="refresh" ${busy ? "disabled" : ""}>새로고침</button></div>
