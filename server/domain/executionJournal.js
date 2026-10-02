@@ -21,7 +21,18 @@ const EVENT_TYPES = new Set([
   "BROKER_ORDER_COMMAND",
   "BROKER_ORDER_RESULT",
   "BROKER_ORDER_UNKNOWN",
+  "BROKER_ORDER_UNKNOWN_RESOLVED",
   "BROKER_RISK_BASELINE",
+  "BROKER_RECONCILIATION_BASELINE",
+  "BROKER_RECONCILIATION_MISMATCH",
+  "BROKER_RECONCILIATION_ACKNOWLEDGED",
+  "BROKER_EQUITY_SNAPSHOT",
+  "BROKER_FILL_OBSERVED",
+  "STRATEGY_APPROVAL_REQUESTED",
+  "STRATEGY_APPROVAL_APPROVED",
+  "STRATEGY_APPROVAL_REJECTED",
+  "STRATEGY_APPROVAL_EXPIRED",
+  "LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED",
 ]);
 
 export class ExecutionJournalError extends Error {
@@ -183,6 +194,11 @@ export class ExecutionJournalRecorder {
   recordSessionStarted(payload, timestamp) {
     if (!this.journal) return null;
     return this.journal.append("SESSION_STARTED", payload, timestamp);
+  }
+
+  recordStrategyApproval(type, payload, timestamp) {
+    if (!this.journal) return null;
+    return this.journal.append(type, payload, timestamp);
   }
 
   capture(account) {

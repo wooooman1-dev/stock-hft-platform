@@ -4,12 +4,18 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   const settings = normalizeRecommendationSettings(settingsInput);
   const candidate = normalizeCandidate(input);
   const bars = normalizeBars(candidate.minuteBars);
+  const barSupply = describeBarSupply(candidate.minuteBars, bars);
   const orderBook = normalizeOrderBook(candidate.orderBook, candidate.tickSize);
   const derived = calculateDerived(candidate, bars, orderBook);
-  const blockReasons = buildBlockReasons(candidate, bars, orderBook, derived, settings);
+  const blockReasons = buildBlockReasons(candidate, bars, orderBook, derived, settings, barSupply);
   const reversal = scoreReversal(candidate, derived, orderBook);
   const pullback = scorePullback(candidate, derived, orderBook);
-  const selected = pullback.score >= reversal.score ? pullback : reversal;
+  const momentum = scoreMomentum(candidate, derived, orderBook);
+  // 기존 pullback≥reversal 동점 우선순위는 그대로 두고, momentum은 분명히
+  // 더 높을 때만(동점이면 안 바꿈) 끼어든다 — 기존 두 경로의 동점 처리에
+  // 영향을 주지 않기 위해서다.
+  let selected = pullback.score >= reversal.score ? pullback : reversal;
+  if (momentum.score > selected.score) selected = momentum;
   const score = blockReasons.length > 0 ? Math.min(selected.score, 49) : selected.score;
   const stage = blockReasons.length > 0
     ? "BLOCKED"
@@ -24,6 +30,9 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
     symbol: candidate.symbol,
     name: candidate.name,
     market: candidate.market,
+    isNewlyListed: candidate.isNewlyListed,
+    daysSinceListing: candidate.daysSinceListing,
+    listingDate: candidate.listingDate,
     candidateType: selected.type,
     stage,
     score,
@@ -145,18 +154,70 @@ function scorePullback(candidate, derived, orderBook) {
   return { type: "PULLBACK", score: Math.min(100, score), reasons };
 }
 
-function buildBlockReasons(candidate, bars, orderBook, derived, settings) {
+// 눌림목(scorePullback)·반전(scoreReversal)은 둘 다 "한 번 빠졌다가 다시
+// 오른다"는 모양에 가산점을 준다. 문제는 pullbackDepthBps(최근 4분봉 고점
+// 대비 눌림폭)가 "눌렸다가 이미 회복된" 종목도 "한 번도 안 눌린" 종목도 똑같이
+// 0에 가깝게 나온다는 점이다 — 둘 다 마지막 분봉이 곧 최근 고점이기 때문에,
+// 이 지표 하나로는 구분이 안 된다. 실제로 구분되는 신호는 거래량이다: 눌림목은
+// 눌리는 구간에서 거래량이 줄어야 신뢰도가 높고(volumeContractionRatio≤0.9),
+// 쉬지 않고 오르는 진짜 추세는 거래량이 줄지 않고 유지·증가한다(2026-10-01,
+// "상승추세 종목을 빨리 찾아야 하는데 못 찾는 것 같다"는 지적으로 확인·보정
+// — 처음엔 pullbackDepthBps만으로 구분하려다 기존 PULLBACK 테스트 후보까지
+// MOMENTUM으로 잘못 뺏는 회귀를 테스트로 잡아 거래량 기준으로 바꿨다).
+function scoreMomentum(candidate, derived, orderBook) {
+  let score = 0;
+  const reasons = [];
+  if (candidate.changePercent !== null && candidate.changePercent > 0) score += add(8, "당일 상승 추세 유지", reasons);
+  if (derived.priorReturnBps >= 20) score += add(16, "직전 구간부터 이어지는 상승", reasons);
+  if (derived.recentReturnBps >= 8) score += add(16, "최근에도 계속 상승", reasons);
+  if (derived.higherRecentLows) score += add(14, "저점이 계속 높아지는 추세", reasons);
+  if (derived.volumeContractionRatio !== null && derived.volumeContractionRatio >= 1) {
+    score += add(16, "거래량이 줄지 않고 유지·증가하며 상승", reasons);
+  }
+  if (derived.bookImbalance >= 0.05) score += add(10, "매수호가 우위", reasons);
+  if (orderBook.spreadTicks !== null && orderBook.spreadTicks <= 2) score += add(6, "스프레드 2틱 이하", reasons);
+  if (candidate.accumulatedTradingValue >= 5_000_000_000) score += add(4, "거래대금 충분", reasons);
+  return { type: "MOMENTUM", score: Math.min(100, score), reasons };
+}
+
+// 데이터 공급 결함과 전략 판정을 구분한다. 응답이 통째로 비어 있는 것과
+// 분봉이 실제로 모자란 것은 원인도 대응도 다르다.
+function describeBarSupply(rawValue, bars) {
+  const rawCount = Array.isArray(rawValue) ? rawValue.length : 0;
+  return {
+    rawCount,
+    usableCount: bars.length,
+    emptyResponse: rawCount > 0 && bars.length === 0,
+  };
+}
+
+function buildBlockReasons(candidate, bars, orderBook, derived, settings, barSupply) {
   const reasons = [];
   if (candidate.tradingHalted) reasons.push("거래정지 또는 일시정지 상태");
   if (candidate.currentPrice === null) reasons.push("현재가 없음");
   if (candidate.accumulatedTradingValue < settings.minimumTradingValue) {
     reasons.push(`누적 거래대금 ${formatWon(settings.minimumTradingValue)} 미만`);
   }
-  if (bars.length < 8) reasons.push("당일 분봉 데이터 8개 미만");
+  if (barSupply.emptyResponse) {
+    reasons.push(`분봉 응답 ${barSupply.rawCount}건이 모두 빈 값 — 시세 데이터 결함`);
+  } else if (bars.length < 8) {
+    reasons.push("당일 분봉 데이터 8개 미만");
+  }
+  // REST 체결강도 결측은 차단 사유가 아니다. ENTRY_READY의 체결강도 게이트는
+  // 실시간 체결(H0STCNT0)이 판정하며 그쪽은 종목 전량 수신된다
+  // (realtimeConfirmationEngine.js). REST 값은 예비 점수에만 쓰이므로,
+  // 없으면 powerScore가 0이 될 뿐이고 결측 자체는 dataCompleteness로 드러난다.
   if (orderBook.bestBid === null || orderBook.bestAsk === null) reasons.push("최우선 호가 없음");
   if (orderBook.spreadTicks !== null && orderBook.spreadTicks > 3) reasons.push("스프레드 3틱 초과");
-  if (candidate.changePercent !== null && candidate.changePercent > settings.maximumDailyRisePercent) {
-    reasons.push(`당일 상승률 ${settings.maximumDailyRisePercent}% 초과`);
+  // 신규상장/공모주 당일 종목은 상장 초반 상승폭이 표준 가드를 거의 항상 넘는다.
+  // 이 두 가드만 완화된 문턱을 쓴다(사용자 승인, 2026-09-24). VWAP 이격·최근
+  // 급등 가드는 신규상장 여부와 무관하게 그대로 적용한다 — 장중 과열 추격은
+  // 여전히 걸러야 한다.
+  const dailyRiseCap = candidate.isNewlyListed
+    ? settings.newlyListedMaximumDailyRisePercent
+    : settings.maximumDailyRisePercent;
+  if (candidate.changePercent !== null && candidate.changePercent > dailyRiseCap) {
+    reasons.push(`당일 상승률 ${dailyRiseCap}% 초과`);
   }
   if (derived.vwapExtensionBps !== null && derived.vwapExtensionBps > settings.maximumVwapExtensionBps) {
     reasons.push(`VWAP 상단 이격 ${settings.maximumVwapExtensionBps}bp 초과`);
@@ -164,8 +225,11 @@ function buildBlockReasons(candidate, bars, orderBook, derived, settings) {
   if (derived.recentReturnBps > settings.maximumRecentRiseBps) {
     reasons.push(`최근 4개 분봉 상승 ${settings.maximumRecentRiseBps}bp 초과`);
   }
-  if (derived.upperLimitDistanceBps !== null && derived.upperLimitDistanceBps <= settings.upperLimitProximityBps) {
-    reasons.push(`상한가 ${settings.upperLimitProximityBps}bp 이내 근접`);
+  const upperLimitCap = candidate.isNewlyListed
+    ? settings.newlyListedUpperLimitProximityBps
+    : settings.upperLimitProximityBps;
+  if (derived.upperLimitDistanceBps !== null && derived.upperLimitDistanceBps <= upperLimitCap) {
+    reasons.push(`상한가 ${upperLimitCap}bp 이내 근접`);
   }
   if (candidate.fetchedAt !== null && candidate.evaluatedAt - candidate.fetchedAt > 60_000) {
     reasons.push("시세 데이터 60초 초과 지연");
@@ -264,6 +328,9 @@ function normalizeCandidate(input) {
     fluctuationRank: integerOrNull(input.fluctuationRank),
     volumePowerRank: integerOrNull(input.volumePowerRank),
     tradingHalted: Boolean(input.tradingHalted),
+    isNewlyListed: Boolean(input.isNewlyListed),
+    daysSinceListing: integerOrNull(input.daysSinceListing),
+    listingDate: input.listingDate ? String(input.listingDate) : null,
     tickSize: positiveOrNull(input.tickSize) ?? 1,
     orderBook: input.orderBook,
     minuteBars: input.minuteBars,

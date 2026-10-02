@@ -55,6 +55,44 @@ test("execution journal appends durable JSONL events and restores the sequence",
   });
 });
 
+test("execution journal persists and restores reconciliation lifecycle events", () => {
+  withTemporaryDirectory((directory) => {
+    const filePath = join(directory, "execution-journal.jsonl");
+    const journal = new ExecutionJournal(filePath, {
+      now: () => 3_000,
+      sessionId: "reconciliation-session",
+      eventIdFactory: makeIdFactory("reconciliation"),
+    });
+    journal.append("BROKER_RECONCILIATION_BASELINE", {
+      day: "2026-08-04",
+      openingPositions: [],
+    });
+    journal.append("BROKER_RECONCILIATION_MISMATCH", {
+      day: "2026-08-04",
+      signature: "external-order",
+      issues: [],
+      summary: {},
+    }, 3_001);
+    journal.append("BROKER_RECONCILIATION_ACKNOWLEDGED", {
+      day: "2026-08-04",
+      acknowledgedAt: 3_002,
+      summary: {},
+    }, 3_002);
+
+    const restored = new ExecutionJournal(filePath, {
+      now: () => 4_000,
+      sessionId: "restored-reconciliation-session",
+      eventIdFactory: makeIdFactory("restored-reconciliation"),
+    });
+    assert.equal(restored.status().lastSequence, 3);
+    assert.deepEqual(restored.readAll().map((event) => event.type), [
+      "BROKER_RECONCILIATION_BASELINE",
+      "BROKER_RECONCILIATION_MISMATCH",
+      "BROKER_RECONCILIATION_ACKNOWLEDGED",
+    ]);
+  });
+});
+
 test("execution journal rejects corrupt JSON and broken sequence without truncating it", () => {
   withTemporaryDirectory((directory) => {
     const filePath = join(directory, "execution-journal.jsonl");
@@ -181,4 +219,40 @@ test("runtime enables the kill switch when execution journal capture fails", () 
   );
   assert.equal(runtime.snapshot().system.killSwitch, true);
   assert.equal(runtime.snapshot().system.autoPaperTrading, false);
+});
+
+// 회귀 방지: app.js가 기록하는 이벤트 타입이 EVENT_TYPES 화이트리스트에 빠지면
+// 서버가 기동 중 죽는다(2026-09-07 LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED 사고).
+// 테스트가 소스를 직접 훑어 새 이벤트 등록 누락을 잡는다.
+test("every journal event appended by app.js is a registered event type", () => {
+  const appSource = readFileSync(new URL("../app.js", import.meta.url), "utf8");
+  const appended = [...appSource.matchAll(/(?:Journal|journal)\.append\(\s*"([A-Z_]+)"/g)]
+    .map((match) => match[1]);
+  assert.ok(appended.length > 0, "app.js에서 저널 append 호출을 찾지 못했습니다.");
+
+  withTemporaryDirectory((directory) => {
+    const journal = new ExecutionJournal(join(directory, "event-type-check.jsonl"));
+    for (const type of new Set(appended)) {
+      assert.doesNotThrow(
+        () => journal.append(type, {}),
+        `app.js가 기록하는 ${type}이 EVENT_TYPES에 등록되지 않았습니다.`,
+      );
+    }
+  });
+});
+
+test("journal accepts the shared quote credential opt-in event", () => {
+  withTemporaryDirectory((directory) => {
+    const path = join(directory, "shared-credential.jsonl");
+    const journal = new ExecutionJournal(path);
+    journal.append("LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED", {
+      processId: 1234,
+      orderEnabled: true,
+      credentialSource: "ENV",
+    });
+    const written = readFileSync(path, "utf8").trim().split("\n");
+    const last = JSON.parse(written[written.length - 1]);
+    assert.equal(last.type, "LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED");
+    assert.equal(last.payload.orderEnabled, true);
+  });
 });

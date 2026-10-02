@@ -6,6 +6,8 @@ import {
   KIS_PAPER_MODE_TRADING,
   loadKisPaperConfiguration,
   publicKisPaperConfiguration,
+  KIS_PAPER_LIMIT_BOUNDS,
+  normalizeKisPaperLimits,
 } from "../integrations/kis/kisPaperConfig.js";
 
 test("KIS paper config is disabled by default", () => {
@@ -68,4 +70,43 @@ test("KIS paper config validates account format and safety limits", () => {
       PULSEHFT_KIS_PAPER_MAX_DAILY_ORDERS: "0",
     },
   }), (error) => error.code === "KIS_PAPER_LIMIT_INVALID");
+});
+
+// 검증 중에는 표본 수집 속도와 안전 한도를 자주 조절한다. .env 수정 + 재기동 없이
+// 화면에서 바꿀 수 있어야 하므로 부분 입력을 현재 한도 위에 덮어쓴다.
+test("한도는 부분 입력을 현재 값 위에 덮어쓴다", () => {
+  const current = {
+    maxOrderQuantity: 10, maxOrderValue: 1_000_000, maxDailyOrders: 20,
+    maxDailyLoss: 100_000, maxConsecutiveLosses: 3,
+  };
+  const next = normalizeKisPaperLimits({ maxDailyOrders: 200, maxConsecutiveLosses: 0 }, current);
+  assert.equal(next.maxDailyOrders, 200);
+  assert.equal(next.maxConsecutiveLosses, 0, "0으로 해제할 수 있어야 한다");
+  assert.equal(next.maxOrderQuantity, 10, "안 건드린 항목은 유지");
+  assert.equal(next.maxOrderValue, 1_000_000);
+});
+
+test("빈 값은 현재 한도를 유지한다", () => {
+  const current = { maxOrderQuantity: 7, maxOrderValue: 500_000, maxDailyOrders: 30, maxDailyLoss: 50_000, maxConsecutiveLosses: 2 };
+  const next = normalizeKisPaperLimits({ maxDailyOrders: "" }, current);
+  assert.equal(next.maxDailyOrders, 30);
+  assert.equal(next.maxOrderQuantity, 7);
+});
+
+test("범위를 벗어난 한도와 알 수 없는 항목을 거부한다", () => {
+  for (const input of [
+    { maxDailyOrders: 0 },
+    { maxDailyOrders: 10_001 },
+    { maxOrderQuantity: 1.5 },
+    { maxConsecutiveLosses: 101 },
+    { maxDailyLoss: -1 },
+    { unknownLimit: 1 },
+  ]) {
+    assert.throws(() => normalizeKisPaperLimits(input, null), `${JSON.stringify(input)}는 거부해야 한다`);
+  }
+});
+
+test("한도 범위는 화면이 쓸 수 있게 노출된다", () => {
+  assert.equal(KIS_PAPER_LIMIT_BOUNDS.maxDailyOrders.maximum, 10_000);
+  assert.equal(KIS_PAPER_LIMIT_BOUNDS.maxConsecutiveLosses.minimum, 0);
 });

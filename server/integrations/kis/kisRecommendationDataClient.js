@@ -16,9 +16,17 @@ const ORDER_BOOK = Object.freeze({
   path: "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
   trId: "FHKST01010200",
 });
+// 당일 분봉 전용 시장구분. 통합("UN")은 NXT 미상장 종목에서 빈 응답을 준다.
+const MINUTE_BAR_MARKET = "J";
 const MINUTE_BARS = Object.freeze({
   path: "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
   trId: "FHKST03010200",
+});
+// 예탁원정보(공모주청약일정). 신규상장/공모주 당일 종목을 식별하는 유일한 소스로,
+// 종목마스터에는 상장일이 없다.
+const PUB_OFFER = Object.freeze({
+  path: "/uapi/domestic-stock/v1/ksdinfo/pub-offer",
+  trId: "HHKDB669108C0",
 });
 
 export class KisRecommendationDataClient {
@@ -70,25 +78,139 @@ export class KisRecommendationDataClient {
       minuteBarsApiAvailable: true,
       instrumentMetadataFilterAvailable: Boolean(this.instrumentCatalog),
       realtimeConfirmationAvailable: false,
+      newlyListedApiAvailable: true,
       minimumIntervalMs: this.minimumIntervalMs,
       rateLimitRetryCount: this.rateLimitRetryCount,
     };
   }
 
-  async getUniverse({ limit = 30 } = {}) {
+  async getUniverse({ limit = 30, newlyListedWindowDays = 20 } = {}) {
     const normalizedLimit = integerInRange(limit, 10, 100, "limit");
     const volumeRows = await this.getVolumeRank();
     const fluctuationRows = await this.getFluctuationRank(normalizedLimit);
     const powerRows = await this.getVolumePowerRank();
+    const newlyListed = await this.getRecentListingsSafely(newlyListedWindowDays);
     const merged = mergeRankingRows({
       volumeRows,
       fluctuationRows,
       powerRows,
       limit: 100,
       fetchedAt: this.now(),
+      newlyListed,
     });
     if (!this.instrumentCatalog) return merged.slice(0, normalizedLimit);
     return filterCommonStockCandidates(merged, this.instrumentCatalog, normalizedLimit);
+  }
+
+  // 예탁원 공모주청약일정 조회는 우선순위를 얹는 보조 신호일 뿐이라, 실패해도
+  // 전체 추천 조회를 막지 않는다(빈 Map으로 조용히 대체).
+  async getRecentListingsSafely(windowDays) {
+    try {
+      return await this.getRecentListings({ windowDays });
+    } catch {
+      return new Map();
+    }
+  }
+
+  // 상장/등록일(list_dt)이 오늘 기준 windowDays 이내인 종목만 반환한다.
+  // KIS 종목마스터에는 상장일이 없어 이 API가 유일한 소스다.
+  async getRecentListings({ windowDays = 20 } = {}) {
+    const days = integerInRange(windowDays, 0, 60, "windowDays");
+    const today = currentKoreaDate(this.now());
+    // F_DT/T_DT는 상장일(list_dt)이 아니라 청약 기준일(record_date)로 필터링된다.
+    // 청약 마감부터 실제 상장까지 실측 10~14일 지연이 있어(2026-09-24 실측), 조회
+    // 구간을 windowDays보다 넉넉히 넓혀야 상장 직후 종목을 놓치지 않는다. 실제
+    // "최근 상장" 판정은 아래에서 list_dt 기준 daysSinceListing으로 다시 거른다.
+    const SUBSCRIPTION_TO_LISTING_LAG_DAYS = 15;
+    const from = shiftDate(today, -(days + SUBSCRIPTION_TO_LISTING_LAG_DAYS));
+    const to = shiftDate(today, 5);
+    const rows = await this.getPublicOfferingRows(from, to);
+    const todayValue = today.getTime();
+    const listings = new Map();
+    for (const row of rows) {
+      const symbol = textOrNull(row.sht_cd);
+      const listDate = parseKisDate(row.list_dt);
+      // 매매 로직용이라 실시간 시세가 받는 숫자 6자리 코드만 남긴다.
+      if (!symbol || !/^\d{6}$/.test(symbol) || !listDate) continue;
+      const listedValue = listDate.getTime();
+      if (listedValue > todayValue) continue; // 상장 예정 — 아직 매매 대상 아님
+      const daysSinceListing = Math.round((todayValue - listedValue) / 86_400_000);
+      if (daysSinceListing > days) continue;
+      listings.set(symbol, {
+        symbol,
+        name: textOrNull(row.isin_name) ?? symbol,
+        listingDate: formatIso(listDate),
+        daysSinceListing,
+      });
+    }
+    return listings;
+  }
+
+  // 공모주 청약 일정을 상장 전/후 가리지 않고 전부 돌려준다. getRecentListings()는
+  // 매매 로직(이미 상장된 신규 종목 식별)용이라 상장 전 종목을 일부러 뺀다 —
+  // 이건 반대로 "상장할 종목을 미리 보고 싶다"는 화면 전용 목록이라, 아직
+  // list_dt가 안 잡힌(미정) 종목까지 청약기간·확정공모가·주관사와 함께 보여준다
+  // (2026-10-01, "날짜도 보여야 하고 미리 알 수 있어야지" 요청으로 추가).
+  //
+  // 2026-10-02 "청약은 중요하지 않아, 상장일 기준으로 해줘" 요청으로 상장일 기준으로
+  // 바꿨다. API의 F_DT/T_DT는 청약 기준일로만 걸리므로, 청약→상장 지연만큼 조회
+  // 구간을 앞으로 넓혀 받은 뒤 상장일이 [오늘-pastDays, 오늘+futureDays]에 드는
+  // 종목만 남긴다. 상장일이 아직 미정인 종목은 앞으로 상장할 종목이라 함께 둔다.
+  async getPublicOfferingSchedule({ pastDays = 10, futureDays = 60 } = {}) {
+    const past = integerInRange(pastDays, 0, 365, "pastDays");
+    const future = integerInRange(futureDays, 0, 365, "futureDays");
+    const SUBSCRIPTION_TO_LISTING_LAG_DAYS = 30;
+    const today = currentKoreaDate(this.now());
+    const listedFrom = formatIso(shiftDate(today, -past));
+    const listedTo = formatIso(shiftDate(today, future));
+    const from = shiftDate(today, -(past + SUBSCRIPTION_TO_LISTING_LAG_DAYS));
+    const to = shiftDate(today, future);
+    const rows = await this.getPublicOfferingRows(from, to);
+    const items = [];
+    const droppedSymbols = [];
+    for (const row of rows) {
+      const item = normalizePublicOfferingRow(row);
+      if (!item) {
+        droppedSymbols.push(String(row?.sht_cd ?? ""));
+        continue;
+      }
+      if (item.listingDate && (item.listingDate < listedFrom || item.listingDate > listedTo)) continue;
+      items.push(item);
+    }
+    if (droppedSymbols.length > 0) {
+      console.warn(
+        `[ipo-schedule] 공모주 일정 ${rows.length}건 중 ${droppedSymbols.length}건을 종목코드 형식 때문에 제외했습니다: ${droppedSymbols.join(", ")}`,
+      );
+    }
+    // 상장일이 이른 순으로 — 상장일 미정은 맨 뒤에, 그 안에서는 청약 시작일순으로.
+    items.sort((a, b) => (a.listingDate ?? "9999-99-99").localeCompare(b.listingDate ?? "9999-99-99")
+      || (a.subscriptionStart ?? "9999-99-99").localeCompare(b.subscriptionStart ?? "9999-99-99"));
+    return { fetchedAt: this.now(), items };
+  }
+
+  // 예탁원 공모주청약일정을 연속조회로 끝까지 받는다. 무한 루프를 막으려고
+  // 페이지 수에 상한을 둔다.
+  async getPublicOfferingRows(from, to, { maxPages = 10 } = {}) {
+    const rows = [];
+    let continuation = false;
+    for (let page = 0; page < maxPages; page += 1) {
+      const { payload, hasMore } = await this.getJsonPage(PUB_OFFER, {
+        SHT_CD: "",
+        CTS: "",
+        F_DT: formatYyyymmdd(from),
+        T_DT: formatYyyymmdd(to),
+      }, "예탁원 공모주청약일정 조회", { continuation });
+      if (!Array.isArray(payload.output1)) {
+        throw new KisApiError(
+          "한국투자 공모주청약일정 응답에 output1 배열이 없습니다.",
+          "KIS_PUB_OFFER_INVALID_RESPONSE",
+        );
+      }
+      rows.push(...payload.output1);
+      if (!hasMore) break;
+      continuation = true;
+    }
+    return rows;
   }
 
   async getCandidateDetails({ symbol, market = "UN" }) {
@@ -191,10 +313,13 @@ export class KisRecommendationDataClient {
     };
   }
 
-  async getMinuteBars({ symbol, market = "UN", hour = currentKoreaTime() }) {
+  // 당일 분봉은 반드시 "J"(주식·ETF·ETN)로 조회한다. "UN"(KRX+NXT 통합)으로 조회하면
+  // NXT 미상장 종목이 30행 전부 O=H=L=C=V=0인 빈 응답으로 돌아와, 평가 단계에서
+  // "분봉 8개 미만"으로 조용히 차단된다(2026-09-10 확인).
+  async getMinuteBars({ symbol, market = MINUTE_BAR_MARKET, hour = currentKoreaTime() }) {
     const normalizedSymbol = normalizeSymbol(symbol);
     const payload = await this.getJson(MINUTE_BARS, {
-      FID_COND_MRKT_DIV_CODE: normalizeMarket(market),
+      FID_COND_MRKT_DIV_CODE: MINUTE_BAR_MARKET,
       FID_INPUT_ISCD: normalizedSymbol,
       FID_INPUT_HOUR_1: normalizeHour(hour),
       FID_PW_DATA_INCU_YN: "Y",
@@ -215,24 +340,29 @@ export class KisRecommendationDataClient {
   }
 
   async getJson(definition, params, operation) {
+    return (await this.getJsonPage(definition, params, operation)).payload;
+  }
+
+  // KIS 연속조회: 응답 헤더 tr_cont가 "M"/"F"면 다음 페이지가 있고, 다음 요청은
+  // 요청 헤더 tr_cont를 "N"으로 보내야 이어서 받는다.
+  async getJsonPage(definition, params, operation, { continuation = false } = {}) {
     for (let attempt = 0; attempt <= this.rateLimitRetryCount; attempt += 1) {
       await this.waitForRateLimit();
       const accessToken = await this.client.getAccessToken();
       const url = new URL(definition.path, this.client.config.baseUrl);
       for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
-      const response = await this.client.request(url, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/plain",
-          charset: "UTF-8",
-          authorization: `Bearer ${accessToken}`,
-          appkey: this.client.config.appKey,
-          appsecret: this.client.config.appSecret,
-          tr_id: definition.trId,
-          custtype: "P",
-        },
-      });
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "text/plain",
+        charset: "UTF-8",
+        authorization: `Bearer ${accessToken}`,
+        appkey: this.client.config.appKey,
+        appsecret: this.client.config.appSecret,
+        tr_id: definition.trId,
+        custtype: "P",
+      };
+      if (continuation) headers.tr_cont = "N";
+      const response = await this.client.request(url, { method: "GET", headers });
       let payload;
       try {
         payload = await response.json();
@@ -265,7 +395,8 @@ export class KisRecommendationDataClient {
           "KIS_RECOMMENDATION_REJECTED",
         );
       }
-      return payload;
+      const trCont = String(response.headers?.get?.("tr_cont") ?? "").trim().toUpperCase();
+      return { payload, hasMore: trCont === "M" || trCont === "F" };
     }
     throw new KisApiError(
       `한국투자 ${operation} 호출 제한 재시도 횟수를 초과했습니다.`,
@@ -311,16 +442,32 @@ export async function filterCommonStockCandidates(candidates, instrumentCatalog,
   return filtered;
 }
 
-export function mergeRankingRows({ volumeRows, fluctuationRows, powerRows, limit, fetchedAt }) {
+export function mergeRankingRows({
+  volumeRows,
+  fluctuationRows,
+  powerRows,
+  limit,
+  fetchedAt,
+  newlyListed = new Map(),
+}) {
   const candidates = new Map();
   addRows(candidates, volumeRows, "volumeRank");
   addRows(candidates, fluctuationRows, "fluctuationRank");
   addRows(candidates, powerRows, "volumePowerRank");
-  const merged = [...candidates.values()].map((candidate) => ({
-    ...candidate,
-    preliminaryScore: preliminaryScore(candidate),
-    fetchedAt,
-  }));
+  const merged = [...candidates.values()].map((candidate) => {
+    const listing = newlyListed.get(candidate.symbol) ?? null;
+    const withListing = {
+      ...candidate,
+      isNewlyListed: Boolean(listing),
+      daysSinceListing: listing?.daysSinceListing ?? null,
+      listingDate: listing?.listingDate ?? null,
+    };
+    return {
+      ...withListing,
+      preliminaryScore: preliminaryScore(withListing),
+      fetchedAt,
+    };
+  });
   return merged
     .filter((candidate) => isEligibleCandidate(candidate))
     .sort((a, b) => b.preliminaryScore - a.preliminaryScore || a.symbol.localeCompare(b.symbol))
@@ -344,6 +491,7 @@ function addRows(target, rows, rankField) {
       accumulatedVolume: 0,
       accumulatedTradingValue: 0,
       executionStrength: null,
+      volumeTurnoverRate: null,
     };
     target.set(normalized.symbol, {
       ...previous,
@@ -362,7 +510,12 @@ function normalizeRankingRow(row) {
     changePercent: firstNumber(row.prdy_ctrt, row.prdy_vrss_rt, row.rsfl_rate),
     accumulatedVolume: firstNumber(row.acml_vol, row.acml_tr_qty) ?? 0,
     accumulatedTradingValue: firstNumber(row.acml_tr_pbmn, row.acml_tr_amt) ?? 0,
-    executionStrength: firstNumber(row.tday_rltv, row.vol_tnrt, row.cttr),
+    // cttr(체결강도)와 vol_tnrt(거래량회전율)는 완전히 다른 지표다. 예전에는
+    // firstNumber(tday_rltv, vol_tnrt, cttr)로 묶어 읽어서, 거래량순위에서 온 종목은
+    // 회전율이 체결강도 자리에 들어갔다(삼성전자 0.06 등). 회전율은 별도 필드로 분리하고
+    // 체결강도는 진짜 체결강도 필드에서만 읽는다.
+    executionStrength: firstNumber(row.cttr, row.tday_rltv),
+    volumeTurnoverRate: firstNumber(row.vol_tnrt),
   };
 }
 
@@ -385,7 +538,9 @@ function preliminaryScore(candidate) {
   const powerScore = candidate.executionStrength !== null
     ? Math.min(20, Math.max(0, (candidate.executionStrength - 80) / 2))
     : 0;
-  return rankScore + tradingValueScore + powerScore;
+  // 신규상장/공모주 당일 종목은 초반 상승폭이 커 우선순위를 높인다(2026-09-24).
+  const newlyListedBoost = candidate.isNewlyListed ? 25 : 0;
+  return rankScore + tradingValueScore + powerScore + newlyListedBoost;
 }
 
 function normalizeRankingOutput(payload, code) {
@@ -415,6 +570,72 @@ function normalizeHour(value) {
   const hour = String(value ?? "").replaceAll(":", "").trim();
   if (!/^\d{6}$/.test(hour)) throw new KisApiError("분봉 조회시간은 HHMMSS 형식이어야 합니다.", "KIS_INVALID_HOUR", 400);
   return hour;
+}
+
+// 달력 날짜 비교/연산만 필요하므로 KST 자정을 UTC epoch에 고정해 표현한다
+// (실제 타임존 인스턴트가 아니라 순수 달력값으로 다룬다). 테스트에서 시각을
+// 고정할 수 있도록 인스턴스의 now()를 그대로 받는다(Date.now 직접 호출 금지).
+function currentKoreaDate(nowMs) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(nowMs));
+  const get = (type) => parts.find((part) => part.type === type)?.value ?? "01";
+  return new Date(Date.UTC(Number(get("year")), Number(get("month")) - 1, Number(get("day"))));
+}
+
+function shiftDate(date, deltaDays) {
+  return new Date(date.getTime() + deltaDays * 86_400_000);
+}
+
+function formatYyyymmdd(date) {
+  return `${date.getUTCFullYear()}${pad2(date.getUTCMonth() + 1)}${pad2(date.getUTCDate())}`;
+}
+
+function formatIso(date) {
+  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+}
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+// KIS 예탁원정보 응답의 날짜 필드는 "YYYYMMDD" 또는 "YYYY/MM/DD" 형식이 섞여 온다.
+function parseKisDate(value) {
+  const digits = String(value ?? "").replaceAll(/\D/g, "");
+  if (digits.length !== 8) return null;
+  const year = Number(digits.slice(0, 4));
+  const month = Number(digits.slice(4, 6));
+  const day = Number(digits.slice(6, 8));
+  if (!year || !month || !day) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+// 예탁원 공모주청약일정 한 행을 화면 표시용으로 정규화한다. list_dt는 상장일이
+// 아직 확정되지 않은 종목(공모가 확정 전 등)에서는 빈 문자열로 온다 — null로
+// 그대로 둬 "미정"을 화면에서 표현할 수 있게 한다.
+function normalizePublicOfferingRow(row) {
+  // 신규 상장 종목은 "0088M0"처럼 영문이 섞인 단축코드를 받기도 해서, 화면용
+  // 일정에서는 숫자로 시작하는 영숫자 6자리까지 받는다.
+  const symbol = textOrNull(row.sht_cd)?.toUpperCase() ?? null;
+  if (!symbol || !/^\d[0-9A-Z]{5}$/.test(symbol)) return null;
+  const [subscriptionStartRaw, subscriptionEndRaw] = String(row.subscr_dt ?? "").split("~");
+  return {
+    symbol,
+    name: textOrNull(row.isin_name) ?? symbol,
+    fixedOfferPrice: numberOrNull(row.fix_subscr_pri),
+    subscriptionStart: formatIsoOrNull(parseKisDate(subscriptionStartRaw)),
+    subscriptionEnd: formatIsoOrNull(parseKisDate(subscriptionEndRaw)),
+    listingDate: formatIsoOrNull(parseKisDate(row.list_dt)),
+    leadManager: textOrNull(row.lead_mgr),
+  };
+}
+
+function formatIsoOrNull(date) {
+  return date ? formatIso(date) : null;
 }
 
 function currentKoreaTime() {

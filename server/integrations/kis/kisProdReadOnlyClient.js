@@ -195,6 +195,8 @@ function normalizeCurrentPrice(output, { symbol, market, fetchedAt }) {
     lowerLimitPrice: numberOrNull(output.stck_llam),
     basePrice: numberOrNull(output.stck_sdpr),
     askUnit: numberOrNull(output.aspr_unit),
+    // 체결강도. 순위 API마다 필드가 달라 값이 뒤섞이므로 종목 무관하게 현재가에서 읽는다.
+    executionStrength: numberOrNull(output.cttr),
     tradingHalted: output.temp_stop_yn === "Y",
   };
 }

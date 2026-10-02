@@ -46,6 +46,24 @@ test("same clientOrderId is idempotent and does not call broker twice", async ()
   assert.equal(broker.submitCalls, 1);
 });
 
+// 2026-09-23: 9연패가 났는데 매도가 손절인지 트레일링인지 신호청산인지 저널에서
+// 전혀 알 수 없었다(어느 것도 KIS에 보낼 필드가 아니라서). 내부 진단용 메모로만
+// 저널에 남기고 KIS로 나가는 request에는 섞이지 않는지 같이 확인한다.
+test("an order's internal reason is journaled but never sent to the broker", async () => {
+  const journal = new MemoryJournal();
+  const broker = client();
+  const orders = service({ client: broker, journal });
+  await orders.submitOrder({
+    clientOrderId: "reason-1", side: "SELL", symbol: "005930", type: "MARKET", quantity: 1,
+    referencePrice: 70_000, reason: "TRAILING_STOP",
+  });
+
+  const commandEvent = journal.readAll().find((event) => event.type === "BROKER_ORDER_COMMAND");
+  assert.equal(commandEvent.payload.reason, "TRAILING_STOP");
+  assert.equal(commandEvent.payload.request.reason, undefined, "reason이 KIS 요청 필드로 새면 안 된다");
+  assert.equal(broker.submitCalls, 1);
+});
+
 test("restart replays accepted result without reissuing order", async () => {
   const journal = new MemoryJournal();
   const firstBroker = client();
@@ -86,6 +104,22 @@ test("ambiguous broker failure is journaled and blocks later new orders", async 
   assert.equal(first.status, "UNKNOWN_RESULT");
   assert.equal(callbackCount, 1);
   await assert.rejects(() => orders.submitOrder({ clientOrderId: "ambiguous-2", side: "BUY", symbol: "005930", type: "LIMIT", quantity: 1, limitPrice: 70000 }), (error) => error.code === "KIS_PAPER_KILL_SWITCH");
+});
+
+test("a failed reconciliation check (KIS call throws) is journaled with the error so the cause is diagnosable later", async () => {
+  const journal = new MemoryJournal();
+  const broker = client({
+    async getDailyOrders() { throw new Error("ECONNRESET"); },
+    async getCancelableOrders() { return { orders: [] }; },
+  });
+  const orders = service({ client: broker, journal });
+
+  await orders.performReconciliation();
+
+  const events = journal.readAll().filter((event) => event.type === "BROKER_RECONCILIATION_UNAVAILABLE");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.error.message, "ECONNRESET");
+  assert.equal(typeof events[0].payload.checkedAt, "number");
 });
 
 test("journal command failure prevents any broker request", async () => {
@@ -187,4 +221,83 @@ test("result journal failure transitions accepted broker order to UNKNOWN_RESULT
   assert.equal(replay.status, "UNKNOWN_RESULT");
   assert.equal(replay.replayed, true);
   assert.equal(broker.submitCalls, 1);
+});
+
+// 2026-09-17: 손절 매도가 계속 1회 주문 금액 한도에 걸려 거절되면서 포지션이
+// 묶였다. 보호청산(protectiveExit)은 이미 보유한 포지션을 줄이는 매도이므로
+// 이 한도들이 새 위험을 늘리는 것을 막을 이유가 없다.
+test("protective exit bypasses the per-order quantity and value limits", async () => {
+  const broker = client();
+  const orders = service({
+    client: broker,
+    limits: { maxOrderQuantity: 1, maxOrderValue: 1_000_000, maxDailyOrders: 20, maxDailyLoss: 0 },
+  });
+  const result = await orders.submitOrder({
+    clientOrderId: "protective-1",
+    side: "SELL",
+    symbol: "005930",
+    type: "MARKET",
+    quantity: 8,
+    referencePrice: 224_000,
+    protectiveExit: true,
+  });
+  assert.equal(result.status, "ACCEPTED");
+  assert.equal(broker.submitCalls, 1);
+});
+
+test("a non-protective order is still blocked by the same quantity and value limits", async () => {
+  const broker = client();
+  const orders = service({
+    client: broker,
+    limits: { maxOrderQuantity: 1, maxOrderValue: 1_000_000, maxDailyOrders: 20, maxDailyLoss: 0 },
+  });
+  await assert.rejects(
+    () => orders.submitOrder({
+      clientOrderId: "manual-sell-1",
+      side: "SELL",
+      symbol: "005930",
+      type: "MARKET",
+      quantity: 8,
+      referencePrice: 224_000,
+    }),
+    (error) => error.code === "KIS_PAPER_ORDER_QUANTITY_LIMIT",
+  );
+  assert.equal(broker.submitCalls, 0);
+});
+
+test("kill switch still blocks a protective exit — only quantity/value caps are bypassed", async () => {
+  const broker = client();
+  const orders = service({ client: broker });
+  orders.setKillSwitch(true);
+  await assert.rejects(
+    () => orders.submitOrder({
+      clientOrderId: "protective-2",
+      side: "SELL",
+      symbol: "005930",
+      type: "MARKET",
+      quantity: 1,
+      referencePrice: 70_000,
+      protectiveExit: true,
+    }),
+    (error) => error.code === "KIS_PAPER_KILL_SWITCH",
+  );
+  assert.equal(broker.submitCalls, 0);
+});
+
+test("a protective exit still rejects a nonsensical (zero/negative) quantity", async () => {
+  const broker = client();
+  const orders = service({ client: broker });
+  await assert.rejects(
+    () => orders.submitOrder({
+      clientOrderId: "protective-3",
+      side: "SELL",
+      symbol: "005930",
+      type: "MARKET",
+      quantity: 0,
+      referencePrice: 70_000,
+      protectiveExit: true,
+    }),
+    (error) => error.code === "KIS_PAPER_ORDER_QUANTITY_INVALID",
+  );
+  assert.equal(broker.submitCalls, 0);
 });

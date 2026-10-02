@@ -56,6 +56,13 @@ export class RecommendationScanner {
     this.bindRealtimeResearch();
   }
 
+  // 화면에서 실시간 확인 문턱(예: 체결강도)을 조절할 수 있도록 런타임에 바꾼다.
+  // 다음 attachRealtime() 호출부터(다음 폴링/재조회 시) 바로 적용된다.
+  updateSettings(partial) {
+    this.settings = normalizeRecommendationSettings({ ...this.settings, ...partial });
+    return publicRecommendationSettings(this.settings);
+  }
+
   status() {
     const dataStatus = this.dataClient?.status?.() ?? {
       enabled: false,
@@ -153,6 +160,7 @@ export class RecommendationScanner {
         this.dataClient,
         this.settings.maxUniverse,
         this.now,
+        this.settings.newlyListedWindowDays,
       );
     } catch (error) {
       this.value = {
@@ -220,6 +228,8 @@ export class RecommendationScanner {
           accumulatedTradingValue: quote.accumulatedTradingValue
             ?? base.accumulatedTradingValue,
           tradingHalted: quote.tradingHalted,
+          // 체결강도는 순위 API가 아니라 현재가 응답을 신뢰한다(순위별로 필드가 달라 단위가 섞인다).
+          executionStrength: quote.executionStrength ?? base.executionStrength ?? null,
           tickSize: quote.askUnit ?? 1,
           orderBook,
           minuteBars: details.minuteBars,
@@ -253,7 +263,11 @@ export class RecommendationScanner {
     const generatedAt = this.now();
     candidates.sort((a, b) => {
       const stageOrder = stagePriority(b.stage) - stagePriority(a.stage);
+      // 같은 단계라면 신규상장/공모주 당일 종목을 우선 노출한다(사용자 요청,
+      // 2026-09-24) — 초반 상승폭이 커 진입 기회로서의 가치가 더 크다.
+      const newlyListedOrder = Number(b.isNewlyListed) - Number(a.isNewlyListed);
       return stageOrder
+        || newlyListedOrder
         || b.score - a.score
         || b.accumulatedTradingValue - a.accumulatedTradingValue;
     });
@@ -339,6 +353,8 @@ export class RecommendationScanner {
     const realtime = evaluateRealtimeConfirmation(candidate, realtimeSnapshot, {
       now: this.now(),
       staleAfterMs: realtimeSnapshot?.staleAfterMs,
+      minimumExecutionStrength: this.settings.minimumExecutionStrength,
+      maximumRealtimeChaseBps: this.settings.maximumRealtimeChaseBps,
     });
     this.trackRealtimeState(candidate, realtime, source);
     return {
@@ -387,6 +403,8 @@ export class RecommendationScanner {
       const realtime = evaluateRealtimeConfirmation(candidate, snapshot, {
         now: this.now(),
         staleAfterMs: snapshot?.staleAfterMs,
+        minimumExecutionStrength: this.settings.minimumExecutionStrength,
+        maximumRealtimeChaseBps: this.settings.maximumRealtimeChaseBps,
       });
       this.trackRealtimeState(candidate, realtime, "MARKET_DATA");
     };
@@ -443,15 +461,15 @@ export class RecommendationScanner {
   }
 }
 
-async function collectUniverseSnapshot(dataClient, limit, now) {
+async function collectUniverseSnapshot(dataClient, limit, now, newlyListedWindowDays) {
   if (typeof dataClient.getUniverseSnapshot === "function") {
-    const snapshot = await dataClient.getUniverseSnapshot({ limit });
+    const snapshot = await dataClient.getUniverseSnapshot({ limit, newlyListedWindowDays });
     if (!Array.isArray(snapshot?.candidates)) {
       throw new TypeError("getUniverseSnapshot 응답에 candidates 배열이 필요합니다.");
     }
     return snapshot;
   }
-  const candidates = await dataClient.getUniverse({ limit });
+  const candidates = await dataClient.getUniverse({ limit, newlyListedWindowDays });
   return {
     fetchedAt: now(),
     limit,
