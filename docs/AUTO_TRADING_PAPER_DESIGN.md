@@ -58,6 +58,26 @@ expectedNetBps = takeProfitBps
 
 **스프레드가 넓으면 자동으로 걸러진다.** 스프레드가 클수록 `expectedNetBps`가 줄기 때문에 별도 스프레드 상한과 이중으로 작동한다.
 
+### 2-1. 추가 진입 필터 (2026-10-02)
+
+036930(주성엔지니어링) 매매 손실(순손익 −12,196원)을 분석해 추가했다. 그 매매는 아래 조건을 모두 어겼다. 당일 VWAP −193bp, 체결강도 91.8로 하락 중이었고, ENTRY_READY는 2분 40초만 유지됐으며, 점심시간이었고, 손절 100bp가 4.9틱이었다.
+
+| 설정 | 기본값 | 막는 것 |
+|---|---|---|
+| `entryMinimumExecutionStrength` | 100 | 매도 우위(체결강도 100 미만)에서의 진입 |
+| `entryMinimumVwapExtensionBps` | −50 | 당일 VWAP보다 크게 아래(하락 추세)에서의 반등 매수 |
+| `entryConfirmMs` | 30,000 | 한 순간만 맞은 신호. 연속 유지가 끊기면 처음부터 다시 잰다 |
+| `noEntryWindows` | 09:00–09:10, 11:30–13:00, 14:50–15:30 | 장 초반·점심·마감 직전 진입 |
+| `minimumStopTicks` | 6 | 손절폭이 호가 몇 틱밖에 안 되는 고가주 |
+| `minimumRewardRiskRatio` | 1.5 | (익절−비용−스프레드) ÷ (손절+비용+스프레드)가 낮은 진입 |
+| `maxConsecutiveLossesPerDay` | 3 | 오늘 비용 차감 후 연속 손실 뒤의 추가 진입 |
+
+연속 손실 제한은 주문 서비스의 `maxConsecutiveLosses`(킬 스위치)를 쓰지 않는다. 킬 스위치는 보호 청산 매도까지 막기 때문이다. 여기서는 신규 진입만 멈춘다.
+
+호가단위는 후보의 `price.tickSize`, 호가 스프레드 ÷ 스프레드 틱 수, KRX 호가가격단위 순서로 정한다. 스캐너 후보에는 `price.tickSize`가 없다.
+
+설정 변경 효과는 `npm run backtest:auto-trading -- <연구 기록.jsonl...>`로 확인한다. 같은 기록에 이전 규칙과 새 규칙을 나란히 돌린다(실제 `KisPaperAutoTrader` 사용, 시장가는 최우선 호가에 즉시 체결 가정).
+
 ## 3. 수량 산정
 
 모의에서는 사이징 로직도 검증 대상이다. 고정 수량 대신 자본 비율로 계산한다.
@@ -80,7 +100,8 @@ expectedNetBps = takeProfitBps
 | 설정 | 기본값 | 근거 |
 |---|---|---|
 | `stopLossBps` | 100 | 손실 1%에서 끊는다 |
-| `takeProfitBps` | 150 | 비용 22.8bp를 빼면 순익 약 127bp |
+| `takeProfitBps` | 250 (2026-10-02, 150에서 상향) | 150일 때 비용·스프레드를 빼면 손절과 손익비가 약 1:1이라 승률 50% 이상이 필요했다 |
+| `stopConfirmMs` | 2,000 | 손절선 아래 2초 유지 시 손절. 손절폭 2배 이상 빠지면 즉시 |
 | `trailingStopBps` | 70 | 익절 전 되돌림 보호 |
 | `maxHoldingMs` | 1,800,000 (30분) | 무한 보유 방지. 초단타 전제 유지 |
 

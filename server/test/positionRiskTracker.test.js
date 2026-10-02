@@ -9,6 +9,8 @@ test("position risk tracker records one opening time and the highest observed pr
     openedAt: null,
     peakPrice: null,
     belowPeakSince: null,
+
+    belowStopSince: null,
   });
 
   assert.deepEqual(tracker.update({ quantity: 10, lastPrice: 70_000, timestamp: 1_000 }), {
@@ -16,18 +18,24 @@ test("position risk tracker records one opening time and the highest observed pr
     openedAt: 1_000,
     peakPrice: 70_000,
     belowPeakSince: null,
+
+    belowStopSince: null,
   });
   assert.deepEqual(tracker.update({ quantity: 15, lastPrice: 71_000, timestamp: 2_000 }), {
     quantity: 15,
     openedAt: 1_000,
     peakPrice: 71_000,
     belowPeakSince: null,
+
+    belowStopSince: null,
   });
   assert.deepEqual(tracker.update({ quantity: 5, lastPrice: 70_500, timestamp: 3_000 }), {
     quantity: 5,
     openedAt: 1_000,
     peakPrice: 71_000,
     belowPeakSince: 3_000,
+
+    belowStopSince: null,
   });
 });
 
@@ -39,12 +47,16 @@ test("position risk tracker resets only when the position becomes flat", () => {
     openedAt: null,
     peakPrice: null,
     belowPeakSince: null,
+
+    belowStopSince: null,
   });
   assert.deepEqual(tracker.update({ quantity: 2, lastPrice: 68_000, timestamp: 3_000 }), {
     quantity: 2,
     openedAt: 3_000,
     peakPrice: 68_000,
     belowPeakSince: null,
+
+    belowStopSince: null,
   });
 });
 
@@ -74,7 +86,7 @@ test("observeTick은 신고점이면 고점을 갱신하고 하락지속시각�
   tracker.update({ quantity: 10, lastPrice: 70_000, timestamp: 1_000 });
   tracker.observeTick({ price: 70_100, timestamp: 1_200 });
   assert.deepEqual(tracker.snapshot(), {
-    quantity: 10, openedAt: 1_000, peakPrice: 70_100, belowPeakSince: null,
+    quantity: 10, openedAt: 1_000, peakPrice: 70_100, belowPeakSince: null, belowStopSince: null,
   });
 });
 
@@ -91,7 +103,7 @@ test("observeTick은 고점 밑으로 내려온 최초 시각만 기록하고 �
 test("observeTick은 포지션이 없으면(quantity===0) 아무것도 하지 않는다", () => {
   const tracker = new PositionRiskTracker();
   const snapshot = tracker.observeTick({ price: 70_000, timestamp: 1_000 });
-  assert.deepEqual(snapshot, { quantity: 0, openedAt: null, peakPrice: null, belowPeakSince: null });
+  assert.deepEqual(snapshot, { quantity: 0, openedAt: null, peakPrice: null, belowPeakSince: null, belowStopSince: null });
 });
 
 test("position risk tracker rejects invalid quantity, price, and time", () => {

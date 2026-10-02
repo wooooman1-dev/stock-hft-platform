@@ -9,7 +9,10 @@ export class PositionRiskTracker {
   // 처음 확인한 시각"이라 KIS 잔고 반영이 늦어지면(전에 실측한 사례로 최대
   // 100초 가까이 걸림) 그만큼 "30분 보유" 카운트 시작이 밀렸다(2026-09-23,
   // 실제 매수보다 30분+반영지연만큼 더 들고 있게 됨). 아는 값이 있으면 그걸 쓴다.
-  update({ quantity, lastPrice, timestamp, openedAt }) {
+  //
+  // stopPrice: 손절선 가격. 넘기면 가격이 그 아래로 처음 내려온 시각(belowStopSince)을
+  // 기록해 손절 유예(stopConfirmMs) 판단에 쓴다. 손절선 위로 올라오면 지운다.
+  update({ quantity, lastPrice, timestamp, openedAt, stopPrice = null }) {
     const nextQuantity = Number(quantity);
     if (!Number.isInteger(nextQuantity) || nextQuantity < 0) {
       throw new TypeError("포지션 수량은 0 이상의 정수여야 합니다.");
@@ -37,9 +40,11 @@ export class PositionRiskTracker {
       this.openedAt = Number.isFinite(knownOpenedAt) ? knownOpenedAt : time;
       this.peakPrice = price;
       this.belowPeakSince = null;
+      this.belowStopSince = null;
     } else {
       this.advancePeak(price, time);
     }
+    this.advanceStop(price, time, stopPrice);
     this.quantity = nextQuantity;
     return this.snapshot();
   }
@@ -48,12 +53,34 @@ export class PositionRiskTracker {
   // "5초 사이에 순간적으로 튄 진짜 고점을 놓친다"는 지적에 따른 추가). 수량 정보가
   //없는 가벼운 갱신이라 포지션이 아직 없으면(quantity===0) 아무것도 안 한다 —
   // 수량 자체는 여전히 잔고 폴링(update)만 바꾼다.
-  observeTick({ price, timestamp }) {
+  observeTick({ price, timestamp, stopPrice = null }) {
     if (this.quantity === 0) return this.snapshot();
     const p = Number(price);
     const t = Number(timestamp);
     if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(t)) return this.snapshot();
     this.advancePeak(p, t);
+    this.advanceStop(p, t, stopPrice);
+    return this.snapshot();
+  }
+
+  // 손절선 아래로 처음 내려온 시각만 기록하고, 다시 위로 올라오면 지운다.
+  // stopPrice를 모르면(null) 손절 유예를 추적하지 않는다.
+  advanceStop(price, timestamp, stopPrice) {
+    const stop = stopPrice === null || stopPrice === undefined ? NaN : Number(stopPrice);
+    if (!Number.isFinite(stop) || stop <= 0 || price > stop) {
+      this.belowStopSince = null;
+    } else if (this.belowStopSince === null) {
+      this.belowStopSince = timestamp;
+    }
+  }
+
+  // 재시작 전에 저장해 둔 고점으로 되살린다. 지금 고점보다 높을 때만 올린다.
+  restorePeak(peakPrice, timestamp) {
+    const peak = Number(peakPrice);
+    if (this.quantity === 0 || !Number.isFinite(peak) || peak <= this.peakPrice) return this.snapshot();
+    this.peakPrice = peak;
+    // 고점 밑으로 언제 내려왔는지는 모른다 — 지금부터 다시 잰다.
+    this.belowPeakSince = Number(timestamp);
     return this.snapshot();
   }
 
@@ -75,6 +102,7 @@ export class PositionRiskTracker {
     this.openedAt = null;
     this.peakPrice = null;
     this.belowPeakSince = null;
+    this.belowStopSince = null;
   }
 
   snapshot() {
@@ -83,6 +111,7 @@ export class PositionRiskTracker {
       openedAt: this.openedAt,
       peakPrice: this.peakPrice,
       belowPeakSince: this.belowPeakSince,
+      belowStopSince: this.belowStopSince,
     };
   }
 }

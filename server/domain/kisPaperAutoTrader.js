@@ -9,7 +9,9 @@ import { evaluatePositionRiskExit } from "./strategyPolicy.js";
 import { PositionRiskTracker } from "./positionRiskTracker.js";
 import {
   calculateExpectedNetEdgeBps,
+  calculateRewardRiskRatio,
   DEFAULT_AUTO_TRADING_SETTINGS,
+  matchingTimeWindow,
   normalizeAutoTradingSettings,
 } from "./autoTradingSettings.js";
 
@@ -28,6 +30,7 @@ export class KisPaperAutoTrader {
     settings = DEFAULT_AUTO_TRADING_SETTINGS,
     costModel = {},
     realtimeClient = null,
+    stateStore = null,
     now = Date.now,
   } = {}) {
     if (!orderService || typeof orderService.submitOrder !== "function") {
@@ -60,6 +63,15 @@ export class KisPaperAutoTrader {
     // ACCEPTED로 확정된 매도만 기록한다 — REJECTED·전송실패는 그 종목이 아직
     // 실제로 청산되지 않았을 수 있어 재시도가 계속 허용돼야 한다.
     this.exitedSymbolsToday = new Map(); // symbol -> KST 거래일 키
+    // 종목별로 ENTRY_READY를 처음 본 시각. 끊기면 지운다 — entryConfirmMs 동안
+    // 연속 유지된 신호만 진입시킨다(2026-10-02, 036930은 2분 40초짜리 신호에 샀다).
+    this.entryReadySince = new Map();
+    // 재시작 전 저장해 둔 보유 종목 상태(symbol -> { openedAt, peakPrice }).
+    // 그 종목의 리스크 추적기를 처음 만들 때 한 번 쓰고 지운다.
+    this.restoredPositions = new Map();
+    this.stateStore = stateStore;
+    this.lastSavedState = null;
+    this.restoreState();
     this.decisions = [];
     // 잔고 폴링(5초)보다 자주 오는 실시간 체결 틱으로 보유 종목의 고점을 갱신하고,
     // 트레일링 스톱을 그 즉시 재평가한다(2026-09-23, "응 적용해"로 승인됨) — 폴링
@@ -155,7 +167,89 @@ export class KisPaperAutoTrader {
       return await this.evaluateOnce(input);
     } finally {
       this.evaluating = false;
+      this.saveState();
     }
+  }
+
+  // ── 재시작 대비 상태 저장·복원 ──
+  restoreState() {
+    if (!this.stateStore) return;
+    const saved = this.stateStore.load();
+    const today = kstDayKey(this.now());
+    if (!saved || saved.day !== today) return;
+    for (const symbol of Array.isArray(saved.exitedSymbols) ? saved.exitedSymbols : []) {
+      this.exitedSymbolsToday.set(String(symbol), today);
+    }
+    for (const [symbol, position] of Object.entries(saved.positions ?? {})) {
+      this.restoredPositions.set(symbol, {
+        openedAt: numberOrNull(position?.openedAt),
+        peakPrice: positiveNumber(position?.peakPrice),
+      });
+    }
+  }
+
+  saveState() {
+    if (!this.stateStore) return;
+    const today = kstDayKey(this.now());
+    const positions = {};
+    for (const [symbol, tracker] of this.riskTrackers) {
+      const risk = tracker.snapshot();
+      if (risk.quantity > 0) positions[symbol] = { openedAt: risk.openedAt, peakPrice: risk.peakPrice };
+    }
+    // 아직 잔고 확인 전이라 추적기가 안 만들어진 복원 종목도 다음 재시작까지 이어 둔다.
+    for (const [symbol, position] of this.restoredPositions) {
+      if (!positions[symbol]) positions[symbol] = position;
+    }
+    const exitedSymbols = [...this.exitedSymbolsToday]
+      .filter(([, day]) => day === today)
+      .map(([symbol]) => symbol)
+      .sort();
+    const state = { day: today, exitedSymbols, positions };
+    const serialized = JSON.stringify(state);
+    if (serialized === this.lastSavedState) return;
+    try {
+      this.stateStore.save(state);
+      this.lastSavedState = serialized;
+    } catch {
+      // 상태 저장 실패가 매매 판단을 막지 않게 한다. 다음 주기에 다시 시도한다.
+    }
+  }
+
+  // 후보마다 ENTRY_READY가 언제부터 이어지고 있는지 갱신한다. 매 평가 주기마다
+  // (멈춤·용량 초과로 진입을 안 보는 주기에도) 호출해야 연속 시간이 정확하다.
+  trackEntryReadiness(candidates, at) {
+    const ready = new Set();
+    for (const candidate of candidates) {
+      const symbol = String(candidate?.symbol ?? "");
+      if (symbol && candidate?.realtime?.state === "ENTRY_READY") ready.add(symbol);
+    }
+    for (const symbol of [...this.entryReadySince.keys()]) {
+      if (!ready.has(symbol)) this.entryReadySince.delete(symbol);
+    }
+    for (const symbol of ready) {
+      if (!this.entryReadySince.has(symbol)) this.entryReadySince.set(symbol, at);
+    }
+  }
+
+  // 오늘 실현된 매매 중 끝에서부터 비용 차감 후 손실이 몇 번 이어졌는지.
+  todayConsecutiveNetLosses(at) {
+    if (typeof this.orderService.getPerformance !== "function") return 0;
+    let report;
+    try {
+      report = this.orderService.getPerformance({ recentLimit: 0 });
+    } catch {
+      return 0;
+    }
+    const trades = Array.isArray(report?.trades?.recent) ? report.trades.recent : [];
+    const today = kstDayKey(at);
+    let streak = 0;
+    for (let index = trades.length - 1; index >= 0; index -= 1) {
+      const trade = trades[index];
+      if (kstDayKey(trade?.closedAt) !== today) break;
+      if (Number(trade?.netPnl) < 0) streak += 1;
+      else break;
+    }
+    return streak;
   }
 
   // 동시에 최대 settings.maxConcurrentPositions종목까지 들고 간다. 보유 중인
@@ -165,6 +259,7 @@ export class KisPaperAutoTrader {
   async evaluateOnce({ candidates = [], balance = null, marketTime = null } = {}) {
     const at = this.now();
     if (!this.settings.enabled) return this.record({ action: "DISABLED", at });
+    this.trackEntryReadiness(candidates, at);
 
     // 가드는 먼저 평가해 멈춤 상태를 갱신하되, 청산 경로는 통과시킨다.
     const guard = this.checkServiceGuards();
@@ -340,16 +435,20 @@ export class KisPaperAutoTrader {
     }
 
     let tracker = this.riskTrackers.get(position.symbol);
+    const restored = tracker ? null : this.restoredPositions.get(position.symbol) ?? null;
     if (!tracker) {
       tracker = new PositionRiskTracker();
       this.riskTrackers.set(position.symbol, tracker);
+      this.restoredPositions.delete(position.symbol);
     }
-    const risk = tracker.update({
+    let risk = tracker.update({
       quantity: position.quantity,
       lastPrice,
       timestamp: at,
-      openedAt: position.knownOpenedAt,
+      openedAt: position.knownOpenedAt ?? restored?.openedAt ?? null,
+      stopPrice: this.stopPriceFor(position.averagePrice),
     });
+    if (restored?.peakPrice) risk = tracker.restorePeak(restored.peakPrice, at);
     this.holdings.set(position.symbol, {
       symbol: position.symbol,
       name: position.name,
@@ -398,6 +497,20 @@ export class KisPaperAutoTrader {
   async evaluateEntry({ candidates, balance, at, heldSymbols }) {
     if (at - this.lastOrderAt < this.settings.cooldownMs) {
       return this.record({ action: "SKIP", at, reason: "COOLDOWN" });
+    }
+    // 장 시작 직후·점심시간·마감 직전처럼 거래가 얇거나 흔들리는 시간대에는 새로 사지 않는다.
+    const blockedWindow = matchingTimeWindow(this.settings.noEntryWindows, at);
+    if (blockedWindow) {
+      return this.record({ action: "SKIP", at, reason: "NO_ENTRY_WINDOW", window: blockedWindow });
+    }
+    if (this.settings.maxConsecutiveLossesPerDay > 0) {
+      const streak = this.todayConsecutiveNetLosses(at);
+      if (streak >= this.settings.maxConsecutiveLossesPerDay) {
+        return this.record({
+          action: "SKIP", at, reason: "CONSECUTIVE_LOSS_LIMIT",
+          streak, max: this.settings.maxConsecutiveLossesPerDay,
+        });
+      }
     }
     const equity = resolveEquity(balance);
     if (equity === null) return this.record({ action: "SKIP", at, reason: "NO_EQUITY" });
@@ -463,13 +576,46 @@ export class KisPaperAutoTrader {
     const price = positiveNumber(candidate?.realtime?.metrics?.currentPrice ?? candidate?.currentPrice);
     if (price === null) return { eligible: false, reason: "NO_PRICE" };
 
+    // ── 2026-10-02 추가 필터: 036930은 아래 네 가지에 전부 걸렸어야 했다 ──
+    // 신호가 한 순간이 아니라 entryConfirmMs 동안 이어졌는가.
+    const readySince = this.entryReadySince.get(symbol) ?? at;
+    const readyMs = Math.max(0, at - readySince);
+    if (readyMs < this.settings.entryConfirmMs) {
+      return { eligible: false, reason: "ENTRY_NOT_CONFIRMED", readyMs, required: this.settings.entryConfirmMs };
+    }
+    // 매수 체결이 매도 체결보다 많은가(체결강도). 값이 없으면 판단할 수 없으니 사지 않는다.
+    const executionStrength = numberOrNull(candidate?.realtime?.metrics?.executionStrength);
+    const minimumStrength = this.settings.entryMinimumExecutionStrength;
+    if (minimumStrength !== null && (executionStrength === null || executionStrength < minimumStrength)) {
+      return {
+        eligible: false, reason: "EXECUTION_STRENGTH_TOO_LOW", executionStrength, required: minimumStrength,
+      };
+    }
+    // 당일 VWAP보다 크게 아래(하락 추세)에서 반등을 노리고 사지 않는다.
+    const vwapExtensionBps = numberOrNull(candidate?.realtime?.metrics?.vwapExtensionBps);
+    const minimumVwap = this.settings.entryMinimumVwapExtensionBps;
+    if (minimumVwap !== null && vwapExtensionBps !== null && vwapExtensionBps < minimumVwap) {
+      return { eligible: false, reason: "BELOW_VWAP", vwapExtensionBps, required: minimumVwap };
+    }
+    // 손절폭이 호가 몇 틱밖에 안 되면 노이즈에 손절된다(243,000원 종목은 손절 100bp가 4.9틱).
+    const tickSizeForStop = resolveTickSize(candidate, price);
+    if (tickSizeForStop !== null && this.settings.stopLossBps !== null && this.settings.minimumStopTicks > 0) {
+      const stopTicks = (price * this.settings.stopLossBps) / 10_000 / tickSizeForStop;
+      if (stopTicks < this.settings.minimumStopTicks) {
+        return {
+          eligible: false, reason: "STOP_TOO_TIGHT",
+          stopTicks: Math.round(stopTicks * 10) / 10, required: this.settings.minimumStopTicks,
+        };
+      }
+    }
+
     const spreadTicks = numberOrNull(candidate?.microstructure?.spreadTicks);
     if (spreadTicks !== null && spreadTicks > this.settings.maximumSpreadTicks) {
       return { eligible: false, reason: "SPREAD_TOO_WIDE", spreadTicks };
     }
 
     const spreadBps = numberOrNull(candidate?.realtime?.metrics?.spreadBps ?? candidate?.microstructure?.spreadBps) ?? 0;
-    const tickSize = positiveNumber(candidate?.price?.tickSize ?? candidate?.tickSize) ?? 0;
+    const tickSize = resolveTickSize(candidate, price) ?? 0;
     const slippageBps = tickSize > 0 ? (tickSize / price) * 10_000 : 0;
     const expectedNetEdgeBps = calculateExpectedNetEdgeBps({
       takeProfitBps: this.settings.takeProfitBps,
@@ -484,6 +630,20 @@ export class KisPaperAutoTrader {
       return {
         eligible: false, reason: "BELOW_NET_EDGE",
         expectedNetEdgeBps, required: this.settings.minimumNetEdgeBps, spreadBps, slippageBps,
+      };
+    }
+    // 순기대수익은 익절에 반드시 닿는다고 가정한다. 손절까지 넣은 손익비도 본다.
+    const rewardRiskRatio = calculateRewardRiskRatio({
+      takeProfitBps: this.settings.takeProfitBps,
+      stopLossBps: this.settings.stopLossBps,
+      costModel: this.costModel,
+      spreadBps,
+    });
+    if (rewardRiskRatio !== null && rewardRiskRatio < this.settings.minimumRewardRiskRatio) {
+      return {
+        eligible: false, reason: "REWARD_RISK_TOO_LOW",
+        rewardRiskRatio: Math.round(rewardRiskRatio * 100) / 100,
+        required: this.settings.minimumRewardRiskRatio, spreadBps,
       };
     }
 
@@ -517,9 +677,17 @@ export class KisPaperAutoTrader {
     return minutesNow >= hour * 60 + minute;
   }
 
+  // 손절선 가격(평균단가 × (1 - 손절폭)). 손절을 안 쓰면 null.
+  stopPriceFor(averagePrice) {
+    const average = positiveNumber(averagePrice);
+    if (average === null || this.settings.stopLossBps === null) return null;
+    return average * (1 - this.settings.stopLossBps / 10_000);
+  }
+
   riskSettings() {
     return {
       stopLossBps: this.settings.stopLossBps,
+      stopConfirmMs: this.settings.stopConfirmMs,
       takeProfitBps: this.settings.takeProfitBps,
       trailingStopBps: this.settings.trailingStopBps,
       trailingConfirmMs: this.settings.trailingConfirmMs,
@@ -615,9 +783,11 @@ export class KisPaperAutoTrader {
     const tracker = this.riskTrackers.get(symbol);
     if (!tracker) return;
     const at = this.now();
-    const risk = tracker.observeTick({ price, timestamp: at });
-
     const holding = this.holdings.get(symbol);
+    const risk = tracker.observeTick({
+      price, timestamp: at, stopPrice: this.stopPriceFor(holding.averagePrice),
+    });
+
     this.holdings.set(symbol, {
       ...holding,
       currentPrice: price,
@@ -661,6 +831,30 @@ function quoteAgeMs(candidate, at) {
   const latest = numberOrNull(candidate?.realtime?.latestAt ?? candidate?.fetchedAt);
   if (latest === null) return null;
   return Math.max(0, Number(at) - latest);
+}
+
+// 호가단위. 추천 스캐너 후보에는 price.tickSize가 없다(2026-10-02 기록 확인) — 그래서
+// 슬리피지가 늘 0으로 계산되고 있었다. 호가 스프레드 ÷ 스프레드 틱 수로 구하고, 그것도
+// 없으면 KRX 호가가격단위(2023-01 개편, 코스피·코스닥 공통)로 계산한다.
+function resolveTickSize(candidate, price) {
+  const explicit = positiveNumber(candidate?.price?.tickSize ?? candidate?.tickSize);
+  if (explicit !== null) return explicit;
+  const spread = positiveNumber(candidate?.microstructure?.spread);
+  const spreadTicks = positiveNumber(candidate?.microstructure?.spreadTicks);
+  if (spread !== null && spreadTicks !== null) return spread / spreadTicks;
+  return krxTickSize(price);
+}
+
+export function krxTickSize(price) {
+  const value = positiveNumber(price);
+  if (value === null) return null;
+  if (value < 2_000) return 1;
+  if (value < 5_000) return 5;
+  if (value < 20_000) return 10;
+  if (value < 50_000) return 50;
+  if (value < 200_000) return 100;
+  if (value < 500_000) return 500;
+  return 1_000;
 }
 
 // KST 달력일 키(자정 경계) — 당일 재진입 금지 판단에 쓴다.

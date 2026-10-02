@@ -12,6 +12,9 @@ export const DEFAULT_STRATEGY_SETTINGS = Object.freeze({
   // 하락으로 인정한다(2026-09-23). 0이면 유예 없이 첫 틱에서 바로 판다. 실시간
   // 틱(observeTick) 사용 시 찰나의 호가 흔들림에 과민반응하는 걸 막는 용도다.
   trailingConfirmMs: 0,
+  // 손절선 아래에 이 시간만큼 머물러야 손절한다(0=첫 틱에서 즉시). 손절폭의 2배
+  // 이상 빠지면 유예 없이 바로 판다(2026-10-02, 1틱짜리 순간 체결에 손절되는 걸 막기 위해).
+  stopConfirmMs: 0,
   maxHoldingMs: null,
   approvalMode: "AUTO",
   approvalExpiryMs: 15_000,
@@ -27,6 +30,7 @@ const EDITABLE_KEYS = Object.freeze([
   "takeProfitBps",
   "trailingStopBps",
   "trailingConfirmMs",
+  "stopConfirmMs",
   "maxHoldingMs",
   "approvalMode",
   "approvalExpiryMs",
@@ -123,6 +127,12 @@ export function normalizeStrategySettings(
       0,
       60_000,
       "트레일링 확인 시간",
+    ),
+    stopConfirmMs: integerInRange(
+      merged.stopConfirmMs,
+      0,
+      60_000,
+      "손절 확인 시간",
     ),
     maxHoldingMs: optionalSafeIntegerAtLeast(
       merged.maxHoldingMs,

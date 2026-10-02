@@ -36,6 +36,7 @@ import {
   normalizeAutoTradingSettings,
 } from "./domain/autoTradingSettings.js";
 import { PaperAutoTradingConfigStore } from "./domain/paperAutoTradingConfigStore.js";
+import { PaperAutoTraderStateStore } from "./domain/paperAutoTraderStateStore.js";
 import { KisPaperTradingClient } from "./integrations/kis/kisPaperTradingClient.js";
 import {
   loadKisLiveConfiguration,
@@ -275,6 +276,8 @@ const kisPaperAutoTrader = kisPaperOrderService
     settings: autoTradingSettings,
     costModel: autoTradingCostModel,
     realtimeClient: heldPositionsRealtimeClient,
+    // 재진입 금지 종목·보유 시작 시각·고점을 재시작 뒤에도 이어 간다(2026-10-02).
+    stateStore: new PaperAutoTraderStateStore(join(dataDir, "paper-auto-trading-state.json")),
   })
   : null;
 let autoTradingTimer = null;
