@@ -124,23 +124,13 @@ export class KisRecommendationDataClient {
     const SUBSCRIPTION_TO_LISTING_LAG_DAYS = 15;
     const from = shiftDate(today, -(days + SUBSCRIPTION_TO_LISTING_LAG_DAYS));
     const to = shiftDate(today, 5);
-    const payload = await this.getJson(PUB_OFFER, {
-      SHT_CD: "",
-      CTS: "",
-      F_DT: formatYyyymmdd(from),
-      T_DT: formatYyyymmdd(to),
-    }, "예탁원 공모주청약일정 조회");
-    if (!Array.isArray(payload.output1)) {
-      throw new KisApiError(
-        "한국투자 공모주청약일정 응답에 output1 배열이 없습니다.",
-        "KIS_PUB_OFFER_INVALID_RESPONSE",
-      );
-    }
+    const rows = await this.getPublicOfferingRows(from, to);
     const todayValue = today.getTime();
     const listings = new Map();
-    for (const row of payload.output1) {
+    for (const row of rows) {
       const symbol = textOrNull(row.sht_cd);
       const listDate = parseKisDate(row.list_dt);
+      // 매매 로직용이라 실시간 시세가 받는 숫자 6자리 코드만 남긴다.
       if (!symbol || !/^\d{6}$/.test(symbol) || !listDate) continue;
       const listedValue = listDate.getTime();
       if (listedValue > todayValue) continue; // 상장 예정 — 아직 매매 대상 아님
@@ -161,31 +151,66 @@ export class KisRecommendationDataClient {
   // 이건 반대로 "상장할 종목을 미리 보고 싶다"는 화면 전용 목록이라, 아직
   // list_dt가 안 잡힌(미정) 종목까지 청약기간·확정공모가·주관사와 함께 보여준다
   // (2026-10-01, "날짜도 보여야 하고 미리 알 수 있어야지" 요청으로 추가).
+  //
+  // 2026-10-02 "청약은 중요하지 않아, 상장일 기준으로 해줘" 요청으로 상장일 기준으로
+  // 바꿨다. API의 F_DT/T_DT는 청약 기준일로만 걸리므로, 청약→상장 지연만큼 조회
+  // 구간을 앞으로 넓혀 받은 뒤 상장일이 [오늘-pastDays, 오늘+futureDays]에 드는
+  // 종목만 남긴다. 상장일이 아직 미정인 종목은 앞으로 상장할 종목이라 함께 둔다.
   async getPublicOfferingSchedule({ pastDays = 10, futureDays = 60 } = {}) {
     const past = integerInRange(pastDays, 0, 365, "pastDays");
     const future = integerInRange(futureDays, 0, 365, "futureDays");
+    const SUBSCRIPTION_TO_LISTING_LAG_DAYS = 30;
     const today = currentKoreaDate(this.now());
-    const from = shiftDate(today, -past);
+    const listedFrom = formatIso(shiftDate(today, -past));
+    const listedTo = formatIso(shiftDate(today, future));
+    const from = shiftDate(today, -(past + SUBSCRIPTION_TO_LISTING_LAG_DAYS));
     const to = shiftDate(today, future);
-    const payload = await this.getJson(PUB_OFFER, {
-      SHT_CD: "",
-      CTS: "",
-      F_DT: formatYyyymmdd(from),
-      T_DT: formatYyyymmdd(to),
-    }, "예탁원 공모주청약일정 조회");
-    if (!Array.isArray(payload.output1)) {
-      throw new KisApiError(
-        "한국투자 공모주청약일정 응답에 output1 배열이 없습니다.",
-        "KIS_PUB_OFFER_INVALID_RESPONSE",
+    const rows = await this.getPublicOfferingRows(from, to);
+    const items = [];
+    const droppedSymbols = [];
+    for (const row of rows) {
+      const item = normalizePublicOfferingRow(row);
+      if (!item) {
+        droppedSymbols.push(String(row?.sht_cd ?? ""));
+        continue;
+      }
+      if (item.listingDate && (item.listingDate < listedFrom || item.listingDate > listedTo)) continue;
+      items.push(item);
+    }
+    if (droppedSymbols.length > 0) {
+      console.warn(
+        `[ipo-schedule] 공모주 일정 ${rows.length}건 중 ${droppedSymbols.length}건을 종목코드 형식 때문에 제외했습니다: ${droppedSymbols.join(", ")}`,
       );
     }
-    const items = payload.output1
-      .map((row) => normalizePublicOfferingRow(row))
-      .filter((item) => item !== null);
-    // 청약 시작일이 이른 순으로 — 아직 청약일 자체가 비어 있으면(드묾) 맨 뒤로 보낸다.
-    items.sort((a, b) => (a.subscriptionStart ?? "9999-99-99")
-      .localeCompare(b.subscriptionStart ?? "9999-99-99"));
+    // 상장일이 이른 순으로 — 상장일 미정은 맨 뒤에, 그 안에서는 청약 시작일순으로.
+    items.sort((a, b) => (a.listingDate ?? "9999-99-99").localeCompare(b.listingDate ?? "9999-99-99")
+      || (a.subscriptionStart ?? "9999-99-99").localeCompare(b.subscriptionStart ?? "9999-99-99"));
     return { fetchedAt: this.now(), items };
+  }
+
+  // 예탁원 공모주청약일정을 연속조회로 끝까지 받는다. 무한 루프를 막으려고
+  // 페이지 수에 상한을 둔다.
+  async getPublicOfferingRows(from, to, { maxPages = 10 } = {}) {
+    const rows = [];
+    let continuation = false;
+    for (let page = 0; page < maxPages; page += 1) {
+      const { payload, hasMore } = await this.getJsonPage(PUB_OFFER, {
+        SHT_CD: "",
+        CTS: "",
+        F_DT: formatYyyymmdd(from),
+        T_DT: formatYyyymmdd(to),
+      }, "예탁원 공모주청약일정 조회", { continuation });
+      if (!Array.isArray(payload.output1)) {
+        throw new KisApiError(
+          "한국투자 공모주청약일정 응답에 output1 배열이 없습니다.",
+          "KIS_PUB_OFFER_INVALID_RESPONSE",
+        );
+      }
+      rows.push(...payload.output1);
+      if (!hasMore) break;
+      continuation = true;
+    }
+    return rows;
   }
 
   async getCandidateDetails({ symbol, market = "UN" }) {
@@ -315,24 +340,29 @@ export class KisRecommendationDataClient {
   }
 
   async getJson(definition, params, operation) {
+    return (await this.getJsonPage(definition, params, operation)).payload;
+  }
+
+  // KIS 연속조회: 응답 헤더 tr_cont가 "M"/"F"면 다음 페이지가 있고, 다음 요청은
+  // 요청 헤더 tr_cont를 "N"으로 보내야 이어서 받는다.
+  async getJsonPage(definition, params, operation, { continuation = false } = {}) {
     for (let attempt = 0; attempt <= this.rateLimitRetryCount; attempt += 1) {
       await this.waitForRateLimit();
       const accessToken = await this.client.getAccessToken();
       const url = new URL(definition.path, this.client.config.baseUrl);
       for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
-      const response = await this.client.request(url, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/plain",
-          charset: "UTF-8",
-          authorization: `Bearer ${accessToken}`,
-          appkey: this.client.config.appKey,
-          appsecret: this.client.config.appSecret,
-          tr_id: definition.trId,
-          custtype: "P",
-        },
-      });
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "text/plain",
+        charset: "UTF-8",
+        authorization: `Bearer ${accessToken}`,
+        appkey: this.client.config.appKey,
+        appsecret: this.client.config.appSecret,
+        tr_id: definition.trId,
+        custtype: "P",
+      };
+      if (continuation) headers.tr_cont = "N";
+      const response = await this.client.request(url, { method: "GET", headers });
       let payload;
       try {
         payload = await response.json();
@@ -365,7 +395,8 @@ export class KisRecommendationDataClient {
           "KIS_RECOMMENDATION_REJECTED",
         );
       }
-      return payload;
+      const trCont = String(response.headers?.get?.("tr_cont") ?? "").trim().toUpperCase();
+      return { payload, hasMore: trCont === "M" || trCont === "F" };
     }
     throw new KisApiError(
       `한국투자 ${operation} 호출 제한 재시도 횟수를 초과했습니다.`,
@@ -587,8 +618,10 @@ function parseKisDate(value) {
 // 아직 확정되지 않은 종목(공모가 확정 전 등)에서는 빈 문자열로 온다 — null로
 // 그대로 둬 "미정"을 화면에서 표현할 수 있게 한다.
 function normalizePublicOfferingRow(row) {
-  const symbol = textOrNull(row.sht_cd);
-  if (!symbol || !/^\d{6}$/.test(symbol)) return null;
+  // 신규 상장 종목은 "0088M0"처럼 영문이 섞인 단축코드를 받기도 해서, 화면용
+  // 일정에서는 숫자로 시작하는 영숫자 6자리까지 받는다.
+  const symbol = textOrNull(row.sht_cd)?.toUpperCase() ?? null;
+  if (!symbol || !/^\d[0-9A-Z]{5}$/.test(symbol)) return null;
   const [subscriptionStartRaw, subscriptionEndRaw] = String(row.subscr_dt ?? "").split("~");
   return {
     symbol,
