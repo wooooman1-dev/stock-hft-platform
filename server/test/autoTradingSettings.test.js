@@ -4,10 +4,45 @@ import {
   assertTradeableConfiguration,
   AutoTradingSettingsError,
   calculateExpectedNetEdgeBps,
+  calculateRewardRiskRatio,
   DEFAULT_AUTO_TRADING_SETTINGS,
   loadAutoTradingSettings,
+  matchingTimeWindow,
   normalizeAutoTradingSettings,
 } from "../domain/autoTradingSettings.js";
+
+// 2026-10-02 12:00 KST
+const KST_NOON = Date.parse("2026-10-02T03:00:00Z");
+
+test("v1로 저장된 설정의 익절 150(옛 기본값)은 250으로 올리고, 직접 바꾼 값은 그대로 둔다", () => {
+  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1, takeProfitBps: 150 }).takeProfitBps, 250);
+  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1, takeProfitBps: 300 }).takeProfitBps, 300);
+  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 2, takeProfitBps: 150 }).takeProfitBps, 150);
+  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1 }).schemaVersion, 2);
+});
+
+test("진입 금지 시간대는 시작 포함·끝 미포함으로 판정하고, 형식이 틀리면 거부한다", () => {
+  const windows = ["11:30-13:00"];
+  assert.equal(matchingTimeWindow(windows, KST_NOON), "11:30-13:00");
+  assert.equal(matchingTimeWindow(windows, Date.parse("2026-10-02T04:00:00Z")), null, "13:00은 끝이라 허용");
+  assert.equal(matchingTimeWindow(windows, Date.parse("2026-10-02T02:29:00Z")), null, "11:29는 허용");
+  assert.deepEqual(
+    [...normalizeAutoTradingSettings({ noEntryWindows: "09:00-09:10, 11:30-13:00" }).noEntryWindows],
+    ["09:00-09:10", "11:30-13:00"],
+    "환경변수처럼 쉼표로 이은 문자열도 받는다",
+  );
+  assert.deepEqual([...normalizeAutoTradingSettings({ noEntryWindows: [] }).noEntryWindows], []);
+  for (const bad of [["13:00-11:30"], ["11:30"], ["25:00-26:00"]]) {
+    assert.throws(() => normalizeAutoTradingSettings({ noEntryWindows: bad }), AutoTradingSettingsError);
+  }
+});
+
+test("손익비는 익절·손절 양쪽에 비용과 스프레드를 반영한다", () => {
+  // (250 - 22.81 - 14) / (100 + 22.81 + 14) = 213.19 / 136.81
+  const ratio = calculateRewardRiskRatio({ takeProfitBps: 250, stopLossBps: 100, costModel: COST, spreadBps: 14 });
+  assert.ok(Math.abs(ratio - 1.5583) < 0.001, `손익비 계산이 어긋난다: ${ratio}`);
+  assert.equal(calculateRewardRiskRatio({ takeProfitBps: null, stopLossBps: 100, costModel: COST }), null);
+});
 
 const COST = { buyCommissionBps: 1.40527, sellCommissionBps: 1.40527, sellTaxBps: 20 };
 
@@ -17,7 +52,15 @@ test("설계 기본값을 그대로 사용한다", () => {
   assert.equal(settings.minimumNetEdgeBps, 50);
   assert.equal(settings.positionSizeRatio, 0.1);
   assert.equal(settings.stopLossBps, 100);
-  assert.equal(settings.takeProfitBps, 150);
+  assert.equal(settings.takeProfitBps, 250);
+  assert.equal(settings.stopConfirmMs, 2_000);
+  assert.equal(settings.entryMinimumExecutionStrength, 100);
+  assert.equal(settings.entryMinimumVwapExtensionBps, -50);
+  assert.equal(settings.entryConfirmMs, 30_000);
+  assert.deepEqual([...settings.noEntryWindows], ["09:00-09:10", "11:30-13:00", "14:50-15:30"]);
+  assert.equal(settings.minimumStopTicks, 6);
+  assert.equal(settings.minimumRewardRiskRatio, 1.5);
+  assert.equal(settings.maxConsecutiveLossesPerDay, 3);
   assert.equal(settings.trailingStopBps, 100);
   assert.equal(settings.maxHoldingMs, 1_800_000);
   assert.equal(settings.forcedExitTime, "15:15");

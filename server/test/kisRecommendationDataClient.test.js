@@ -138,6 +138,80 @@ test("getPublicOfferingSchedule은 상장 전/후 가리지 않고 청약 일정
   assert.equal(schedule.items[1].listingDate, null, "상장일 미확정은 null(화면에서 '미정')이어야 한다");
 });
 
+test("getPublicOfferingSchedule은 상장일 기준으로 거르고 정렬하며, 청약 기준일 조회 구간은 상장 지연만큼 앞으로 넓힌다", async () => {
+  let requestedFrom;
+  const fake = {
+    config: { baseUrl: "https://example.test", appKey: "app", appSecret: "secret" },
+    async getAccessToken() { return "token"; },
+    async request(url) {
+      requestedFrom = url.searchParams.get("F_DT");
+      return response({
+        rt_cd: "0",
+        output1: [
+          // 청약은 오래전이지만 상장은 곧 — 상장일 기준이라 보여야 한다.
+          { sht_cd: "111110", isin_name: "곧상장", subscr_dt: "2026/09/01 ~ 2026/09/02", list_dt: "2026/10/08" },
+          // 이미 상장한 지 10일이 넘었다 — 빠져야 한다.
+          { sht_cd: "222220", isin_name: "오래전상장", subscr_dt: "2026/08/20 ~ 2026/08/21", list_dt: "2026/09/01" },
+          // 상장일 미정 — 맨 뒤.
+          { sht_cd: "333330", isin_name: "미정", subscr_dt: "2026/09/25 ~ 2026/09/26", list_dt: "" },
+          { sht_cd: "444440", isin_name: "최근상장", subscr_dt: "2026/09/10 ~ 2026/09/11", list_dt: "2026/09/20" },
+        ],
+      });
+    },
+  };
+  const client = new KisRecommendationDataClient({ client: fake, now: () => Date.parse("2026-09-24T00:00:00Z") });
+  const schedule = await client.getPublicOfferingSchedule();
+  assert.equal(requestedFrom, "20260815", "청약 기준일 조회는 오늘-(10+30)일부터여야 한다");
+  assert.deepEqual(schedule.items.map((item) => item.symbol), ["444440", "111110", "333330"]);
+});
+
+test("getPublicOfferingSchedule은 영문이 섞인 신규 단축코드도 받고 tr_cont 연속조회로 다음 페이지까지 이어 받는다", async () => {
+  const requestedContinuations = [];
+  const pages = [
+    {
+      trCont: "M",
+      rows: [{ sht_cd: "0088M0", isin_name: "영문코드", subscr_dt: "2026/10/05 ~ 2026/10/06", list_dt: "" }],
+    },
+    {
+      trCont: "D",
+      rows: [
+        { sht_cd: "468670", isin_name: "브릴스", subscr_dt: "2026/09/17 ~ 2026/09/18", list_dt: "2026/10/01" },
+        { sht_cd: "", isin_name: "코드없음", subscr_dt: "2026/10/07 ~ 2026/10/08", list_dt: "" },
+      ],
+    },
+  ];
+  const fake = {
+    config: { baseUrl: "https://example.test", appKey: "app", appSecret: "secret" },
+    async getAccessToken() { return "token"; },
+    async request(_url, options) {
+      requestedContinuations.push(options.headers.tr_cont ?? null);
+      const page = pages[requestedContinuations.length - 1];
+      return {
+        ...response({ rt_cd: "0", output1: page.rows }),
+        headers: { get: (name) => (name === "tr_cont" ? page.trCont : null) },
+      };
+    },
+  };
+  const client = new KisRecommendationDataClient({
+    client: fake,
+    now: () => Date.parse("2026-09-24T00:00:00Z"),
+    minimumIntervalMs: 0,
+  });
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (message) => warnings.push(message);
+  let schedule;
+  try {
+    schedule = await client.getPublicOfferingSchedule();
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(requestedContinuations, [null, "N"]);
+  assert.deepEqual(schedule.items.map((item) => item.symbol), ["468670", "0088M0"]);
+  assert.equal(warnings.length, 1, "형식 때문에 버린 행은 로그로 남겨야 한다");
+  assert.match(warnings[0], /3건 중 1건/);
+});
+
 test("호가와 분봉 응답을 정규화한다", async () => {
   const requests = [];
   const fake = {

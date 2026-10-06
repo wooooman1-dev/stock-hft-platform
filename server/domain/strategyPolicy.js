@@ -86,7 +86,18 @@ export function evaluatePositionRiskExit({
 
   const returnBps = ((currentPrice - averagePrice) / averagePrice) * 10_000;
   if (normalized.stopLossBps !== null && returnBps <= -normalized.stopLossBps) {
-    return riskExitIntent(positionQuantity, "STOP_LOSS", { returnBps });
+    // stopConfirmMs: 손절선 아래에 이만큼 머물러야 손절한다. 단, 손절폭의 2배 넘게
+    // 빠지면 기다리지 않는다 — 유예는 노이즈 한 틱을 거르려는 것이지 급락을 버티려는 게 아니다.
+    const hardStop = returnBps <= -2 * normalized.stopLossBps;
+    const belowStopSince = Number(positionRiskState?.belowStopSince);
+    const belowStopMs = positionRiskState?.belowStopSince !== null
+      && positionRiskState?.belowStopSince !== undefined
+      && Number.isFinite(belowStopSince)
+      ? Number(now) - belowStopSince
+      : 0;
+    if (hardStop || belowStopMs >= normalized.stopConfirmMs) {
+      return riskExitIntent(positionQuantity, "STOP_LOSS", { returnBps, belowStopMs, hardStop });
+    }
   }
 
   // 트레일링 스톱: "고점 대비 X% 빠지면 판다"가 아니라 "진입가 대비 X% 이상

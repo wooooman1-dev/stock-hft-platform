@@ -155,6 +155,8 @@ test("deterministic verification ticks update the peak before executing a traili
     openedAt: null,
     peakPrice: null,
     belowPeakSince: null,
+
+    belowStopSince: null,
   });
   runtime.stop();
 });

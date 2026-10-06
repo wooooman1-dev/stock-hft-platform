@@ -50,7 +50,11 @@ function candidate(overrides = {}) {
     currentPrice: 70_000,
     price: { tickSize: 100 },
     microstructure: { spreadTicks: 1 },
-    realtime: { state: "ENTRY_READY", latestAt: BASE, metrics: { currentPrice: 70_000, spreadBps: 14 } },
+    realtime: {
+      state: "ENTRY_READY",
+      latestAt: BASE,
+      metrics: { currentPrice: 70_000, spreadBps: 14, executionStrength: 110, vwapExtensionBps: 20 },
+    },
     ...overrides,
   };
 }
@@ -63,9 +67,9 @@ const balance = (cash = 10_000_000, positions = []) => ({
 function trader(settings = {}, service = fakeService()) {
   return new KisPaperAutoTrader({
     orderService: service,
-    // 정산 대기는 기본으로 꺼 각 테스트가 겨냥한 게이트만 검증한다.
-    // 정산 대기 자체는 전용 테스트에서 명시적으로 켠다.
-    settings: { enabled: true, settlementGraceMs: 0, ...settings },
+    // 정산 대기·신호 지속시간·손절 유예는 기본으로 꺼 각 테스트가 겨냥한 게이트만
+    // 검증한다. 이 셋은 전용 테스트에서 명시적으로 켠다.
+    settings: { enabled: true, settlementGraceMs: 0, entryConfirmMs: 0, stopConfirmMs: 0, ...settings },
     costModel: COST,
     now: () => BASE,
   });
@@ -137,10 +141,10 @@ test("WATCH는 확신도 점수와 무관하게 진입하지 않는다", async (
 test("비용 문턱을 못 넘으면 ENTRY_READY여도 진입하지 않는다", async () => {
   const service = fakeService();
   // 익절 150 - 고정비용 22.81 - 스프레드 100 - 슬리피지 14.3 = 12.9 < 문턱 50
-  const auto = trader({ minimumNetEdgeBps: 50 }, service);
+  const auto = trader({ minimumNetEdgeBps: 50, takeProfitBps: 150 }, service);
   const decision = await auto.evaluate({
     candidates: [candidate({
-      realtime: { state: "ENTRY_READY", latestAt: BASE, metrics: { currentPrice: 70_000, spreadBps: 100 } },
+      realtime: { state: "ENTRY_READY", latestAt: BASE, metrics: { currentPrice: 70_000, spreadBps: 100, executionStrength: 110 } },
     })],
     balance: balance(),
   });
@@ -383,7 +387,7 @@ test("평가가 겹쳐 호출돼도 주문은 한 번만 나간다", async () =>
   let tick = BASE;
   const auto = new KisPaperAutoTrader({
     orderService: service,
-    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 0 },
+    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 0, entryConfirmMs: 0 },
     costModel: COST,
     now: () => (tick += 1), // 1ms씩 흐르는 시계 — 사고 당시와 같은 조건
   });
@@ -480,7 +484,7 @@ test("주문 직후 잔고에 안 잡혀도 다시 진입하지 않는다", asyn
   let tick = BASE;
   const auto = new KisPaperAutoTrader({
     orderService: service,
-    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 60_000 },
+    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 60_000, entryConfirmMs: 0 },
     costModel: COST,
     now: () => tick,
   });
@@ -509,7 +513,7 @@ test("잔고 반영이 끝내 안 되면 유예시간 뒤 정상 흐름으로 �
   let tick = BASE;
   const auto = new KisPaperAutoTrader({
     orderService: service,
-    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 60_000 },
+    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 60_000, entryConfirmMs: 0 },
     costModel: COST,
     now: () => tick,
   });
@@ -518,7 +522,7 @@ test("잔고 반영이 끝내 안 되면 유예시간 뒤 정상 흐름으로 �
   // 주문이 거절됐을 수도 있으므로 영구히 막지 않는다.
   tick = BASE + 61_000;
   const fresh = candidate({
-    realtime: { state: "ENTRY_READY", currentPrice: 70_000, spreadBps: 14, latestAt: tick },
+    realtime: { state: "ENTRY_READY", currentPrice: 70_000, spreadBps: 14, latestAt: tick, metrics: { executionStrength: 110 } },
   });
   const after = await auto.evaluate({ candidates: [fresh], balance: balance() });
   assert.equal(after.action, "ORDER", "유예시간이 지나면 다시 진입할 수 있어야 한다");
@@ -534,7 +538,7 @@ test("최대 보유시간은 잔고 반영이 늦어도 실제 매수 제출 시
   let tick = BASE;
   const auto = new KisPaperAutoTrader({
     orderService: service,
-    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 600_000, maxHoldingMs: 300_000, forcedExitTime: null },
+    settings: { enabled: true, cooldownMs: 0, settlementGraceMs: 600_000, maxHoldingMs: 300_000, forcedExitTime: null, entryConfirmMs: 0 },
     costModel: COST,
     now: () => tick,
   });
@@ -738,7 +742,7 @@ test("날짜가 바뀌면(다음 거래일) 같은 종목 재진입이 다시 �
   const auto = new KisPaperAutoTrader({
     orderService: service,
     settings: {
-      enabled: true, cooldownMs: 0, settlementGraceMs: 0, stopLossBps: 100, forcedExitTime: null,
+      enabled: true, cooldownMs: 0, settlementGraceMs: 0, stopLossBps: 100, forcedExitTime: null, entryConfirmMs: 0, stopConfirmMs: 0,
       maxConcurrentPositions: 5,
     },
     costModel: COST,
@@ -758,10 +762,185 @@ test("날짜가 바뀌면(다음 거래일) 같은 종목 재진입이 다시 �
   tick = BASE + 24 * 60 * 60 * 1_000;
   const nextDay = await auto.evaluate({
     candidates: [candidate({
-      realtime: { state: "ENTRY_READY", latestAt: tick, metrics: { currentPrice: 70_000, spreadBps: 14 } },
+      realtime: { state: "ENTRY_READY", latestAt: tick, metrics: { currentPrice: 70_000, spreadBps: 14, executionStrength: 110 } },
     })],
     balance: balance(),
   });
   assert.equal(nextDay.action, "ORDER");
   assert.equal(nextDay.side, "BUY");
+});
+
+// ── 2026-10-02 036930 손실 분석으로 추가한 진입·청산 규칙 ──
+
+function clockTrader(settings = {}, service = fakeService(), options = {}) {
+  const clock = { now: BASE };
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: { enabled: true, settlementGraceMs: 0, cooldownMs: 0, forcedExitTime: null, ...settings },
+    costModel: COST,
+    now: () => clock.now,
+    ...options,
+  });
+  return { auto, clock };
+}
+
+function readyCandidate(metrics = {}, extra = {}) {
+  return candidate({
+    realtime: {
+      state: "ENTRY_READY",
+      latestAt: BASE,
+      metrics: { currentPrice: 70_000, spreadBps: 14, executionStrength: 110, vwapExtensionBps: 20, ...metrics },
+    },
+    ...extra,
+  });
+}
+
+test("체결강도가 기준(100) 미만이면 매도 우위라 진입하지 않는다", async () => {
+  const blocked = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: 99 })], balance: balance() });
+  assert.equal(blocked.evaluated[0].reason, "EXECUTION_STRENGTH_TOO_LOW");
+  const missing = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: null })], balance: balance() });
+  assert.equal(missing.evaluated[0].reason, "EXECUTION_STRENGTH_TOO_LOW", "체결강도를 모르면 사지 않는다");
+  const allowed = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: 100 })], balance: balance() });
+  assert.equal(allowed.action, "ORDER");
+});
+
+test("당일 VWAP보다 50bp 넘게 아래(하락 추세)면 진입하지 않는다", async () => {
+  const blocked = await trader().evaluate({ candidates: [readyCandidate({ vwapExtensionBps: -51 })], balance: balance() });
+  assert.equal(blocked.evaluated[0].reason, "BELOW_VWAP");
+  const allowed = await trader().evaluate({ candidates: [readyCandidate({ vwapExtensionBps: -49 })], balance: balance() });
+  assert.equal(allowed.action, "ORDER");
+});
+
+test("손절폭이 6틱보다 좁은 고가주는 진입하지 않는다(243,000원·호가 500원이면 100bp = 4.9틱)", async () => {
+  const pricey = readyCandidate({ currentPrice: 243_000, spreadBps: 20.6 }, { price: { tickSize: 500 } });
+  const decision = await trader().evaluate({ candidates: [pricey], balance: balance() });
+  assert.equal(decision.evaluated[0].reason, "STOP_TOO_TIGHT");
+  assert.equal(decision.evaluated[0].stopTicks, 4.9);
+});
+
+test("후보에 호가단위가 없어도(실제 스캐너 후보) 스프레드나 KRX 호가단위로 손절 틱 수를 잰다", async () => {
+  const fromSpread = readyCandidate({ currentPrice: 243_000, spreadBps: 20.6 }, {
+    price: {}, microstructure: { spread: 500, spreadTicks: 1 },
+  });
+  const bySpread = await trader().evaluate({ candidates: [fromSpread], balance: balance() });
+  assert.equal(bySpread.evaluated[0].reason, "STOP_TOO_TIGHT");
+
+  const fromTable = readyCandidate({ currentPrice: 243_000, spreadBps: 20.6 }, { price: {}, microstructure: {} });
+  const byTable = await trader().evaluate({ candidates: [fromTable], balance: balance() });
+  assert.equal(byTable.evaluated[0].reason, "STOP_TOO_TIGHT");
+});
+
+test("스프레드가 넓어 손익비가 1.5에 못 미치면 진입하지 않는다", async () => {
+  // (250 - 22.81 - 30) / (100 + 22.81 + 30) = 1.29
+  const decision = await trader().evaluate({
+    candidates: [readyCandidate({ spreadBps: 30 })],
+    balance: balance(),
+  });
+  assert.equal(decision.evaluated[0].reason, "REWARD_RISK_TOO_LOW");
+});
+
+test("ENTRY_READY가 30초 연속 유지돼야 진입하고, 중간에 끊기면 처음부터 다시 잰다", async () => {
+  const service = fakeService();
+  const { auto, clock } = clockTrader({ entryConfirmMs: 30_000 }, service);
+  const at = (ms, state = "ENTRY_READY") => {
+    clock.now = BASE + ms;
+    const item = readyCandidate();
+    item.realtime = { ...item.realtime, state, latestAt: clock.now };
+    return auto.evaluate({ candidates: [item], balance: balance() });
+  };
+  assert.equal((await at(0)).evaluated[0].reason, "ENTRY_NOT_CONFIRMED");
+  assert.equal((await at(20_000, "WATCH")).evaluated[0].reason, "NOT_ENTRY_READY");
+  assert.equal((await at(25_000)).evaluated[0].reason, "ENTRY_NOT_CONFIRMED");
+  assert.equal((await at(54_000)).evaluated[0].reason, "ENTRY_NOT_CONFIRMED", "끊긴 뒤 25초부터 29초째");
+  const decision = await at(55_000);
+  assert.equal(decision.action, "ORDER", "끊긴 뒤 다시 30초 이어지면 진입");
+  assert.equal(service.submitted.length, 1);
+});
+
+test("점심시간(11:30~13:00)에는 새로 사지 않고 13:00부터 다시 산다", async () => {
+  const { auto, clock } = clockTrader({ entryConfirmMs: 0 });
+  clock.now = Date.parse("2026-10-02T03:00:00Z"); // 12:00 KST
+  const lunch = await auto.evaluate({ candidates: [readyCandidate({}, {})], balance: balance() });
+  assert.equal(lunch.reason, "NO_ENTRY_WINDOW");
+  assert.equal(lunch.window, "11:30-13:00");
+  clock.now = Date.parse("2026-10-02T04:01:00Z"); // 13:01 KST
+  const item = readyCandidate();
+  item.realtime = { ...item.realtime, latestAt: clock.now };
+  const after = await auto.evaluate({ candidates: [item], balance: balance() });
+  assert.equal(after.action, "ORDER");
+});
+
+test("손절은 손절선 아래 2초 유지돼야 나가고, 손절폭의 2배 넘게 빠지면 바로 나간다", async () => {
+  const service = fakeService();
+  const { auto, clock } = clockTrader({ stopLossBps: 100, stopConfirmMs: 2_000 }, service);
+  const held = (price) => balance(1_000_000, [{ symbol: "005930", quantity: 5, averagePrice: 70_000, currentPrice: price }]);
+  assert.equal((await auto.evaluate({ candidates: [], balance: held(69_000) })).action, "HOLD");
+  clock.now = BASE + 1_900;
+  assert.equal((await auto.evaluate({ candidates: [], balance: held(69_000) })).action, "HOLD");
+  clock.now = BASE + 2_000;
+  const stop = await auto.evaluate({ candidates: [], balance: held(69_000) });
+  assert.equal(stop.reason, "STOP_LOSS");
+
+  const fast = clockTrader({ stopLossBps: 100, stopConfirmMs: 2_000 });
+  const crash = await fast.auto.evaluate({
+    candidates: [],
+    balance: balance(1_000_000, [{ symbol: "005930", quantity: 5, averagePrice: 70_000, currentPrice: 68_500 }]),
+  });
+  assert.equal(crash.reason, "STOP_LOSS", "-214bp는 손절폭(100)의 2배를 넘어 즉시 판다");
+});
+
+test("손절선 위로 한 번 올라오면 손절 유예를 처음부터 다시 잰다", async () => {
+  const { auto, clock } = clockTrader({ stopLossBps: 100, stopConfirmMs: 2_000 });
+  const held = (price) => balance(1_000_000, [{ symbol: "005930", quantity: 5, averagePrice: 70_000, currentPrice: price }]);
+  await auto.evaluate({ candidates: [], balance: held(69_000) });
+  clock.now = BASE + 1_000;
+  await auto.evaluate({ candidates: [], balance: held(69_500) });
+  clock.now = BASE + 2_500;
+  assert.equal((await auto.evaluate({ candidates: [], balance: held(69_000) })).action, "HOLD");
+});
+
+test("오늘 비용 차감 후 손실이 3번 연속이면 그날 신규 진입을 멈춘다", async () => {
+  const today = BASE - 60_000;
+  const losing = { netPnl: -1_000, closedAt: today };
+  const service = fakeService();
+  service.getPerformance = () => ({ available: true, trades: { recent: [losing, losing, losing] } });
+  const blocked = await trader({}, service).evaluate({ candidates: [readyCandidate()], balance: balance() });
+  assert.equal(blocked.reason, "CONSECUTIVE_LOSS_LIMIT");
+  assert.equal(blocked.streak, 3);
+
+  const yesterday = { netPnl: -1_000, closedAt: BASE - 86_400_000 };
+  service.getPerformance = () => ({ available: true, trades: { recent: [yesterday, losing, losing] } });
+  const allowed = await trader({}, service).evaluate({ candidates: [readyCandidate()], balance: balance() });
+  assert.equal(allowed.action, "ORDER", "어제 손실은 오늘 연속 손실에 넣지 않는다");
+});
+
+test("재시작해도 당일 재진입 금지·보유 시작 시각·고점이 이어진다", async () => {
+  let saved = null;
+  const stateStore = { load: () => saved, save: (state) => { saved = structuredClone(state); } };
+
+  const first = clockTrader({ stopLossBps: 100, stopConfirmMs: 0, trailingStopBps: 500 }, fakeService(), { stateStore });
+  const position = { symbol: "000660", quantity: 3, averagePrice: 100_000 };
+  await first.auto.evaluate({ candidates: [], balance: balance(1_000_000, [{ ...position, currentPrice: 103_000 }]) });
+  first.clock.now = BASE + 1_000;
+  await first.auto.evaluate({ candidates: [], balance: balance(1_000_000, [{ ...position, currentPrice: 98_000 }]) });
+  assert.deepEqual(saved.exitedSymbols, ["000660"], "손절 매도가 ACCEPTED되면 재진입 금지가 저장된다");
+  assert.equal(saved.positions["000660"].openedAt, BASE);
+  assert.equal(saved.positions["000660"].peakPrice, 103_000);
+
+  const second = clockTrader({}, fakeService(), { stateStore });
+  second.clock.now = BASE + 5_000;
+  await second.auto.evaluate({
+    candidates: [],
+    balance: balance(1_000_000, [{ ...position, currentPrice: 99_500 }]),
+  });
+  const holding = second.auto.status().holdings[0];
+  assert.equal(holding.openedAt, BASE, "보유 시작 시각은 재시작 전 값을 쓴다");
+  assert.equal(holding.peakPrice, 103_000, "고점도 재시작 전 값을 쓴다");
+
+  const third = clockTrader({ entryConfirmMs: 0 }, fakeService(), { stateStore });
+  const reentry = await third.auto.evaluate({
+    candidates: [candidate({ symbol: "000660" })],
+    balance: balance(),
+  });
+  assert.equal(reentry.evaluated[0].reason, "EXITED_TODAY", "재시작 뒤에도 같은 날 재진입하지 않는다");
 });

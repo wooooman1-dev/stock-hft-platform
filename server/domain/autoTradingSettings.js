@@ -3,8 +3,13 @@
 // 수수료·세금·슬리피지 같은 비용 항목은 여기서 다시 정의하지 않는다.
 // recommendationSettings의 비용 모델을 단일 출처로 사용해 두 곳이 어긋나지 않게 한다.
 
+// schemaVersion 2 (2026-10-02): 036930 손실 분석으로 진입 필터(체결강도·VWAP·지속시간·
+// 진입 금지 시간대·최소 손절 틱·손익비)와 손절 유예, 당일 연속 손실 제한을 추가하고
+// 익절 기본값을 150 → 250bp로 올렸다.
+const SCHEMA_VERSION = 2;
+
 export const DEFAULT_AUTO_TRADING_SETTINGS = Object.freeze({
-  schemaVersion: 1,
+  schemaVersion: SCHEMA_VERSION,
   // 자동매매는 기본으로 꺼져 있다. 명시적으로 켜야만 주문이 나간다.
   enabled: false,
   // 비용을 모두 뺀 뒤에도 남아야 하는 최소 기대 순익. 이 문턱을 넘지 못하면 진입하지 않는다.
@@ -21,9 +26,31 @@ export const DEFAULT_AUTO_TRADING_SETTINGS = Object.freeze({
   exitMinimumConfidence: 50,
   maximumSpreadTicks: 2,
   cooldownMs: 5_000,
+  // ── 진입 필터 (2026-10-02) ──
+  // 036930(주성엔지니어링)을 당일 VWAP -193bp·체결강도 91.8(매도 우위, 하락 중)·점심시간에
+  // 2~3틱 반등 점수만 보고 샀다가 손절됐다. 아래 조건은 전부 자동매매 진입에만 적용된다.
+  // 체결강도가 이 값 이상(100=매수·매도 체결이 같음)일 때만 진입한다. null이면 보지 않는다.
+  entryMinimumExecutionStrength: 100,
+  // 당일 VWAP 대비 괴리가 이 값보다 낮으면(하락 추세) 진입하지 않는다. null이면 보지 않는다.
+  entryMinimumVwapExtensionBps: -50,
+  // 같은 종목이 ENTRY_READY로 이 시간 이상 연속 유지돼야 진입한다(한 순간 신호는 거른다).
+  entryConfirmMs: 30_000,
+  // 이 시간대(KST "HH:MM-HH:MM", 끝 시각 미포함)에는 신규 진입하지 않는다. 청산은 계속한다.
+  noEntryWindows: Object.freeze(["09:00-09:10", "11:30-13:00", "14:50-15:30"]),
+  // 손절폭이 그 종목 호가단위로 이 틱 수보다 좁으면 진입하지 않는다(고가주는 손절이 노이즈 몇 틱에 걸린다).
+  minimumStopTicks: 6,
+  // (익절 - 비용 - 스프레드) ÷ (손절 + 비용 + 스프레드)가 이 값 이상이어야 진입한다.
+  minimumRewardRiskRatio: 1.5,
+  // 오늘 실현손실(비용 차감 후) 매매가 이 횟수만큼 연속되면 그날 신규 진입을 멈춘다(0=끔).
+  // 주문 서비스의 연속 손실 한도는 킬 스위치를 켜 보호 청산까지 막으므로 쓰지 않고 여기서 거른다.
+  maxConsecutiveLossesPerDay: 3,
   // 보호 청산. null이면 해당 청산을 쓰지 않는다.
   stopLossBps: 100,
-  takeProfitBps: 150,
+  // 150이었을 때는 비용·스프레드를 빼면 손절과 손익비가 약 1:1이라 승률이 50%를 넘어야
+  // 본전이었다(2026-10-02). 손절 100 기준 손익비가 1.5 이상 나오도록 올린다.
+  takeProfitBps: 250,
+  // 손절선 아래에 이 시간만큼 머물러야 손절한다(손절폭 2배 이상 빠지면 즉시).
+  stopConfirmMs: 2_000,
   // "고점 대비 X% 빠지면 판다"가 아니라 "진입가 대비 X% 이상 오른 적이 있으면
   // (armed) 그 뒤 신고점을 못 찍고 조금이라도 빠지는 순간 즉시 판다"는 뜻이다
   // (strategyPolicy.js, 2026-09-23 변경). 그래서 이 숫자는 "얼마나 밀리면
@@ -74,8 +101,16 @@ const EDITABLE_KEYS = Object.freeze([
   "exitMinimumConfidence",
   "maximumSpreadTicks",
   "cooldownMs",
+  "entryMinimumExecutionStrength",
+  "entryMinimumVwapExtensionBps",
+  "entryConfirmMs",
+  "noEntryWindows",
+  "minimumStopTicks",
+  "minimumRewardRiskRatio",
+  "maxConsecutiveLossesPerDay",
   "stopLossBps",
   "takeProfitBps",
+  "stopConfirmMs",
   "trailingStopBps",
   "trailingConfirmMs",
   "maxHoldingMs",
@@ -108,8 +143,16 @@ export function loadAutoTradingSettings(env = process.env) {
     exitMinimumConfidence: env.PULSEHFT_AUTO_TRADING_EXIT_MIN_CONFIDENCE,
     maximumSpreadTicks: env.PULSEHFT_AUTO_TRADING_MAX_SPREAD_TICKS,
     cooldownMs: env.PULSEHFT_AUTO_TRADING_COOLDOWN_MS,
+    entryMinimumExecutionStrength: env.PULSEHFT_AUTO_TRADING_ENTRY_MIN_EXECUTION_STRENGTH,
+    entryMinimumVwapExtensionBps: env.PULSEHFT_AUTO_TRADING_ENTRY_MIN_VWAP_EXTENSION_BPS,
+    entryConfirmMs: env.PULSEHFT_AUTO_TRADING_ENTRY_CONFIRM_MS,
+    noEntryWindows: env.PULSEHFT_AUTO_TRADING_NO_ENTRY_WINDOWS,
+    minimumStopTicks: env.PULSEHFT_AUTO_TRADING_MIN_STOP_TICKS,
+    minimumRewardRiskRatio: env.PULSEHFT_AUTO_TRADING_MIN_REWARD_RISK_RATIO,
+    maxConsecutiveLossesPerDay: env.PULSEHFT_AUTO_TRADING_MAX_CONSECUTIVE_LOSSES_PER_DAY,
     stopLossBps: env.PULSEHFT_AUTO_TRADING_STOP_LOSS_BPS,
     takeProfitBps: env.PULSEHFT_AUTO_TRADING_TAKE_PROFIT_BPS,
+    stopConfirmMs: env.PULSEHFT_AUTO_TRADING_STOP_CONFIRM_MS,
     trailingStopBps: env.PULSEHFT_AUTO_TRADING_TRAILING_STOP_BPS,
     trailingConfirmMs: env.PULSEHFT_AUTO_TRADING_TRAILING_CONFIRM_MS,
     maxHoldingMs: env.PULSEHFT_AUTO_TRADING_MAX_HOLDING_MS,
@@ -137,6 +180,12 @@ export function normalizeAutoTradingSettings(input = {}) {
   for (const key of EDITABLE_KEYS) {
     if (input[key] !== undefined) merged[key] = input[key];
   }
+  // v1로 저장된 설정 파일은 모든 값을 그대로 적어 두므로, 기본값을 바꿔도 v1 기본값
+  // (익절 150)이 계속 덮어쓴다. v1 기본값 그대로인 항목만 새 기본값으로 올린다
+  // — 사용자가 직접 바꾼 값은 건드리지 않는다.
+  if (Number(input.schemaVersion) === 1 && Number(merged.takeProfitBps) === 150) {
+    merged.takeProfitBps = DEFAULT_AUTO_TRADING_SETTINGS.takeProfitBps;
+  }
 
   return Object.freeze({
     schemaVersion: DEFAULT_AUTO_TRADING_SETTINGS.schemaVersion,
@@ -148,8 +197,22 @@ export function normalizeAutoTradingSettings(input = {}) {
     exitMinimumConfidence: numberInRange(merged.exitMinimumConfidence, 0, 100, "exitMinimumConfidence"),
     maximumSpreadTicks: integerInRange(merged.maximumSpreadTicks, 0, 100, "maximumSpreadTicks"),
     cooldownMs: integerInRange(merged.cooldownMs, 0, 3_600_000, "cooldownMs"),
+    entryMinimumExecutionStrength: nullableNumberInRange(
+      merged.entryMinimumExecutionStrength, 0, 1_000, "entryMinimumExecutionStrength",
+    ),
+    entryMinimumVwapExtensionBps: nullableNumberInRange(
+      merged.entryMinimumVwapExtensionBps, -10_000, 10_000, "entryMinimumVwapExtensionBps",
+    ),
+    entryConfirmMs: integerInRange(merged.entryConfirmMs, 0, 600_000, "entryConfirmMs"),
+    noEntryWindows: timeWindowsValue(merged.noEntryWindows),
+    minimumStopTicks: integerInRange(merged.minimumStopTicks, 0, 100, "minimumStopTicks"),
+    minimumRewardRiskRatio: numberInRange(merged.minimumRewardRiskRatio, 0, 20, "minimumRewardRiskRatio"),
+    maxConsecutiveLossesPerDay: integerInRange(
+      merged.maxConsecutiveLossesPerDay, 0, 100, "maxConsecutiveLossesPerDay",
+    ),
     stopLossBps: nullableNumberInRange(merged.stopLossBps, 1, 10_000, "stopLossBps"),
     takeProfitBps: nullableNumberInRange(merged.takeProfitBps, 1, 10_000, "takeProfitBps"),
+    stopConfirmMs: integerInRange(merged.stopConfirmMs, 0, 60_000, "stopConfirmMs"),
     trailingStopBps: nullableNumberInRange(merged.trailingStopBps, 1, 10_000, "trailingStopBps"),
     trailingConfirmMs: integerInRange(merged.trailingConfirmMs, 0, 60_000, "trailingConfirmMs"),
     maxHoldingMs: nullableIntegerInRange(merged.maxHoldingMs, 1_000, 86_400_000, "maxHoldingMs"),
@@ -193,6 +256,58 @@ export function calculateExpectedNetEdgeBps({
   if (!Number.isFinite(target)) return null;
   return target - fixedCost(costModel) - Math.max(0, Number(spreadBps) || 0)
     - Math.max(0, Number(slippageBps) || 0);
+}
+
+// 손익비: 익절에 닿았을 때 남는 순익 ÷ 손절에 닿았을 때 잃는 순손실.
+// 진입 때 스프레드만큼 불리하게 사므로 양쪽에 스프레드를 한 번씩 반영한다.
+export function calculateRewardRiskRatio({
+  takeProfitBps,
+  stopLossBps,
+  costModel = {},
+  spreadBps = 0,
+}) {
+  const target = Number(takeProfitBps);
+  const stop = Number(stopLossBps);
+  if (takeProfitBps === null || stopLossBps === null || !Number.isFinite(target) || !Number.isFinite(stop)) {
+    return null;
+  }
+  const spread = Math.max(0, Number(spreadBps) || 0);
+  const reward = target - fixedCost(costModel) - spread;
+  const risk = stop + fixedCost(costModel) + spread;
+  return risk > 0 ? reward / risk : null;
+}
+
+// "HH:MM-HH:MM" 시간대 안이면(시작 포함, 끝 미포함) 그 문자열을 돌려준다.
+export function matchingTimeWindow(windows, timestamp) {
+  if (!Array.isArray(windows) || windows.length === 0) return null;
+  const kst = new Date(Number(timestamp) + 9 * 60 * 60 * 1_000);
+  const minutesNow = kst.getUTCHours() * 60 + kst.getUTCMinutes();
+  for (const window of windows) {
+    const [start, end] = window.split("-").map(minutesOfDay);
+    if (minutesNow >= start && minutesNow < end) return window;
+  }
+  return null;
+}
+
+function minutesOfDay(text) {
+  const [hour, minute] = text.split(":").map(Number);
+  return hour * 60 + minute;
+}
+
+function timeWindowsValue(value) {
+  if (value === null || value === undefined || value === "") return Object.freeze([]);
+  const list = Array.isArray(value) ? value : String(value).split(",");
+  const windows = list.map((item) => String(item).trim()).filter(Boolean);
+  for (const window of windows) {
+    const [start, end, extra] = window.split("-");
+    if (extra !== undefined || !TIME_PATTERN.test(start ?? "") || !TIME_PATTERN.test(end ?? "")
+      || minutesOfDay(start) >= minutesOfDay(end)) {
+      throw new AutoTradingSettingsError(
+        `noEntryWindows의 "${window}"는 "HH:MM-HH:MM"(시작 < 끝) 형식이어야 합니다.`,
+      );
+    }
+  }
+  return Object.freeze(windows);
 }
 
 function fixedCost(costModel) {

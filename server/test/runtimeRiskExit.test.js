@@ -51,6 +51,8 @@ test("runtime tracks entry time and executes a stop loss through the paper order
     openedAt: null,
     peakPrice: null,
     belowPeakSince: null,
+
+    belowStopSince: null,
   });
   const exitOrder = snapshot.account.orders[0];
   assert.equal(exitOrder.side, "SELL");
