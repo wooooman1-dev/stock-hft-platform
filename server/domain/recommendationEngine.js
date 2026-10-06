@@ -1,5 +1,9 @@
 import { normalizeRecommendationSettings } from "./recommendationSettings.js";
 
+// 최근 4개 분봉 수익률이 이 값 이상이어야 "다시 오르기 시작했다"고 본다. 점수 가산
+// 기준이면서 진입 확인 단계(75점) 진입의 필수 조건이다.
+const MIN_RECENT_RISE_BPS = 8;
+
 export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   const settings = normalizeRecommendationSettings(settingsInput);
   const candidate = normalizeCandidate(input);
@@ -16,7 +20,17 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   // 영향을 주지 않기 위해서다.
   let selected = pullback.score >= reversal.score ? pullback : reversal;
   if (momentum.score > selected.score) selected = momentum;
-  const score = blockReasons.length > 0 ? Math.min(selected.score, 49) : selected.score;
+  // 다시 오르기 시작했다는 확인(최근 분봉 수익률 ≥ MIN_RECENT_RISE_BPS) 없이는
+  // 진입 확인 단계(75점)에 못 올라가게 점수를 74점에 묶는다. 재상승 항목은 점수
+  // 가산점일 뿐이라 나머지 항목만으로 84점까지 나왔고, 그 결과 눌리는 도중에
+  // 진입했다(2026-10-06 파미셀: 최근 4분봉 -110bp 하락 중 매수 → 반등 없이 2분 만에
+  // 손절). 사용자의 원래 계획은 "재상승 확인 후 매수"다.
+  const risingConfirmed = derived.recentReturnBps >= MIN_RECENT_RISE_BPS;
+  const reasons = risingConfirmed
+    ? selected.reasons
+    : ["재상승 확인 전 — 진입 대기", ...selected.reasons];
+  const cappedScore = risingConfirmed ? selected.score : Math.min(selected.score, 74);
+  const score = blockReasons.length > 0 ? Math.min(cappedScore, 49) : cappedScore;
   const stage = blockReasons.length > 0
     ? "BLOCKED"
     : score >= 75
@@ -70,7 +84,7 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
       vwapExtensionBps: derived.vwapExtensionBps,
       upperLimitDistanceBps: derived.upperLimitDistanceBps,
     },
-    reasons: selected.reasons.slice(0, 6),
+    reasons: reasons.slice(0, 6),
     blockReasons,
     target,
     confirmation: {
@@ -120,7 +134,7 @@ function scoreReversal(candidate, derived, orderBook) {
   let score = 0;
   const reasons = [];
   if (derived.priorReturnBps <= -20) score += add(14, "직전 구간 하락 후 반전 감시", reasons);
-  if (derived.recentReturnBps >= 8) score += add(16, "최근 가격 기울기가 상승으로 전환", reasons);
+  if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS) score += add(16, "최근 가격 기울기가 상승으로 전환", reasons);
   if (derived.reboundFromLowBps >= 20 && derived.reboundFromLowBps <= 250) {
     score += add(14, "최근 저점에서 유효한 반등", reasons);
   }
@@ -144,7 +158,7 @@ function scorePullback(candidate, derived, orderBook) {
   if (derived.pullbackDepthBps >= 20 && derived.pullbackDepthBps <= 250) {
     score += add(14, "과도하지 않은 짧은 눌림", reasons);
   }
-  if (derived.recentReturnBps >= 8) score += add(16, "눌림 후 재상승", reasons);
+  if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS) score += add(16, "눌림 후 재상승", reasons);
   if (derived.volumeContractionRatio !== null && derived.volumeContractionRatio <= 0.9) {
     score += add(10, "눌림 구간 거래량 감소", reasons);
   }
@@ -169,7 +183,7 @@ function scoreMomentum(candidate, derived, orderBook) {
   const reasons = [];
   if (candidate.changePercent !== null && candidate.changePercent > 0) score += add(8, "당일 상승 추세 유지", reasons);
   if (derived.priorReturnBps >= 20) score += add(16, "직전 구간부터 이어지는 상승", reasons);
-  if (derived.recentReturnBps >= 8) score += add(16, "최근에도 계속 상승", reasons);
+  if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS) score += add(16, "최근에도 계속 상승", reasons);
   if (derived.higherRecentLows) score += add(14, "저점이 계속 높아지는 추세", reasons);
   if (derived.volumeContractionRatio !== null && derived.volumeContractionRatio >= 1) {
     score += add(16, "거래량이 줄지 않고 유지·증가하며 상승", reasons);

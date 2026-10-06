@@ -146,6 +146,61 @@ test("눌림 없이 꾸준히 신고점을 갱신하는 후보는 MOMENTUM으로
   assert.ok(result.score >= 75);
 });
 
+// 2026-10-06 파미셀: 최근 4분봉이 -110bp 하락하는 중에 눌림목 점수 84로 진입해 반등
+// 없이 2분 만에 손절됐다. 재상승 가산점(16점)이 없어도 나머지 항목만으로 84점이
+// 나왔기 때문이다. 재상승 확인 전에는 진입 확인 단계(75점)에 오를 수 없어야 한다.
+test("눌리는 도중(재상승 확인 전)인 눌림목 후보는 다른 조건이 좋아도 WATCH에 머문다", () => {
+  const closes = [9800, 9850, 9900, 9950, 10000, 10050, 10040, 10010, 9990, 9970];
+  const bars = closes.map((close, index) => bar(
+    `09${String(index).padStart(2, "0")}00`,
+    close + 5,
+    close + 10,
+    close - 10,
+    close,
+    index < 6 ? 2000 : 900,
+  ));
+  const result = evaluateRecommendationCandidate({
+    symbol: "005690",
+    name: "눌림중",
+    currentPrice: 9970,
+    changePercent: 9,
+    accumulatedTradingValue: 20_000_000_000,
+    tickSize: 10,
+    orderBook: { bestBid: 9960, bestAsk: 9970, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.ok(result.microstructure.recentReturnBps < 0, "최근 분봉이 하락 중이라는 전제");
+  assert.equal(result.candidateType, "PULLBACK");
+  assert.equal(result.stage, "WATCH");
+  assert.ok(result.score <= 74);
+  assert.equal(result.reasons[0], "재상승 확인 전 — 진입 대기");
+});
+
+test("반전형도 재상승 확인 전에는 진입 확인 단계에 오르지 못한다", () => {
+  const closes = [10000, 9960, 9920, 9880, 9840, 9800, 9795, 9800, 9802, 9801];
+  const lows = [9990, 9950, 9910, 9870, 9830, 9790, 9785, 9790, 9795, 9798];
+  const bars = closes.map((close, index) => bar(
+    `09${String(index).padStart(2, "0")}00`, close, close + 10, lows[index], close, 1000,
+  ));
+  const result = evaluateRecommendationCandidate({
+    symbol: "000001",
+    name: "반전대기",
+    currentPrice: 9815,
+    changePercent: -0.5,
+    accumulatedTradingValue: 20_000_000_000,
+    executionStrength: 118,
+    tickSize: 10,
+    orderBook: { bestBid: 9810, bestAsk: 9815, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.ok(result.microstructure.recentReturnBps < 8, "아직 재상승이 확인되지 않았다는 전제");
+  assert.equal(result.candidateType, "REVERSAL");
+  assert.equal(result.stage, "WATCH");
+  assert.ok(result.score <= 74);
+});
+
 test("신규상장 종목은 당일 상승률·상한가 근접 가드가 완화되지만 VWAP 이격 가드는 유지된다", () => {
   const bars = Array.from({ length: 10 }, (_, index) => bar(
     `09${String(index).padStart(2, "0")}00`,
