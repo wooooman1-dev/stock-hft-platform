@@ -944,3 +944,36 @@ test("재시작해도 당일 재진입 금지·보유 시작 시각·고점이 �
   });
   assert.equal(reentry.evaluated[0].reason, "EXITED_TODAY", "재시작 뒤에도 같은 날 재진입하지 않는다");
 });
+// 2026-10-07: 판단 기록(decisions)은 메모리에 20건뿐이라 "오늘 왜 매수가 0건이었나"를
+// 사후에 따질 수 없었다. 스캐너가 ENTRY_READY로 본 종목이 진입 필터에서 탈락한 사유를
+// 실행 저널에 남긴다(같은 사유 조합은 60초 안에는 반복해 쓰지 않는다).
+test("ENTRY_READY인데 진입 필터에서 탈락한 사유를 실행 저널에 남기고 같은 사유는 반복해 쓰지 않는다", async () => {
+  const service = fakeService();
+  let tick = BASE;
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: {
+      enabled: true, settlementGraceMs: 0, entryConfirmMs: 0, cooldownMs: 0,
+      noEntryWindows: [], maxConsecutiveLossesPerDay: 0,
+    },
+    costModel: COST,
+    now: () => tick,
+  });
+  const fresh = () => candidate({
+    realtime: { state: "ENTRY_READY", latestAt: tick, metrics: { currentPrice: 70_000, spreadBps: 14, executionStrength: 50 } },
+  });
+  const gateEvents = () => service.journal.events.filter((event) => event.type === "AUTO_ENTRY_GATE");
+
+  await auto.evaluate({ candidates: [fresh()], balance: balance() });
+  assert.equal(gateEvents().length, 1);
+  assert.equal(gateEvents()[0].payload.blocked[0].reason, "EXECUTION_STRENGTH_TOO_LOW");
+  assert.equal(gateEvents()[0].payload.blocked[0].symbol, "005930");
+
+  tick = BASE + 10_000;
+  await auto.evaluate({ candidates: [fresh()], balance: balance() });
+  assert.equal(gateEvents().length, 1, "같은 사유는 60초 안에 다시 쓰지 않는다");
+
+  tick = BASE + 70_000;
+  await auto.evaluate({ candidates: [fresh()], balance: balance() });
+  assert.equal(gateEvents().length, 2, "60초가 지나면 다시 쓴다");
+});

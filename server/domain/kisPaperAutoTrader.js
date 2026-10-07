@@ -15,6 +15,9 @@ import {
   normalizeAutoTradingSettings,
 } from "./autoTradingSettings.js";
 
+// 진입 필터 탈락 사유를 같은 조합으로 다시 쓰지 않는 최소 간격.
+const ENTRY_GATE_JOURNAL_INTERVAL_MS = 60_000;
+
 export class KisPaperAutoTraderError extends Error {
   constructor(message, code = "KIS_PAPER_AUTO_TRADER_ERROR") {
     super(message);
@@ -66,6 +69,8 @@ export class KisPaperAutoTrader {
     // 종목별로 ENTRY_READY를 처음 본 시각. 끊기면 지운다 — entryConfirmMs 동안
     // 연속 유지된 신호만 진입시킨다(2026-10-02, 036930은 2분 40초짜리 신호에 샀다).
     this.entryReadySince = new Map();
+    this.lastEntryGateKey = null;
+    this.lastEntryGateAt = 0;
     // 재시작 전 저장해 둔 보유 종목 상태(symbol -> { openedAt, peakPrice }).
     // 그 종목의 리스크 추적기를 처음 만들 때 한 번 쓰고 지운다.
     this.restoredPositions = new Map();
@@ -142,6 +147,23 @@ export class KisPaperAutoTrader {
       this.journalHaltTransition("AUTO_TRADER_HALT_CLEARED", { ...previous, clearedAt: this.now() });
     }
     return this.status();
+  }
+
+  // 스캐너가 ENTRY_READY로 본 종목이 자동매매 진입 필터에서 왜 탈락했는지를 실행 저널에
+  // 남긴다. 판단 기록(decisions)은 메모리에 20건만 있어서 "오늘 왜 매수가 0건이었나"를
+  // 사후에 못 따졌다(2026-10-07). 탈락 사유 조합이 바뀌었거나 60초가 지났을 때만 쓴다.
+  journalEntryGate(evaluated, at) {
+    const blocked = evaluated.filter((item) => item.reason
+      && !["NOT_ENTRY_READY", "ALREADY_HELD_OR_PENDING", "EXITED_TODAY", "NO_SYMBOL"].includes(item.reason));
+    if (blocked.length === 0) return;
+    const key = blocked.map((item) => `${item.symbol}:${item.reason}`).sort().join("|");
+    if (key === this.lastEntryGateKey && at - this.lastEntryGateAt < ENTRY_GATE_JOURNAL_INTERVAL_MS) return;
+    this.lastEntryGateKey = key;
+    this.lastEntryGateAt = at;
+    this.orderService.journal?.append?.("AUTO_ENTRY_GATE", {
+      at,
+      blocked: blocked.map(({ eligible, ...rest }) => rest),
+    }, at);
   }
 
   journalHaltTransition(type, payload) {
@@ -545,6 +567,7 @@ export class KisPaperAutoTrader {
         });
       }
     }
+    this.journalEntryGate(evaluated, at);
     return this.record({ action: "SKIP", at, reason: "NO_ELIGIBLE_CANDIDATE", evaluated });
   }
 
