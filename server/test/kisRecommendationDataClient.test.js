@@ -425,6 +425,24 @@ test("getFlowBars는 분봉 페이지를 과거로 이어 받아 15분봉으로 
   assert.equal(client.getCachedFlowBars("000660"), null);
 });
 
+test("getCandidateDetails는 미리 받아둔 분봉이 있으면 분봉 API를 다시 호출하지 않는다", async () => {
+  const paths = [];
+  const fake = {
+    config: { baseUrl: "https://example.test", appKey: "app", appSecret: "secret" },
+    async getAccessToken() { return "token"; },
+    async getCurrentPrice() { return { currentPrice: 10000 }; },
+    async request(url) {
+      paths.push(url.pathname);
+      return response({ rt_cd: "0", output1: {}, output2: [], output: {} });
+    },
+  };
+  const client = new KisRecommendationDataClient({ client: fake, now: () => 1, minimumIntervalMs: 0, sleep: async () => {} });
+  const preloaded = [{ time: "090000", open: 1, high: 1, low: 1, close: 1, volume: 1 }];
+  const details = await client.getCandidateDetails({ symbol: "005930", market: "UN", minuteBars: preloaded });
+  assert.deepEqual(details.minuteBars, preloaded);
+  assert.equal(paths.some((path) => path.includes("itemchartprice")), false);
+});
+
 function row(symbol, name, price, change, volume, value) {
   return {
     mksc_shrn_iscd: symbol,

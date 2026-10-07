@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { estimateTarget, evaluateRecommendationCandidate } from "../domain/recommendationEngine.js";
+import { estimateTarget, evaluateRecommendationCandidate, screenPullbackShape } from "../domain/recommendationEngine.js";
 
 const settings = {
   cacheTtlMs: 15_000,
@@ -345,6 +345,14 @@ test("15분봉 신고점 근처에서 계속 오르는 추세형 후보는 15분
   assert.equal(result.candidateType, "MOMENTUM");
   assert.equal(result.stage, "CONFIRMATION_REQUIRED");
   assert.equal(result.pullbackRerise.flowState, "UPTREND_AT_HIGH");
+});
+
+test("screenPullbackShape는 눌린 뒤 재상승 중인 1분봉에 가장 높은 우선순위를 준다", () => {
+  const resume = screenPullbackShape({ symbol: "005930", currentPrice: 10140, tickSize: 10 }, pullbackResumeBars());
+  assert.equal(resume.priority, 3);
+  const flat = Array.from({ length: 10 }, (_, index) => bar(`09${String(index).padStart(2, "0")}00`, 10000, 10005, 9995, 10000, 1000));
+  assert.equal(screenPullbackShape({ symbol: "005930", currentPrice: 10000, tickSize: 10 }, flat).priority, 0);
+  assert.equal(screenPullbackShape({ symbol: "005930", currentPrice: 10000, tickSize: 10 }, flat.slice(0, 3)).priority, -1);
 });
 
 test("신규상장 종목은 당일 상승률·상한가 근접 가드가 완화되지만 VWAP 이격 가드는 유지된다", () => {

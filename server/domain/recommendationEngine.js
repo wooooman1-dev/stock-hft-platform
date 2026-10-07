@@ -153,6 +153,22 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   };
 }
 
+// 정밀 분석 전에 1분봉만으로 "눌림 후 재상승" 모양인지 빠르게 가늠한다(스캐너의 모양 선별
+// 단계). priority: 3=눌림 뒤 바닥에서 재상승 중, 2=계속 오르며 저점이 높아짐, 1=최근 분봉 상승,
+// 0=해당 없음, -1=분봉 부족. 점수·단계는 정밀 분석(evaluateRecommendationCandidate)이 정한다.
+export function screenPullbackShape(input, minuteBars) {
+  const candidate = normalizeCandidate({ ...input, minuteBars });
+  const bars = normalizeBars(candidate.minuteBars);
+  if (bars.length < 8) return { priority: -1 };
+  const orderBook = normalizeOrderBook(undefined, candidate.tickSize);
+  const derived = calculateDerived(candidate, bars, orderBook);
+  let priority = 0;
+  if (derived.shape.dip && derived.shape.rising) priority = 3;
+  else if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS && derived.higherRecentLows) priority = 2;
+  else if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS) priority = 1;
+  return { priority };
+}
+
 export function estimateTarget(currentPrice, tickSize, settingsInput = {}) {
   const settings = normalizeRecommendationSettings(settingsInput);
   const price = positiveOrNull(currentPrice);

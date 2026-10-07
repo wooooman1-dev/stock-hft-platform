@@ -1,4 +1,4 @@
-import { evaluateRecommendationCandidate } from "./recommendationEngine.js";
+import { evaluateRecommendationCandidate, screenPullbackShape } from "./recommendationEngine.js";
 import { KisRealtimeMarketDataClient } from "../integrations/kis/kisRealtimeMarketDataClient.js";
 import {
   evaluateRealtimeConfirmation,
@@ -12,6 +12,8 @@ import {
 // 15분봉 흐름은 종목당 여러 번 호출이 필요하다. 한 사이클에 새로 조회하는 종목 수 상한이다
 // (캐시에 있는 종목은 호출 없이 쓰므로 여러 사이클에 걸쳐 점차 채워진다).
 const MAX_FLOW_FETCHES_PER_CYCLE = 6;
+// 모양 선별용 1분봉은 이 시간 안에는 다시 받지 않는다(사이클이 짧을 때 호출을 아낀다).
+const SCREEN_CACHE_MS = 30_000;
 
 export class RecommendationScanner {
   constructor({
@@ -56,6 +58,7 @@ export class RecommendationScanner {
     this.inFlight = null;
     this.value = this.emptySnapshot();
     this.lastRealtimeStates = new Map();
+    this.screenCache = new Map();
     this.realtimeListeners = null;
     this.bindRealtimeResearch();
   }
@@ -179,7 +182,8 @@ export class RecommendationScanner {
     const universe = universeSnapshot.candidates;
     const candidates = [];
     const researchDetails = [];
-    const enrichTargets = universe.slice(0, this.settings.maxEnriched);
+    const preloadedBars = new Map();
+    const enrichTargets = await this.selectEnrichTargets(universe, preloadedBars, errors);
     let disclosures = new Map();
     if (this.disclosureClient) {
       try {
@@ -200,6 +204,7 @@ export class RecommendationScanner {
         const details = await this.dataClient.getCandidateDetails({
           symbol: base.symbol,
           market: "UN",
+          minuteBars: preloadedBars.get(base.symbol),
         });
         const quote = details.quote ?? {};
         const orderBook = {
@@ -417,6 +422,38 @@ export class RecommendationScanner {
       automaticOrderConnected: false,
     }, realtime.checkedAt ?? this.now());
     this.lastRealtimeStates.set(candidate.symbol, realtime.state);
+  }
+
+  // 정밀 분석 대상을 고른다. 순위 점수 상위 maxEnriched개만 쓰면 눌림 후 재상승 종목이
+  // 순위 밖에 있을 때 영원히 못 보므로, 후보 maxScreened개 전체에 1분봉 1번만 받아 모양으로
+  // 먼저 거른 뒤(모양 우선순위 → 같으면 순위순) 상위 maxEnriched개를 정밀 분석한다.
+  // 받아둔 분봉은 정밀 분석에서 재사용해 호출을 아낀다.
+  async selectEnrichTargets(universe, preloadedBars, errors) {
+    const { maxEnriched, maxScreened } = this.settings;
+    const screenCount = Math.min(universe.length, maxScreened);
+    if (screenCount <= maxEnriched || typeof this.dataClient.getMinuteBars !== "function") {
+      return universe.slice(0, maxEnriched);
+    }
+    const scored = [];
+    for (let index = 0; index < screenCount; index += 1) {
+      const base = universe[index];
+      let priority = -1;
+      try {
+        const cached = this.screenCache.get(base.symbol);
+        let rows = cached && this.now() - cached.at <= SCREEN_CACHE_MS ? cached.rows : null;
+        if (rows === null) {
+          rows = await this.dataClient.getMinuteBars({ symbol: base.symbol });
+          this.screenCache.set(base.symbol, { at: this.now(), rows });
+        }
+        preloadedBars.set(base.symbol, rows);
+        priority = screenPullbackShape(base, rows).priority;
+      } catch (error) {
+        errors.push({ source: "SCREEN", symbol: base.symbol, ...safeError(error) });
+      }
+      scored.push({ base, index, priority });
+    }
+    scored.sort((a, b) => b.priority - a.priority || a.index - b.index);
+    return scored.slice(0, maxEnriched).map((item) => item.base);
   }
 
   bindRealtimeResearch() {

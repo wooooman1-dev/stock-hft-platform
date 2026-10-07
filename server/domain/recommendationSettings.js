@@ -12,6 +12,10 @@ export const DEFAULT_RECOMMENDATION_SETTINGS = Object.freeze({
   cacheTtlMs: 15_000,
   maxUniverse: 50,
   maxEnriched: 18,
+  // 정밀 분석(18개)에 앞서 1분봉만으로 눌림 후 재상승 모양을 선별하는 후보 수. 순위 점수만으로
+  // 상위 18개를 고르면 순위 밖에 있는 눌림 후 재상승 종목은 영원히 못 본다(2026-10-07).
+  // maxEnriched 이하이면 선별 없이 예전처럼 순위 상위를 쓴다.
+  maxScreened: 50,
   minimumTradingValue: 1_000_000_000,
   targetNetProfitBps: 300,
   buyCommissionBps: 1.40527,
@@ -58,6 +62,7 @@ export function loadRecommendationSettings(env = process.env) {
     cacheTtlMs: env.PULSEHFT_RECOMMENDATION_CACHE_TTL_MS,
     maxUniverse: env.PULSEHFT_RECOMMENDATION_MAX_UNIVERSE,
     maxEnriched: env.PULSEHFT_RECOMMENDATION_MAX_ENRICHED,
+    maxScreened: env.PULSEHFT_RECOMMENDATION_MAX_SCREENED,
     minimumTradingValue: env.PULSEHFT_RECOMMENDATION_MIN_TRADING_VALUE,
     targetNetProfitBps: env.PULSEHFT_RECOMMENDATION_TARGET_NET_BPS,
     buyCommissionBps: env.PULSEHFT_RECOMMENDATION_BUY_FEE_BPS,
@@ -92,6 +97,7 @@ export function normalizeRecommendationSettings(input = {}) {
     cacheTtlMs: integerInRange(merged.cacheTtlMs, 5_000, 300_000, "추천 캐시 시간"),
     maxUniverse: integerInRange(merged.maxUniverse, 10, 100, "1차 후보 수"),
     maxEnriched: integerInRange(merged.maxEnriched, 3, 20, "정밀 분석 후보 수"),
+    maxScreened: integerInRange(merged.maxScreened, 0, 100, "모양 선별 후보 수"),
     minimumTradingValue: numberInRange(
       merged.minimumTradingValue,
       0,

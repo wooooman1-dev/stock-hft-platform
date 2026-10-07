@@ -218,13 +218,16 @@ export class KisRecommendationDataClient {
     return rows;
   }
 
-  async getCandidateDetails({ symbol, market = "UN" }) {
+  // minuteBars를 이미 받아둔 경우(스캐너의 모양 선별 단계) 그대로 쓰고 분봉 호출을 건너뛴다.
+  async getCandidateDetails({ symbol, market = "UN", minuteBars: preloadedMinuteBars = null }) {
     const normalizedSymbol = normalizeSymbol(symbol);
     // KIS REST 호출 제한을 보호하기 위해 후보 상세 조회는 순차 실행합니다.
     await this.waitForRateLimit();
     const quote = await this.client.getCurrentPrice({ symbol: normalizedSymbol, market });
     const orderBook = await this.getOrderBook({ symbol: normalizedSymbol, market });
-    const minuteBars = await this.getMinuteBars({ symbol: normalizedSymbol, market });
+    const minuteBars = Array.isArray(preloadedMinuteBars)
+      ? preloadedMinuteBars
+      : await this.getMinuteBars({ symbol: normalizedSymbol, market });
     return {
       quote,
       orderBook,

@@ -162,6 +162,66 @@ test("15분봉 조회가 실패해도 후보를 막지 않고 WATCH에 두며 �
   assert.ok(result.errors.some((item) => item.source === "FLOW_BARS"));
 });
 
+// 2026-10-07: 순위 상위 N개만 정밀 분석하면 순위 밖의 눌림 후 재상승 종목을 못 본다. 후보
+// 전체에 1분봉만 먼저 받아 모양으로 거른 뒤 상위만 정밀 분석하는지 확인한다.
+test("순위가 낮아도 눌림 후 재상승 모양이면 정밀 분석 대상에 먼저 뽑히고 분봉은 재사용한다", async () => {
+  const now = 1_000_000;
+  const symbols = ["000001", "000002", "000003", "000004", "000005", "000006"];
+  const flat = Array.from({ length: 10 }, (_, index) => ({
+    time: `09${String(index).padStart(2, "0")}00`, open: 10_000, high: 10_005, low: 9_995, close: 10_000, volume: 1_000,
+  }));
+  const minuteCalls = [];
+  const detailCalls = [];
+  const base = fakeClient();
+  const client = {
+    ...base,
+    async getUniverse() {
+      return symbols.map((symbol, index) => ({
+        symbol, name: symbol, market: "KRX", currentPrice: 10_140, changePercent: 2,
+        accumulatedTradingValue: 20_000_000_000, volumeRank: index + 1,
+      }));
+    },
+    async getMinuteBars({ symbol }) {
+      minuteCalls.push(symbol);
+      return symbol === "000005" ? bars() : flat;
+    },
+    async getCandidateDetails({ symbol, minuteBars }) {
+      detailCalls.push({ symbol, reused: Array.isArray(minuteBars) });
+      return base.getCandidateDetails();
+    },
+  };
+  const scanner = new RecommendationScanner({
+    dataClient: client,
+    settings: { ...settings, maxUniverse: 10, maxEnriched: 3, maxScreened: 6 },
+    now: () => now,
+    sleep: async () => {},
+  });
+  await scanner.refresh({ force: true });
+  assert.deepEqual(minuteCalls, symbols, "후보 전체의 1분봉을 한 번씩만 받아야 한다");
+  assert.deepEqual(detailCalls.map((call) => call.symbol), ["000005", "000001", "000002"]);
+  assert.ok(detailCalls.every((call) => call.reused), "선별에서 받은 분봉을 정밀 분석이 재사용해야 한다");
+});
+
+test("maxScreened가 maxEnriched 이하이면 선별 없이 순위 상위를 그대로 쓴다", async () => {
+  const now = 1_000_000;
+  const minuteCalls = [];
+  const base = fakeClient();
+  const client = {
+    ...base,
+    async getUniverse() {
+      return ["000001", "000002", "000003", "000004"].map((symbol) => ({
+        symbol, name: symbol, market: "KRX", accumulatedTradingValue: 20_000_000_000,
+      }));
+    },
+    async getMinuteBars({ symbol }) { minuteCalls.push(symbol); return bars(); },
+  };
+  const scanner = new RecommendationScanner({
+    dataClient: client, settings: { ...settings, maxEnriched: 3, maxScreened: 3 }, now: () => now, sleep: async () => {},
+  });
+  await scanner.refresh({ force: true });
+  assert.deepEqual(minuteCalls, []);
+});
+
 function fakeClient() {
   return {
     status() {
