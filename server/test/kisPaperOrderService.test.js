@@ -64,6 +64,26 @@ test("an order's internal reason is journaled but never sent to the broker", asy
   assert.equal(broker.submitCalls, 1);
 });
 
+// 2026-10-07: 매수 시점 필터 값·매도 직전 보유 중 최대 상승/하락을 주문 기록에 남겨 손익과 맞춰
+// 볼 수 있게 한다. KIS 요청에는 새지 않아야 하고, 너무 큰 값은 버린다.
+test("an order analysis context is journaled but never sent to the broker", async () => {
+  const journal = new MemoryJournal();
+  const broker = client();
+  const orders = service({ client: broker, journal });
+  await orders.submitOrder({
+    clientOrderId: "ctx-1", side: "BUY", symbol: "005930", type: "MARKET", quantity: 1,
+    referencePrice: 70_000, context: { gate: { executionStrength: 95 }, mfeBps: 12 },
+  });
+  await orders.submitOrder({
+    clientOrderId: "ctx-2", side: "BUY", symbol: "000660", type: "MARKET", quantity: 1,
+    referencePrice: 70_000, context: { huge: "x".repeat(5_000) },
+  });
+  const events = journal.readAll().filter((event) => event.type === "BROKER_ORDER_COMMAND");
+  assert.deepEqual(events[0].payload.context, { gate: { executionStrength: 95 }, mfeBps: 12 });
+  assert.equal(events[0].payload.request.context, undefined, "context가 KIS 요청 필드로 새면 안 된다");
+  assert.equal(events[1].payload.context, null, "너무 큰 context는 버린다");
+});
+
 test("restart replays accepted result without reissuing order", async () => {
   const journal = new MemoryJournal();
   const firstBroker = client();

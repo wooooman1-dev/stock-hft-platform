@@ -324,6 +324,9 @@ executionJournal.append("SESSION_STARTED", {
   kisPaperOrderEnabled: Boolean(kisPaperOrderService),
   kisPaperAutomaticStrategyConnected: Boolean(kisPaperAutoTrader),
   kisPaperAutoTradingEnabled: Boolean(kisPaperAutoTrader?.settings.enabled),
+  // 그날 어떤 설정으로 돌았는지 — 날짜별 성적을 설정과 연결해 비교하려는 기록이다(2026-10-07).
+  autoTradingSettings: kisPaperAutoTrader ? { ...kisPaperAutoTrader.settings } : null,
+  recommendationSettings: { ...recommendationScanner.settings },
   kisLiveMode: kisLiveConfiguration.mode,
   kisLiveBalanceEnabled: Boolean(kisLiveClient),
   kisLiveOrderEnabled: Boolean(kisLiveOrderService),

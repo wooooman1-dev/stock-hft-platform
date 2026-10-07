@@ -40,6 +40,12 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   // 영향을 주지 않기 위해서다.
   let selected = pullback.score >= reversal.score ? pullback : reversal;
   if (momentum.score > selected.score) selected = momentum;
+  // 기존 신호(눌림목·반전·추세)는 신호 단위 재측정에서 무작위 진입보다 나빴다. 검증되기 전엔
+  // 75점 미만(WATCH)에 묶어 진입 확인 단계에 오르지 못하게 하고, 고가 근처 모멘텀만 통과시킨다.
+  const highMomentum = scoreHighMomentum(candidate, derived, orderBook, settings);
+  const legacyBlocked = !settings.enableLegacyEntrySignals;
+  if (legacyBlocked) selected = { ...selected, score: Math.min(selected.score, 74) };
+  if (highMomentum.score > selected.score) selected = highMomentum;
   // 다시 오르기 시작했다는 확인(최근 분봉 수익률 ≥ MIN_RECENT_RISE_BPS) 없이는
   // 진입 확인 단계(75점)에 못 올라가게 점수를 74점에 묶는다. 재상승 항목은 점수
   // 가산점일 뿐이라 나머지 항목만으로 84점까지 나왔고, 그 결과 눌리는 도중에
@@ -69,11 +75,17 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
       flowWaitReason = "15분 상승 흐름 아님 — 진입 대기";
     }
   }
-  const risingConfirmed = timingConfirmed && flowConfirmed;
+  // 고가 근처 모멘텀은 눌림·재상승·15분 흐름 조건과 무관하게 자기 조건(고가 근처·등락률)으로 판정한다.
+  const risingConfirmed = selected.type === "HIGH_MOMENTUM" || (timingConfirmed && flowConfirmed);
   const waitingReasons = [];
   if (!timingConfirmed) waitingReasons.push("재상승 확인 전 — 진입 대기");
   if (!flowConfirmed) waitingReasons.push(flowWaitReason);
-  const reasons = risingConfirmed ? selected.reasons : [...waitingReasons, ...selected.reasons];
+  const legacyCapped = legacyBlocked && selected.type !== "HIGH_MOMENTUM";
+  const reasons = [
+    ...(legacyCapped ? ["고가 근처·적정 상승 조건 미충족 — 진입 대기"] : []),
+    ...(risingConfirmed ? [] : waitingReasons),
+    ...selected.reasons,
+  ];
   const cappedScore = risingConfirmed ? selected.score : Math.min(selected.score, 74);
   const score = blockReasons.length > 0 ? Math.min(cappedScore, 49) : cappedScore;
   const stage = blockReasons.length > 0
@@ -131,8 +143,12 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
     },
     reasons: reasons.slice(0, 6),
     blockReasons,
+    highMomentum: {
+      qualifies: highMomentum.score > 0,
+      nearHighBps: derived.nearHighBps,
+    },
     pullbackRerise: {
-      confirmed: risingConfirmed && shape.dip,
+      confirmed: risingConfirmed && shape.dip && selected.type !== "HIGH_MOMENTUM",
       source: shape.source,
       flowState: derived.flowState,
       flowUptrend: derived.flowUptrend,
@@ -153,17 +169,50 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   };
 }
 
+// 당일 고가 근처 모멘텀(2026-10-07): 신호 단위 측정(09-21~10-07, 같은 종목 10분 중복 제거 488건)에서
+// "당일 고가 150bp 이내 + 등락률 2.5~8.7%"를 60분 보유하면 비용 23bp를 빼고도 평균 +23.5bp(검증
+// 구간 +29bp, 8일 중 6일 양수)였다. 점수에 쓰던 요소들과 달리 이 구간만 비용을 넘는 방향성이
+// 있었다. 표본이 8일뿐이고 겹치는 표본이 많아 잠정 규칙이다.
+function scoreHighMomentum(candidate, derived, orderBook, settings) {
+  const reasons = [];
+  const change = candidate.changePercent;
+  const qualifies = change !== null
+    && change >= settings.highMomentumMinChangePercent
+    && change <= settings.highMomentumMaxChangePercent
+    && derived.nearHighBps !== null
+    && derived.nearHighBps <= settings.highMomentumMaxNearHighBps;
+  if (!qualifies) return { type: "HIGH_MOMENTUM", score: 0, reasons };
+  let score = 76;
+  reasons.push("당일 고가 근처에서 적정 상승률 유지");
+  if (orderBook.spreadTicks !== null && orderBook.spreadTicks <= 2) score += add(4, "스프레드 2틱 이하", reasons);
+  if (candidate.accumulatedTradingValue >= 5_000_000_000) score += add(4, "거래대금 충분", reasons);
+  if (derived.vwap !== null && candidate.currentPrice > derived.vwap) score += add(4, "현재가가 단기 VWAP 위", reasons);
+  return { type: "HIGH_MOMENTUM", score: Math.min(100, score), reasons };
+}
+
 // 정밀 분석 전에 1분봉만으로 "눌림 후 재상승" 모양인지 빠르게 가늠한다(스캐너의 모양 선별
 // 단계). priority: 3=눌림 뒤 바닥에서 재상승 중, 2=계속 오르며 저점이 높아짐, 1=최근 분봉 상승,
 // 0=해당 없음, -1=분봉 부족. 점수·단계는 정밀 분석(evaluateRecommendationCandidate)이 정한다.
-export function screenPullbackShape(input, minuteBars) {
+export function screenPullbackShape(input, minuteBars, settingsInput = {}) {
+  const settings = normalizeRecommendationSettings(settingsInput);
   const candidate = normalizeCandidate({ ...input, minuteBars });
   const bars = normalizeBars(candidate.minuteBars);
   if (bars.length < 8) return { priority: -1 };
   const orderBook = normalizeOrderBook(undefined, candidate.tickSize);
   const derived = calculateDerived(candidate, bars, orderBook);
   let priority = 0;
-  if (derived.shape.dip && derived.shape.rising) priority = 3;
+  // 순위 행에는 당일 고가가 없을 수 있어, 분봉(최근 30분)의 고가를 대신 써서 고가 근처인지 가늠한다.
+  const recentHigh = Math.max(...bars.map((bar) => bar.high));
+  const proxyNearHighBps = candidate.currentPrice && recentHigh
+    ? Math.max(0, ((recentHigh - candidate.currentPrice) / recentHigh) * 10_000)
+    : null;
+  const highMomentumLike = candidate.changePercent !== null
+    && candidate.changePercent >= settings.highMomentumMinChangePercent
+    && candidate.changePercent <= settings.highMomentumMaxChangePercent
+    && proxyNearHighBps !== null
+    && proxyNearHighBps <= settings.highMomentumMaxNearHighBps;
+  if (highMomentumLike) priority = 4;
+  else if (derived.shape.dip && derived.shape.rising) priority = 3;
   else if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS && derived.higherRecentLows) priority = 2;
   else if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS) priority = 1;
   return { priority };
@@ -516,6 +565,9 @@ function calculateDerived(candidate, bars, orderBook, flowBars = []) {
     vwapExtensionBps: vwapExtensionBps === null ? null : round(vwapExtensionBps, 2),
     upperLimitDistanceBps: upperLimitDistanceBps === null ? null : round(upperLimitDistanceBps, 2),
     bookImbalance: round(bookImbalance, 4),
+    nearHighBps: candidate.highPrice && candidate.currentPrice
+      ? round(Math.max(0, ((candidate.highPrice - candidate.currentPrice) / candidate.highPrice) * 10_000), 2)
+      : null,
     ...swing,
     ...flow,
     ...bounce,

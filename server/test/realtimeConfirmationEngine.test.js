@@ -44,6 +44,18 @@ test("스프레드 또는 추격 이격이 크면 BLOCKED 처리한다", () => {
   assert.match(result.reasons.join(" "), /스프레드/);
 });
 
+// 2026-10-07: 매수호가 우위일수록 이후 수익이 나빴다(스냅샷 11,792개 5분위). 호가가 매도 우위여도
+// 막지 않는다.
+test("호가가 매도 우위여도 호가 불균형만으로는 ENTRY_READY를 막지 않는다", () => {
+  const now = 1_000_000;
+  const sellHeavy = snapshot(now);
+  sellHeavy.orderBook.totalBidSize = 5_000;
+  sellHeavy.orderBook.totalAskSize = 30_000;
+  const result = evaluateRealtimeConfirmation(candidate, sellHeavy, { now });
+  assert.equal(result.state, "ENTRY_READY");
+  assert.ok(result.metrics.bookImbalance < 0);
+});
+
 test("실시간 상태 집계를 반환한다", () => {
   const counts = summarizeRealtimeStates([
     { realtime: { state: "ENTRY_READY" } },

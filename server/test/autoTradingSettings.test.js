@@ -14,8 +14,11 @@ import {
 // 2026-10-02 12:00 KST
 const KST_NOON = Date.parse("2026-10-02T03:00:00Z");
 
-test("v1로 저장된 설정의 익절 150(옛 기본값)은 250으로 올리고, 직접 바꾼 값은 그대로 둔다", () => {
-  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1, takeProfitBps: 150 }).takeProfitBps, 250);
+test("v1로 저장된 설정의 익절 150(옛 기본값)은 현재 기본값으로 올리고, 직접 바꾼 값은 그대로 둔다", () => {
+  assert.equal(
+    normalizeAutoTradingSettings({ schemaVersion: 1, takeProfitBps: 150 }).takeProfitBps,
+    DEFAULT_AUTO_TRADING_SETTINGS.takeProfitBps,
+  );
   assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1, takeProfitBps: 300 }).takeProfitBps, 300);
   assert.equal(normalizeAutoTradingSettings({ schemaVersion: 2, takeProfitBps: 150 }).takeProfitBps, 150);
   assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1 }).schemaVersion, 2);
@@ -51,18 +54,19 @@ test("설계 기본값을 그대로 사용한다", () => {
   assert.equal(settings.enabled, false, "자동매매는 기본으로 꺼져 있어야 한다");
   assert.equal(settings.minimumNetEdgeBps, 50);
   assert.equal(settings.positionSizeRatio, 0.1);
-  assert.equal(settings.stopLossBps, 100);
-  assert.equal(settings.takeProfitBps, 250);
+  // 2026-10-07 신호 측정으로 고가 근처 모멘텀 60분 보유 정책에 맞춰 바꿨다(autoTradingSettings.js 주석).
+  assert.equal(settings.stopLossBps, 300);
+  assert.equal(settings.takeProfitBps, 1_000);
   assert.equal(settings.stopConfirmMs, 2_000);
   assert.equal(settings.entryMinimumExecutionStrength, 100);
   assert.equal(settings.entryMinimumVwapExtensionBps, -50);
   assert.equal(settings.entryConfirmMs, 30_000);
-  assert.deepEqual([...settings.noEntryWindows], ["09:00-09:10", "11:30-13:00", "14:50-15:30"]);
+  assert.deepEqual([...settings.noEntryWindows], ["09:00-09:10", "11:30-13:00", "14:15-15:30"]);
   assert.equal(settings.minimumStopTicks, 6);
   assert.equal(settings.minimumRewardRiskRatio, 1.5);
   assert.equal(settings.maxConsecutiveLossesPerDay, 3);
-  assert.equal(settings.trailingStopBps, 100);
-  assert.equal(settings.maxHoldingMs, 1_800_000);
+  assert.equal(settings.trailingStopBps, null);
+  assert.equal(settings.maxHoldingMs, 3_600_000);
   assert.equal(settings.forcedExitTime, "15:15");
   assert.equal(settings.staleQuoteMs, 5_000);
   assert.equal(settings.evaluationIntervalMs, 5_000);

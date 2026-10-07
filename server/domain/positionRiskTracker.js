@@ -39,10 +39,12 @@ export class PositionRiskTracker {
       const knownOpenedAt = openedAt === null || openedAt === undefined ? NaN : Number(openedAt);
       this.openedAt = Number.isFinite(knownOpenedAt) ? knownOpenedAt : time;
       this.peakPrice = price;
+      this.troughPrice = price;
       this.belowPeakSince = null;
       this.belowStopSince = null;
     } else {
       this.advancePeak(price, time);
+      this.advanceTrough(price);
     }
     this.advanceStop(price, time, stopPrice);
     this.quantity = nextQuantity;
@@ -59,8 +61,25 @@ export class PositionRiskTracker {
     const t = Number(timestamp);
     if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(t)) return this.snapshot();
     this.advancePeak(p, t);
+    this.advanceTrough(p);
     this.advanceStop(p, t, stopPrice);
     return this.snapshot();
+  }
+
+  // 보유 중 가장 낮았던 가격. 청산 정책이 이익을 깎았는지 손실을 키웠는지 사후에 따지려고
+  // 매도 기록에 같이 남긴다(2026-10-07). snapshot()에는 넣지 않는다 — 판단에 쓰이지 않는 값이다.
+  advanceTrough(price) {
+    if (this.troughPrice === null || price < this.troughPrice) this.troughPrice = price;
+  }
+
+  // 진입가 대비 보유 중 최대 상승(MFE)·최대 하락(MAE), bp.
+  excursionBps(averagePrice) {
+    const base = Number(averagePrice);
+    if (!(base > 0) || this.peakPrice === null || this.troughPrice === null) return null;
+    return {
+      mfeBps: Math.round(((this.peakPrice - base) / base) * 10_000),
+      maeBps: Math.round(((this.troughPrice - base) / base) * 10_000),
+    };
   }
 
   // 손절선 아래로 처음 내려온 시각만 기록하고, 다시 위로 올라오면 지운다.
@@ -101,6 +120,7 @@ export class PositionRiskTracker {
     this.quantity = 0;
     this.openedAt = null;
     this.peakPrice = null;
+    this.troughPrice = null;
     this.belowPeakSince = null;
     this.belowStopSince = null;
   }

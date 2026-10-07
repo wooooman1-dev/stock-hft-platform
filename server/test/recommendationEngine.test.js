@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { estimateTarget, evaluateRecommendationCandidate, screenPullbackShape } from "../domain/recommendationEngine.js";
 
+// 기존(눌림목·반전·추세) 신호 로직을 검증하는 테스트들이라 legacy 신호를 켠다. 기본값은 꺼짐이다
+// (고가 근처 모멘텀만 진입 확인 단계에 오름 — 전용 테스트가 따로 있다).
 const settings = {
+  enableLegacyEntrySignals: true,
   cacheTtlMs: 15_000,
   maxUniverse: 30,
   maxEnriched: 8,
@@ -353,6 +356,60 @@ test("screenPullbackShape는 눌린 뒤 재상승 중인 1분봉에 가장 높�
   const flat = Array.from({ length: 10 }, (_, index) => bar(`09${String(index).padStart(2, "0")}00`, 10000, 10005, 9995, 10000, 1000));
   assert.equal(screenPullbackShape({ symbol: "005930", currentPrice: 10000, tickSize: 10 }, flat).priority, 0);
   assert.equal(screenPullbackShape({ symbol: "005930", currentPrice: 10000, tickSize: 10 }, flat.slice(0, 3)).priority, -1);
+});
+
+// 2026-10-07: 신호 단위 측정에서 이 구간만 비용을 넘는 방향성이 있었다(고가 150bp 이내 + 등락률
+// 2.5~8.7%, 60분 보유 평균 +23.5bp). 기존 신호는 기본값에서 75점 미만에 묶인다.
+function highMomentumCandidate(overrides = {}) {
+  const bars = Array.from({ length: 10 }, (_, index) => bar(
+    `09${String(index).padStart(2, "0")}00`, 10000 + index * 5, 10020 + index * 5, 9990 + index * 5, 10010 + index * 5, 1000,
+  ));
+  return {
+    symbol: "005930", name: "고가근처", currentPrice: 10_055, highPrice: 10_070, changePercent: 5,
+    accumulatedTradingValue: 20_000_000_000, tickSize: 10,
+    orderBook: { bestBid: 10_050, bestAsk: 10_060, totalBidSize: 10_000, totalAskSize: 14_000 },
+    minuteBars: bars, fetchedAt: Date.now(), ...overrides,
+  };
+}
+
+test("당일 고가 근처에서 적정 등락률이면 기본 설정에서 HIGH_MOMENTUM으로 진입 확인 단계에 오른다", () => {
+  const result = evaluateRecommendationCandidate(highMomentumCandidate(), { ...settings, enableLegacyEntrySignals: false });
+  assert.equal(result.candidateType, "HIGH_MOMENTUM");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.ok(result.score >= 76);
+  assert.equal(result.highMomentum.qualifies, true);
+  assert.ok(result.highMomentum.nearHighBps <= 150);
+});
+
+test("고가에서 멀거나 등락률이 범위 밖이면 HIGH_MOMENTUM이 아니고 WATCH 이하에 머문다", () => {
+  const config = { ...settings, enableLegacyEntrySignals: false };
+  for (const overrides of [
+    { highPrice: 10_600 }, // 고가에서 약 520bp
+    { changePercent: 1.5 },
+    { changePercent: 9.5 },
+  ]) {
+    const result = evaluateRecommendationCandidate(highMomentumCandidate(overrides), config);
+    assert.notEqual(result.candidateType, "HIGH_MOMENTUM", JSON.stringify(overrides));
+    assert.notEqual(result.stage, "CONFIRMATION_REQUIRED", JSON.stringify(overrides));
+    assert.ok(result.score <= 74);
+  }
+});
+
+test("기존 신호는 legacy가 꺼져 있으면(기본값) 점수가 아무리 높아도 진입 확인 단계에 못 오른다", () => {
+  const off = evaluateRecommendationCandidate(pullbackResumeCandidate(pullbackFlow), { ...settings, enableLegacyEntrySignals: false });
+  assert.equal(off.stage, "WATCH");
+  assert.ok(off.score <= 74);
+  assert.equal(off.reasons[0], "고가 근처·적정 상승 조건 미충족 — 진입 대기");
+  const on = evaluateRecommendationCandidate(pullbackResumeCandidate(pullbackFlow), { ...settings, enableLegacyEntrySignals: true });
+  assert.equal(on.stage, "CONFIRMATION_REQUIRED", "같은 후보가 legacy를 켜면 예전처럼 통과한다");
+});
+
+test("screenPullbackShape는 고가 근처 모멘텀 모양에 가장 높은 우선순위를 준다", () => {
+  const bars = highMomentumCandidate().minuteBars;
+  assert.equal(
+    screenPullbackShape({ symbol: "005930", currentPrice: 10_055, changePercent: 5, tickSize: 10 }, bars).priority,
+    4,
+  );
 });
 
 test("신규상장 종목은 당일 상승률·상한가 근접 가드가 완화되지만 VWAP 이격 가드는 유지된다", () => {

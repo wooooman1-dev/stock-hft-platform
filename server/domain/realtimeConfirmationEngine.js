@@ -7,7 +7,9 @@
 const DEFAULTS = Object.freeze({
   staleAfterMs: 5_000,
   maxSpreadBps: 25,
-  minimumBookImbalance: 0.05,
+  // 매수호가 우위일수록 이후 수익이 나빴다(스냅샷 11,792개 5분위: 우위 구간 30분 -14bp, 매도 우위
+  // 구간 +23bp, 2026-10-07). 게이트가 나쁜 쪽을 고르고 있어 끈다(-1 = 항상 통과).
+  minimumBookImbalance: -1,
   minimumExecutionStrength: 80,
   maximumRealtimeChaseBps: 150,
 });

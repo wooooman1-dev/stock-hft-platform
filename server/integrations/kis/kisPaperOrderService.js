@@ -207,6 +207,7 @@ export class KisPaperOrderService {
       protectiveExit: Boolean(input?.protectiveExit),
       // KIS로 나가는 request에는 안 넣는다 — 실행 저널에만 붙는 내부 메모다.
       reason: input?.reason ?? null,
+      context: sanitizeContext(input?.context),
       call: (request) => this.client.submitOrder(request),
     }));
   }
@@ -237,6 +238,7 @@ export class KisPaperOrderService {
 
   async execute({
     operation, clientOrderId, request, call, orderBookSnapshot = null, protectiveExit = false, reason = null,
+    context = null,
   }) {
     const existing = this.commands.get(clientOrderId);
     if (existing) return replayExisting(existing);
@@ -249,6 +251,9 @@ export class KisPaperOrderService {
       request: safeRequest(request),
       orderBookSnapshot: orderBookSnapshot ? structuredClone(orderBookSnapshot) : null,
       reason: text(reason),
+      // 매수는 진입 시점의 필터 값, 매도는 보유 중 최대 상승·하락 같은 사후 분석용 메모다.
+      // KIS로 나가는 request에는 안 들어가고 실행 저널에만 남는다.
+      context,
       timestamp,
       day: koreaDateKey(timestamp),
     };
@@ -919,6 +924,17 @@ function optionalNote(value) {
     });
   }
   return note;
+}
+
+// 사후 분석용 메모는 JSON으로 안전하게 직렬화되고 너무 크지 않은 일반 객체만 남긴다.
+function sanitizeContext(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized.length <= 4_000 ? JSON.parse(serialized) : null;
+  } catch {
+    return null;
+  }
 }
 
 function text(value) {

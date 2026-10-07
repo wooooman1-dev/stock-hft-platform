@@ -33,6 +33,11 @@ const EVENT_TYPES = new Set([
   "STRATEGY_APPROVAL_REJECTED",
   "STRATEGY_APPROVAL_EXPIRED",
   "LIVE_SHARED_QUOTE_CREDENTIAL_ENABLED",
+  // 자동매매 사후 분석용. 목록에 없으면 append가 던져서 기록이 조용히 사라진다 — 멈춤/해제
+  // 이벤트가 09-23부터 한 건도 안 남은 원인이 이거였다(2026-10-07 확인).
+  "AUTO_TRADER_HALTED",
+  "AUTO_TRADER_HALT_CLEARED",
+  "AUTO_ENTRY_GATE",
 ]);
 
 export class ExecutionJournalError extends Error {

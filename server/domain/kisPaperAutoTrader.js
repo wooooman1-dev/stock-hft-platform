@@ -160,10 +160,15 @@ export class KisPaperAutoTrader {
     if (key === this.lastEntryGateKey && at - this.lastEntryGateAt < ENTRY_GATE_JOURNAL_INTERVAL_MS) return;
     this.lastEntryGateKey = key;
     this.lastEntryGateAt = at;
-    this.orderService.journal?.append?.("AUTO_ENTRY_GATE", {
-      at,
-      blocked: blocked.map(({ eligible, ...rest }) => rest),
-    }, at);
+    // 분석용 기록이 실패해도 매매 판단을 막으면 안 된다.
+    try {
+      this.orderService.journal?.append?.("AUTO_ENTRY_GATE", {
+        at,
+        blocked: blocked.map(({ eligible, ...rest }) => rest),
+      }, at);
+    } catch {
+      // 저널 쓰기 실패는 무시한다.
+    }
   }
 
   journalHaltTransition(type, payload) {
@@ -493,6 +498,7 @@ export class KisPaperAutoTrader {
         side: "SELL", symbol: position.symbol, name: position.name,
         quantity: position.quantity,
         referencePrice: lastPrice, reason: "FORCED_EXIT", at,
+        diagnostics: this.exitContext(position.symbol, position.averagePrice),
       });
     }
 
@@ -507,7 +513,8 @@ export class KisPaperAutoTrader {
       return this.submit({
         side: "SELL", symbol: position.symbol, name: position.name,
         quantity: intent.quantity,
-        referencePrice: lastPrice, reason: intent.reason, at, diagnostics: intent.diagnostics,
+        referencePrice: lastPrice, reason: intent.reason, at,
+        diagnostics: { ...intent.diagnostics, ...this.exitContext(position.symbol, position.averagePrice) },
       });
     }
     return this.record({
@@ -562,7 +569,7 @@ export class KisPaperAutoTrader {
         return this.submit({
           side: "BUY", symbol: check.symbol, name: check.name, quantity: check.quantity,
           referencePrice: check.price, reason: "ENTRY_SIGNAL", at,
-          diagnostics: { expectedNetEdgeBps: check.expectedNetEdgeBps, equity },
+          diagnostics: { expectedNetEdgeBps: check.expectedNetEdgeBps, equity, gate: check.gate, candidate: check.snapshot },
           orderBookSnapshot: check.orderBookSnapshot,
         });
       }
@@ -677,6 +684,26 @@ export class KisPaperAutoTrader {
     return {
       eligible: true, symbol, name: candidate?.name ?? null,
       price, quantity, expectedNetEdgeBps,
+      // 매수 시점의 필터 값과 후보 요약 — 나중에 손익과 맞춰 "어떤 조건에서 산 게 돈이 됐나"를
+      // 따질 수 있게 주문 기록에 같이 남긴다(2026-10-07).
+      gate: {
+        readyMs,
+        executionStrength,
+        vwapExtensionBps,
+        spreadBps,
+        stopTicks: tickSizeForStop !== null && this.settings.stopLossBps !== null
+          ? Math.round(((price * this.settings.stopLossBps) / 10_000 / tickSizeForStop) * 10) / 10
+          : null,
+        rewardRiskRatio: rewardRiskRatio === null ? null : Math.round(rewardRiskRatio * 100) / 100,
+      },
+      snapshot: {
+        type: candidate?.candidateType ?? null,
+        stage: candidate?.stage ?? null,
+        score: candidate?.score ?? null,
+        changePercent: candidate?.changePercent ?? null,
+        flowState: candidate?.pullbackRerise?.flowState ?? null,
+        rerise: candidate?.pullbackRerise?.confirmed ?? null,
+      },
       orderBookSnapshot: candidate?.orderBookSnapshot ?? null,
     };
   }
@@ -757,6 +784,8 @@ export class KisPaperAutoTrader {
         // 매도가 손절/트레일링/신호 중 어느 것 때문이었는지 나중에 복원할 수 없다
         // (2026-09-23, 9연패의 원인이 진입 문제인지 청산 문제인지 판단할 근거가 없어서 추가).
         reason,
+        // 매수는 진입 시점의 필터 값, 매도는 보유 중 최대 상승·하락 — 실행 저널에만 남는다.
+        context: diagnostics,
       });
     } catch (error) {
       // 제출 자체가 실패하면(전송 오류 등) KIS에 도달했는지조차 알 수 없다 — 잡아두면
@@ -832,8 +861,22 @@ export class KisPaperAutoTrader {
     // 모든 실패를 잡아 record()로 남기므로 여기서 예외가 새어나가지 않는다.
     void this.submit({
       side: "SELL", symbol, name: holding.name, quantity: intent.quantity,
-      referencePrice: price, reason: intent.reason, at, diagnostics: intent.diagnostics,
+      referencePrice: price, reason: intent.reason, at,
+      diagnostics: { ...intent.diagnostics, ...this.exitContext(symbol, holding.averagePrice) },
     });
+  }
+
+  // 매도 직전 보유 중 경로(최대 상승·하락, 보유시간)를 실행 저널에 남기려는 사후 분석용 값.
+  exitContext(symbol, averagePrice) {
+    const tracker = this.riskTrackers.get(symbol);
+    const holding = this.holdings.get(symbol);
+    return {
+      ...(tracker?.excursionBps(averagePrice) ?? {}),
+      heldMs: holding?.heldMs ?? null,
+      averagePrice: Number.isFinite(Number(averagePrice)) ? Number(averagePrice) : null,
+      peakPrice: tracker?.peakPrice ?? null,
+      troughPrice: tracker?.troughPrice ?? null,
+    };
   }
 
   record(decision) {

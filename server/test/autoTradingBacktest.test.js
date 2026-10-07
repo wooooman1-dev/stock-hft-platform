@@ -54,7 +54,9 @@ test("기록을 시간순으로 흘려 실제 자동매매로 진입하고, 호�
   for (let second = 41; second <= 60; second += 1) {
     events.push(marketData(START + second * 1_000, { bid: 9_880, ask: 9_890, price: 9_880 }));
   }
-  const result = await backtestAutoTrading(events, { settings: { forcedExitTime: null } });
+  const result = await backtestAutoTrading(events, {
+    settings: { forcedExitTime: null, stopLossBps: 100, takeProfitBps: 250, trailingStopBps: null },
+  });
   assert.equal(result.summary.tradeCount, 1);
   const [trade] = result.trades;
   assert.equal(trade.entryPrice, 10_010);

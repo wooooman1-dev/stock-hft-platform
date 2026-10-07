@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { KisPaperAutoTrader } from "../domain/kisPaperAutoTrader.js";
+import { ExecutionJournal } from "../domain/executionJournal.js";
 
 const COST = { buyCommissionBps: 1.40527, sellCommissionBps: 1.40527, sellTaxBps: 20 };
 const BASE = 1_789_000_000_000; // 임의 기준 시각
@@ -63,6 +67,10 @@ const balance = (cash = 10_000_000, positions = []) => ({
   positions,
   summary: { cash, totalEvaluationAmount: cash },
 });
+
+// 손절 100bp·익절 250bp 기준으로 계산한 값을 단정하는 게이트 테스트용(기본값은 2026-10-07에
+// 손절 300·익절 1000으로 바뀌었다).
+const OLD_EXIT_SETTINGS = { stopLossBps: 100, takeProfitBps: 250 };
 
 function trader(settings = {}, service = fakeService()) {
   return new KisPaperAutoTrader({
@@ -813,7 +821,7 @@ test("당일 VWAP보다 50bp 넘게 아래(하락 추세)면 진입하지 않는
 
 test("손절폭이 6틱보다 좁은 고가주는 진입하지 않는다(243,000원·호가 500원이면 100bp = 4.9틱)", async () => {
   const pricey = readyCandidate({ currentPrice: 243_000, spreadBps: 20.6 }, { price: { tickSize: 500 } });
-  const decision = await trader().evaluate({ candidates: [pricey], balance: balance() });
+  const decision = await trader(OLD_EXIT_SETTINGS).evaluate({ candidates: [pricey], balance: balance() });
   assert.equal(decision.evaluated[0].reason, "STOP_TOO_TIGHT");
   assert.equal(decision.evaluated[0].stopTicks, 4.9);
 });
@@ -822,17 +830,17 @@ test("후보에 호가단위가 없어도(실제 스캐너 후보) 스프레드�
   const fromSpread = readyCandidate({ currentPrice: 243_000, spreadBps: 20.6 }, {
     price: {}, microstructure: { spread: 500, spreadTicks: 1 },
   });
-  const bySpread = await trader().evaluate({ candidates: [fromSpread], balance: balance() });
+  const bySpread = await trader(OLD_EXIT_SETTINGS).evaluate({ candidates: [fromSpread], balance: balance() });
   assert.equal(bySpread.evaluated[0].reason, "STOP_TOO_TIGHT");
 
   const fromTable = readyCandidate({ currentPrice: 243_000, spreadBps: 20.6 }, { price: {}, microstructure: {} });
-  const byTable = await trader().evaluate({ candidates: [fromTable], balance: balance() });
+  const byTable = await trader(OLD_EXIT_SETTINGS).evaluate({ candidates: [fromTable], balance: balance() });
   assert.equal(byTable.evaluated[0].reason, "STOP_TOO_TIGHT");
 });
 
 test("스프레드가 넓어 손익비가 1.5에 못 미치면 진입하지 않는다", async () => {
   // (250 - 22.81 - 30) / (100 + 22.81 + 30) = 1.29
-  const decision = await trader().evaluate({
+  const decision = await trader(OLD_EXIT_SETTINGS).evaluate({
     candidates: [readyCandidate({ spreadBps: 30 })],
     balance: balance(),
   });
@@ -976,4 +984,79 @@ test("ENTRY_READY인데 진입 필터에서 탈락한 사유를 실행 저널에
   tick = BASE + 70_000;
   await auto.evaluate({ candidates: [fresh()], balance: balance() });
   assert.equal(gateEvents().length, 2, "60초가 지나면 다시 쓴다");
+});
+
+// 2026-10-07: 매수는 진입 시점의 필터 값, 매도는 보유 중 최대 상승·하락을 주문 서비스에
+// context로 넘겨 실행 저널에 남긴다 — 어떤 조건에서 산 게 돈이 됐는지, 청산이 이익을
+// 깎았는지 사후에 따지기 위해서다.
+test("매수에는 진입 필터 값이, 매도에는 보유 중 최대 상승·하락이 context로 실린다", async () => {
+  const service = fakeService();
+  let tick = BASE;
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: {
+      enabled: true, settlementGraceMs: 0, entryConfirmMs: 0, cooldownMs: 0, noEntryWindows: [],
+      maxConsecutiveLossesPerDay: 0, entryMinimumExecutionStrength: null, entryMinimumVwapExtensionBps: null,
+      stopLossBps: 100, stopConfirmMs: 0, takeProfitBps: 400, trailingStopBps: null, forcedExitTime: null, minimumRewardRiskRatio: 0,
+    },
+    costModel: COST,
+    now: () => tick,
+  });
+  const ready = candidate({
+    realtime: { state: "ENTRY_READY", latestAt: BASE, metrics: { currentPrice: 70_000, spreadBps: 14, executionStrength: 120, vwapExtensionBps: 10 } },
+    candidateType: "PULLBACK", stage: "CONFIRMATION_REQUIRED", score: 82,
+  });
+  const buy = await auto.evaluate({ candidates: [ready], balance: balance() });
+  assert.equal(buy.action, "ORDER");
+  const buyContext = service.submitted[0].context;
+  assert.equal(buyContext.gate.executionStrength, 120);
+  assert.equal(buyContext.gate.vwapExtensionBps, 10);
+  assert.equal(buyContext.candidate.type, "PULLBACK");
+  assert.equal(buyContext.candidate.score, 82);
+
+  // 보유 중 70,000 → 70,350(고점) → 69,300(손절선 아래)로 움직인다.
+  const holding = (price) => balance(10_000_000, [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: price }]);
+  tick = BASE + 10_000;
+  await auto.evaluate({ candidates: [], balance: holding(70_350) });
+  tick = BASE + 20_000;
+  const sell = await auto.evaluate({ candidates: [], balance: holding(69_300) });
+  assert.equal(sell.reason, "STOP_LOSS");
+  const sellContext = service.submitted.at(-1).context;
+  assert.equal(sellContext.mfeBps, 50);
+  assert.equal(sellContext.maeBps, -100);
+  assert.equal(sellContext.averagePrice, 70_000);
+});
+
+// 2026-10-07: 가짜 저널(fakeJournal)은 이벤트 종류를 검증하지 않아서, 진짜 ExecutionJournal이
+// 허용 목록에 없는 종류를 던져 버려도 테스트가 통과했다 — 멈춤/해제 이벤트가 09-23부터 한 건도
+// 안 남았던 원인이다. 진짜 저널로 자동매매 이벤트가 실제로 기록되는지 확인한다.
+test("진짜 실행 저널에 멈춤·해제·진입 필터 탈락 이벤트가 실제로 기록된다", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pulsehft-auto-journal-"));
+  try {
+    const journal = new ExecutionJournal(join(directory, "execution-journal.jsonl"), { now: () => BASE });
+    const service = { ...fakeService(), journal };
+    const auto = new KisPaperAutoTrader({
+      orderService: service,
+      settings: {
+        enabled: true, settlementGraceMs: 0, entryConfirmMs: 0, cooldownMs: 0,
+        noEntryWindows: [], maxConsecutiveLossesPerDay: 0,
+      },
+      costModel: COST,
+      now: () => BASE,
+    });
+    auto.setHalt("KILL_SWITCH", "테스트");
+    auto.clearHalt();
+    await auto.evaluate({
+      candidates: [candidate({
+        realtime: { state: "ENTRY_READY", latestAt: BASE, metrics: { currentPrice: 70_000, spreadBps: 14, executionStrength: 50 } },
+      })],
+      balance: balance(),
+    });
+    const types = journal.readAll().map((event) => event.type);
+    assert.ok(types.includes("AUTO_TRADER_HALTED"));
+    assert.ok(types.includes("AUTO_TRADER_HALT_CLEARED"));
+    assert.ok(types.includes("AUTO_ENTRY_GATE"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
