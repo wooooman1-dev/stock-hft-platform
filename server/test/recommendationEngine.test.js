@@ -201,6 +201,135 @@ test("반전형도 재상승 확인 전에는 진입 확인 단계에 오르지 
   assert.ok(result.score <= 74);
 });
 
+// 2026-10-07: 흐름은 15분봉, 타이밍은 1분봉으로 본다. 1분봉에서 짧게 눌렸다가 바닥에서
+// 다시 올라오는 후보가 15분 상승 흐름 안에 있을 때만 진입 확인 단계에 오른다.
+function pullbackResumeBars() {
+  return [
+    bar("090000", 10000, 10010, 9990, 10000, 2000),
+    bar("090100", 10000, 10040, 9995, 10030, 2200),
+    bar("090200", 10030, 10070, 10020, 10060, 2300),
+    bar("090300", 10060, 10100, 10050, 10090, 2400),
+    bar("090400", 10090, 10120, 10070, 10110, 2500),
+    bar("090500", 10110, 10130, 10090, 10100, 1000),
+    bar("090600", 10100, 10115, 10080, 10090, 900),
+    bar("090700", 10090, 10105, 10085, 10095, 800),
+    bar("090800", 10095, 10125, 10090, 10120, 1000),
+    bar("090900", 10120, 10145, 10110, 10140, 1200),
+  ];
+}
+
+function pullbackResumeCandidate(flowBars) {
+  return {
+    symbol: "005930",
+    name: "삼성전자",
+    currentPrice: 10140,
+    changePercent: 2.42,
+    accumulatedTradingValue: 20_000_000_000,
+    executionStrength: 118,
+    tickSize: 10,
+    orderBook: { bestBid: 10130, bestAsk: 10140, totalBidSize: 18000, totalAskSize: 12000 },
+    minuteBars: pullbackResumeBars(),
+    flowBars,
+    fetchedAt: Date.now(),
+  };
+}
+
+// 15분봉에서 상승 다리(10040→10200) 뒤 -59bp 눌린 상태(현재가 10140): 상승 흐름 속 눌림.
+const pullbackFlow = [
+  bar("090000", 10000, 10050, 9990, 10040, 5000),
+  bar("091500", 10040, 10150, 10030, 10110, 5000),
+  bar("093000", 10110, 10220, 10100, 10200, 5000),
+  bar("094500", 10200, 10205, 10130, 10150, 5000),
+];
+// 상승 다리 뒤 신고점 근처(눌림 없음).
+const atHighFlow = [
+  bar("090000", 10000, 10050, 9990, 10040, 5000),
+  bar("091500", 10040, 10100, 10030, 10090, 5000),
+  bar("093000", 10090, 10130, 10080, 10120, 5000),
+  bar("094500", 10120, 10145, 10110, 10140, 5000),
+];
+// 상승 다리 뒤 -500bp 넘게 빠져 구조가 깨진 상태.
+const brokenFlow = [
+  bar("090000", 10300, 10320, 10290, 10310, 5000),
+  bar("091500", 10310, 10400, 10300, 10390, 5000),
+  bar("093000", 10390, 10400, 9900, 9950, 5000),
+  bar("094500", 9950, 10000, 9880, 9900, 5000),
+];
+const fallingFlow = [
+  bar("090000", 10300, 10320, 10290, 10310, 5000),
+  bar("091500", 10310, 10320, 10250, 10260, 5000),
+  bar("093000", 10260, 10270, 10200, 10210, 5000),
+  bar("094500", 10210, 10220, 10150, 10160, 5000),
+];
+
+test("15분봉 상승 흐름 속 눌림에서 1분봉이 바닥에서 다시 오르면 확인되어 진입 확인 단계에 오른다", () => {
+  const result = evaluateRecommendationCandidate(pullbackResumeCandidate(pullbackFlow), settings);
+  assert.equal(result.candidateType, "PULLBACK");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.equal(result.pullbackRerise.confirmed, true);
+  assert.equal(result.pullbackRerise.source, "FLOW15");
+  assert.equal(result.pullbackRerise.flowState, "UPTREND_PULLBACK");
+  assert.ok(result.pullbackRerise.swingDepthBps >= 20, "눌림폭은 15분봉 기준이다");
+});
+
+test("15분봉에서 눌림이 아니거나(신고점 근처·구조 붕괴·하락·확인 불가) 눌림목은 WATCH에 머문다", () => {
+  const expectations = [
+    [atHighFlow, "15분봉 상승 흐름 속 눌림 아님 — 진입 대기"],
+    [brokenFlow, "15분봉 상승 흐름 속 눌림 아님 — 진입 대기"],
+    [fallingFlow, "15분봉 상승 흐름 속 눌림 아님 — 진입 대기"],
+    [[], "15분 흐름 확인 불가 — 진입 대기"],
+  ];
+  for (const [flow, reason] of expectations) {
+    const result = evaluateRecommendationCandidate(pullbackResumeCandidate(flow), settings);
+    assert.equal(result.stage, "WATCH", reason);
+    assert.ok(result.score <= 74);
+    assert.equal(result.reasons[0], reason);
+    assert.equal(result.pullbackRerise.confirmed, false);
+  }
+});
+
+test("15분봉 눌림이어도 1분봉이 아직 하락 중(바닥이 방금 찍힘)이면 WATCH에 머문다", () => {
+  const closes = [9800, 9850, 9900, 9950, 10000, 10050, 10040, 10010, 9990, 9970];
+  const bars = closes.map((close, index) => bar(
+    `09${String(index).padStart(2, "0")}00`, close + 5, close + 10, close - 10, close, index < 6 ? 2000 : 900,
+  ));
+  const flow = [
+    bar("090000", 9800, 9850, 9790, 9840, 5000),
+    bar("091500", 9840, 10000, 9830, 9990, 5000),
+    bar("093000", 9990, 10060, 9980, 10050, 5000),
+    bar("094500", 10050, 10055, 9960, 9980, 5000),
+  ];
+  const result = evaluateRecommendationCandidate({
+    ...pullbackResumeCandidate(flow), currentPrice: 9970, minuteBars: bars,
+    orderBook: { bestBid: 9960, bestAsk: 9970, totalBidSize: 18000, totalAskSize: 10000 },
+  }, settings);
+  assert.equal(result.pullbackRerise.flowState, "UPTREND_PULLBACK", "전제: 15분봉으로는 눌림이다");
+  assert.equal(result.stage, "WATCH");
+  assert.equal(result.pullbackRerise.confirmed, false);
+  assert.equal(result.reasons[0], "재상승 확인 전 — 진입 대기");
+});
+
+test("15분봉 신고점 근처에서 계속 오르는 추세형 후보는 15분 흐름이 있으면 진입 확인 단계에 오른다", () => {
+  const bars = [];
+  for (let index = 0; index < 10; index += 1) {
+    const close = 10000 + index * 40 + 40;
+    bars.push(bar(`09${String(index).padStart(2, "0")}00`, close - 40, close + 10, close - 45, close, 1000));
+  }
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930", name: "추세", currentPrice: 10400, changePercent: 4,
+    accumulatedTradingValue: 20_000_000_000, tickSize: 10,
+    orderBook: { bestBid: 10390, bestAsk: 10400, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars, flowBars: [
+      bar("090000", 10000, 10100, 9990, 10080, 5000),
+      bar("091500", 10080, 10250, 10070, 10240, 5000),
+      bar("093000", 10240, 10420, 10230, 10400, 5000),
+    ], fetchedAt: Date.now(),
+  }, settings);
+  assert.equal(result.candidateType, "MOMENTUM");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.equal(result.pullbackRerise.flowState, "UPTREND_AT_HIGH");
+});
+
 test("신규상장 종목은 당일 상승률·상한가 근접 가드가 완화되지만 VWAP 이격 가드는 유지된다", () => {
   const bars = Array.from({ length: 10 }, (_, index) => bar(
     `09${String(index).padStart(2, "0")}00`,

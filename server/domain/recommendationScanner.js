@@ -9,6 +9,10 @@ import {
   publicRecommendationSettings,
 } from "./recommendationSettings.js";
 
+// 15분봉 흐름은 종목당 여러 번 호출이 필요하다. 한 사이클에 새로 조회하는 종목 수 상한이다
+// (캐시에 있는 종목은 호출 없이 쓰므로 여러 사이클에 걸쳐 점차 채워진다).
+const MAX_FLOW_FETCHES_PER_CYCLE = 6;
+
 export class RecommendationScanner {
   constructor({
     dataClient = null,
@@ -189,6 +193,7 @@ export class RecommendationScanner {
       }
     }
 
+    let flowFetches = 0;
     for (let index = 0; index < enrichTargets.length; index += 1) {
       const base = enrichTargets[index];
       try {
@@ -214,7 +219,7 @@ export class RecommendationScanner {
         }
         const disclosure = disclosures.get(base.symbol)
           ?? emptyDisclosureSignal(Boolean(this.disclosureClient));
-        let evaluated = evaluateRecommendationCandidate({
+        const candidateInput = {
           ...base,
           name: base.name ?? quote.name ?? base.symbol,
           currentPrice: quote.currentPrice ?? base.currentPrice,
@@ -235,7 +240,28 @@ export class RecommendationScanner {
           minuteBars: details.minuteBars,
           fetchedAt: details.fetchedAt ?? quote.fetchedAt ?? this.now(),
           evaluatedAt: this.now(),
-        }, this.settings);
+        };
+        let evaluated = evaluateRecommendationCandidate(candidateInput, this.settings);
+        // 흐름은 15분봉, 타이밍은 1분봉으로 본다(2026-10-07). 15분봉은 호출이 여러 번
+        // 필요해서 1분봉 기준으로 가능성 있는 후보(점수 55 이상, 차단 아님)에만, 사이클당
+        // 최대 MAX_FLOW_FETCHES_PER_CYCLE종목만 새로 조회한다(캐시 적중분은 호출 없음).
+        // 조회 못 한 후보는 빈 배열로 평가해 "15분 흐름 확인 불가"로 WATCH에 둔다.
+        if (typeof this.dataClient.getFlowBars === "function") {
+          let flowBars = this.dataClient.getCachedFlowBars?.(base.symbol) ?? null;
+          const promising = evaluated.stage !== "BLOCKED" && evaluated.score >= 55;
+          if (flowBars === null && promising && flowFetches < MAX_FLOW_FETCHES_PER_CYCLE) {
+            flowFetches += 1;
+            try {
+              flowBars = await this.dataClient.getFlowBars({ symbol: base.symbol });
+            } catch (error) {
+              errors.push({ source: "FLOW_BARS", symbol: base.symbol, ...safeError(error) });
+            }
+          }
+          evaluated = evaluateRecommendationCandidate(
+            { ...candidateInput, flowBars: flowBars ?? [] },
+            this.settings,
+          );
+        }
         evaluated = attachAuxiliarySignals(evaluated, { disclosure, social });
         candidates.push(evaluated);
         researchDetails.push({
@@ -266,7 +292,11 @@ export class RecommendationScanner {
       // 같은 단계라면 신규상장/공모주 당일 종목을 우선 노출한다(사용자 요청,
       // 2026-09-24) — 초반 상승폭이 커 진입 기회로서의 가치가 더 크다.
       const newlyListedOrder = Number(b.isNewlyListed) - Number(a.isNewlyListed);
+      // 같은 단계 안에서는 눌림 후 재상승이 확인된 종목을 먼저 보여준다.
+      const rerisingOrder = Number(b.pullbackRerise?.confirmed === true)
+        - Number(a.pullbackRerise?.confirmed === true);
       return stageOrder
+        || rerisingOrder
         || newlyListedOrder
         || b.score - a.score
         || b.accumulatedTradingValue - a.accumulatedTradingValue;

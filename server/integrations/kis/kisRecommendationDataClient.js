@@ -29,6 +29,10 @@ const PUB_OFFER = Object.freeze({
   trId: "HHKDB669108C0",
 });
 
+// 15분봉 흐름은 천천히 변하므로 이 시간 동안은 같은 종목을 다시 조회하지 않는다.
+const FLOW_BARS_CACHE_MS = 240_000;
+const MARKET_OPEN_HOUR = "090000";
+
 export class KisRecommendationDataClient {
   constructor({
     client,
@@ -67,6 +71,7 @@ export class KisRecommendationDataClient {
     this.rateLimitRetryBaseMs = rateLimitRetryBaseMs;
     this.sleep = sleep;
     this.nextRequestAt = 0;
+    this.flowBarsCache = new Map();
   }
 
   status() {
@@ -339,6 +344,43 @@ export class KisRecommendationDataClient {
     })).filter((bar) => [bar.open, bar.high, bar.low, bar.close].every((value) => value !== null));
   }
 
+  // 흐름(추세) 판단용 15분봉. KIS 분봉 API는 1분봉을 한 번에 30개만 주므로,
+  // 조회 시각을 과거로 옮겨가며 최대 maxPages 페이지를 받아 15분 단위로 합친다.
+  // 흐름은 천천히 변하므로 종목별로 FLOW_BARS_CACHE_MS 동안 캐시해 호출량을 줄인다.
+  async getFlowBars({ symbol, hour = currentKoreaTime(), maxPages = 5 } = {}) {
+    const normalizedSymbol = normalizeSymbol(symbol);
+    const cached = this.flowBarsCache.get(normalizedSymbol);
+    if (cached && this.now() - cached.at <= FLOW_BARS_CACHE_MS) return structuredClone(cached.bars);
+    const minutes = new Map();
+    let cursor = normalizeHour(hour);
+    for (let page = 0; page < maxPages; page += 1) {
+      const rows = await this.getMinuteBars({ symbol: normalizedSymbol, hour: cursor });
+      let earliest = null;
+      for (const row of rows) {
+        if (!/^\d{6}$/.test(row.time) || !(row.close > 0)) continue;
+        minutes.set(row.time, row);
+        if (earliest === null || row.time < earliest) earliest = row.time;
+      }
+      if (earliest === null || earliest <= MARKET_OPEN_HOUR) break;
+      const next = previousMinute(earliest);
+      if (next >= cursor) break;
+      cursor = next;
+    }
+    const bars = aggregateMinuteBars(
+      [...minutes.values()].sort((a, b) => a.time.localeCompare(b.time)),
+      15,
+    );
+    this.flowBarsCache.set(normalizedSymbol, { at: this.now(), bars });
+    return structuredClone(bars);
+  }
+
+  // 캐시에 신선한 15분봉이 있으면 돌려주고, 없으면 null(호출하지 않는다).
+  getCachedFlowBars(symbol) {
+    const cached = this.flowBarsCache.get(normalizeSymbol(symbol));
+    if (cached && this.now() - cached.at <= FLOW_BARS_CACHE_MS) return structuredClone(cached.bars);
+    return null;
+  }
+
   async getJson(definition, params, operation) {
     return (await this.getJsonPage(definition, params, operation)).payload;
   }
@@ -564,6 +606,36 @@ function normalizeMarket(value) {
     throw new KisApiError("market은 J, NX, UN 중 하나여야 합니다.", "KIS_RECOMMENDATION_INVALID_MARKET", 400);
   }
   return market;
+}
+
+// 1분 전 시각(HHMM00). 분봉 페이지를 과거로 이어 받을 때 다음 조회 시각으로 쓴다.
+function previousMinute(hhmmss) {
+  const hours = Number(hhmmss.slice(0, 2));
+  const minutes = Number(hhmmss.slice(2, 4));
+  const total = Math.max(0, hours * 60 + minutes - 1);
+  return `${pad2(Math.floor(total / 60))}${pad2(total % 60)}00`;
+}
+
+// 시간순 1분봉을 intervalMinutes 단위로 합친다. 마지막 봉은 아직 진행 중일 수 있다.
+export function aggregateMinuteBars(minuteBars, intervalMinutes) {
+  const buckets = new Map();
+  for (const bar of minuteBars) {
+    const total = Number(bar.time.slice(0, 2)) * 60 + Number(bar.time.slice(2, 4));
+    const start = total - (total % intervalMinutes);
+    const key = `${pad2(Math.floor(start / 60))}${pad2(start % 60)}00`;
+    const bucket = buckets.get(key);
+    if (!bucket) {
+      buckets.set(key, {
+        time: key, open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume ?? 0,
+      });
+    } else {
+      bucket.high = Math.max(bucket.high, bar.high);
+      bucket.low = Math.min(bucket.low, bar.low);
+      bucket.close = bar.close;
+      bucket.volume += bar.volume ?? 0;
+    }
+  }
+  return [...buckets.values()];
 }
 
 function normalizeHour(value) {

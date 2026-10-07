@@ -4,13 +4,30 @@ import { normalizeRecommendationSettings } from "./recommendationSettings.js";
 // 기준이면서 진입 확인 단계(75점) 진입의 필수 조건이다.
 const MIN_RECENT_RISE_BPS = 8;
 
+// 1분봉 스윙(눌림→재상승) 판정 기준. 눌림이 이 폭 이상이어야 "눌림"으로 보고,
+// 바닥에서 이만큼 올라와야 "재상승"으로 인정한다.
+const MIN_PULLBACK_DEPTH_BPS = 15;
+const MIN_RERISE_FROM_TROUGH_BPS = 15;
+const MIN_BARS_SINCE_TROUGH = 2;
+// 15분봉 흐름: 이 개수 이상의 봉이 있어야 추세를 판단한다.
+const MIN_FLOW_BARS = 3;
+const FLOW_LOW_TOLERANCE_BPS = 10;
+// 15분봉 상승 다리(처음 봉 종가 → 최고 종가)가 이 이상이어야 "상승 흐름"으로 본다.
+const MIN_FLOW_UP_LEG_BPS = 30;
+// 15분봉 눌림폭(최고 종가 대비 현재가) 범위. 미만이면 신고점 근처, 초과면 구조가 깨진 것으로 본다.
+const MIN_FLOW_PULLBACK_BPS = 20;
+const MAX_FLOW_PULLBACK_BPS = 300;
+// 1분봉 재상승: 바닥(최근 14분봉 최저 종가)이 이 분봉 수 안에 있어야 "방금 올라오는" 것으로 본다.
+const MAX_BARS_SINCE_BOUNCE_TROUGH = 10;
+
 export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   const settings = normalizeRecommendationSettings(settingsInput);
   const candidate = normalizeCandidate(input);
   const bars = normalizeBars(candidate.minuteBars);
   const barSupply = describeBarSupply(candidate.minuteBars, bars);
   const orderBook = normalizeOrderBook(candidate.orderBook, candidate.tickSize);
-  const derived = calculateDerived(candidate, bars, orderBook);
+  const flowBars = normalizeBars(candidate.flowBars);
+  const derived = calculateDerived(candidate, bars, orderBook, flowBars);
   const blockReasons = buildBlockReasons(candidate, bars, orderBook, derived, settings, barSupply);
   const reversal = scoreReversal(candidate, derived, orderBook);
   const pullback = scorePullback(candidate, derived, orderBook);
@@ -25,10 +42,35 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
   // 가산점일 뿐이라 나머지 항목만으로 84점까지 나왔고, 그 결과 눌리는 도중에
   // 진입했다(2026-10-06 파미셀: 최근 4분봉 -110bp 하락 중 매수 → 반등 없이 2분 만에
   // 손절). 사용자의 원래 계획은 "재상승 확인 후 매수"다.
-  const risingConfirmed = derived.recentReturnBps >= MIN_RECENT_RISE_BPS;
-  const reasons = risingConfirmed
-    ? selected.reasons
-    : ["재상승 확인 전 — 진입 대기", ...selected.reasons];
+  // 흐름과 눌림은 15분봉, 재상승 타이밍은 1분봉으로 본다(2026-10-07). 15분봉이 주어지면
+  // (shape.source === "FLOW15") 눌림 여부·폭을 15분봉으로 판단하고, 1분봉은 바닥에서
+  // 다시 올라오는지(bounceRising)만 본다. 15분봉이 없으면 1분봉 스윙으로 대신한다.
+  // 눌림이 있으면 재상승(shape.rising)이어야 하고, 눌림이 없으면 최근 분봉이 오르는 중이어야 한다.
+  const shape = derived.shape;
+  const timingConfirmed = shape.dip
+    ? shape.rising
+    : derived.recentReturnBps >= MIN_RECENT_RISE_BPS;
+  const flowGateActive = Array.isArray(candidate.flowBars);
+  const flowKnown = derived.flowBarCount >= MIN_FLOW_BARS;
+  let flowConfirmed = true;
+  let flowWaitReason = null;
+  if (flowGateActive) {
+    if (!flowKnown) {
+      flowConfirmed = false;
+      flowWaitReason = "15분 흐름 확인 불가 — 진입 대기";
+    } else if (selected.type === "PULLBACK") {
+      flowConfirmed = derived.flowState === "UPTREND_PULLBACK";
+      flowWaitReason = "15분봉 상승 흐름 속 눌림 아님 — 진입 대기";
+    } else {
+      flowConfirmed = derived.flowState === "UPTREND_PULLBACK" || derived.flowState === "UPTREND_AT_HIGH";
+      flowWaitReason = "15분 상승 흐름 아님 — 진입 대기";
+    }
+  }
+  const risingConfirmed = timingConfirmed && flowConfirmed;
+  const waitingReasons = [];
+  if (!timingConfirmed) waitingReasons.push("재상승 확인 전 — 진입 대기");
+  if (!flowConfirmed) waitingReasons.push(flowWaitReason);
+  const reasons = risingConfirmed ? selected.reasons : [...waitingReasons, ...selected.reasons];
   const cappedScore = risingConfirmed ? selected.score : Math.min(selected.score, 74);
   const score = blockReasons.length > 0 ? Math.min(cappedScore, 49) : cappedScore;
   const stage = blockReasons.length > 0
@@ -86,6 +128,18 @@ export function evaluateRecommendationCandidate(input, settingsInput = {}) {
     },
     reasons: reasons.slice(0, 6),
     blockReasons,
+    pullbackRerise: {
+      confirmed: risingConfirmed && shape.dip,
+      source: shape.source,
+      flowState: derived.flowState,
+      flowUptrend: derived.flowUptrend,
+      flowBars: derived.flowBarCount,
+      // 눌림폭: 15분봉이 있으면 15분 눌림(최고 종가 대비), 없으면 1분봉 스윙 낙폭.
+      swingDepthBps: shape.depthBps,
+      // 1분봉 바닥 대비 현재가 상승폭.
+      reRiseFromTroughBps: shape.source === "FLOW15" ? derived.bounceFromTroughBps : derived.reRiseFromTroughBps,
+      barsSinceTrough: shape.source === "FLOW15" ? derived.bounceBarsSinceTrough : derived.barsSinceTrough,
+    },
     target,
     confirmation: {
       required: true,
@@ -153,12 +207,15 @@ function scorePullback(candidate, derived, orderBook) {
   let score = 0;
   const reasons = [];
   if (candidate.changePercent !== null && candidate.changePercent > 0) score += add(10, "당일 상승 추세 유지", reasons);
-  if (derived.priorReturnBps >= 20) score += add(16, "눌림 전 상승 모멘텀 확인", reasons);
-  if (derived.vwap !== null && candidate.currentPrice > derived.vwap) score += add(14, "현재가가 단기 VWAP 위", reasons);
-  if (derived.pullbackDepthBps >= 20 && derived.pullbackDepthBps <= 250) {
-    score += add(14, "과도하지 않은 짧은 눌림", reasons);
+  const shape = derived.shape;
+  if (shape.upLegBps >= 20 || derived.priorReturnBps >= 20) {
+    score += add(16, "눌림 전 상승 모멘텀 확인", reasons);
   }
-  if (derived.recentReturnBps >= MIN_RECENT_RISE_BPS) score += add(16, "눌림 후 재상승", reasons);
+  if (derived.vwap !== null && candidate.currentPrice > derived.vwap) score += add(14, "현재가가 단기 VWAP 위", reasons);
+  if (shape.dip && shape.depthBps <= MAX_FLOW_PULLBACK_BPS) {
+    score += add(14, shape.source === "FLOW15" ? "15분봉 상승 흐름 속 과도하지 않은 눌림" : "과도하지 않은 짧은 눌림", reasons);
+  }
+  if (shape.rising) score += add(16, "눌림 후 재상승", reasons);
   if (derived.volumeContractionRatio !== null && derived.volumeContractionRatio <= 0.9) {
     score += add(10, "눌림 구간 거래량 감소", reasons);
   }
@@ -251,7 +308,144 @@ function buildBlockReasons(candidate, bars, orderBook, derived, settings, barSup
   return reasons;
 }
 
-function calculateDerived(candidate, bars, orderBook) {
+// 최근 최대 14개 1분봉 종가에서 "달리는 최고 종가 대비 최대 낙폭" 지점을 눌림 바닥으로
+// 잡는다. 현재가를 최근 4분봉 고점과 비교하던 pullbackDepthBps는 눌린 뒤 재상승이
+// 진행될수록 0에 가까워져 눌림목으로 안 보였다(2026-10-07).
+function analyzeSwing(bars, currentPrice) {
+  const window = bars.slice(-14);
+  const empty = {
+    swingDepthBps: 0, preSwingRiseBps: 0, reRiseFromTroughBps: 0, barsSinceTrough: 0, reRising: false,
+  };
+  if (window.length < 6) return empty;
+  let runningMax = -Infinity;
+  let runningMaxIndex = -1;
+  let best = null;
+  window.forEach((bar, index) => {
+    if (bar.close > runningMax) {
+      runningMax = bar.close;
+      runningMaxIndex = index;
+    }
+    const drawdown = ((runningMax - bar.close) / runningMax) * 10_000;
+    if (drawdown > (best?.drawdown ?? 0)) {
+      best = { drawdown, peak: runningMax, peakIndex: runningMaxIndex, trough: bar.close, troughIndex: index };
+    }
+  });
+  if (!best) return empty;
+  const price = currentPrice ?? window.at(-1).close;
+  const barsSinceTrough = window.length - 1 - best.troughIndex;
+  const reRiseFromTroughBps = returnBps(best.trough, price);
+  const lastBarUp = window.length >= 2 && window.at(-1).close >= window.at(-2).close;
+  return {
+    swingDepthBps: round(best.drawdown, 2),
+    preSwingRiseBps: round(returnBps(window[0].close, best.peak), 2),
+    reRiseFromTroughBps: round(reRiseFromTroughBps, 2),
+    barsSinceTrough,
+    reRising: best.drawdown >= MIN_PULLBACK_DEPTH_BPS
+      && barsSinceTrough >= MIN_BARS_SINCE_TROUGH
+      && reRiseFromTroughBps >= MIN_RERISE_FROM_TROUGH_BPS
+      && lastBarUp,
+  };
+}
+
+// 15분봉 흐름과 눌림(2026-10-07): 최근 최대 8개 봉에서 최고 종가 봉(peak)을 찾는다.
+// peak까지가 상승 다리(처음 종가 대비 +30bp 이상, 저점이 허용 오차 안에서 높아짐)이고,
+// peak 대비 현재가 낙폭이 20~300bp이며 눌림 저점이 상승 다리 최저 저점 아래로 안 내려갔으면
+// "상승 흐름 속 눌림"(UPTREND_PULLBACK). 낙폭이 20bp 미만이면 신고점 근처(UPTREND_AT_HIGH).
+function analyzeFlow(flowBars, currentPrice) {
+  const window = flowBars.slice(-8);
+  const base = {
+    flowBarCount: window.length, flowState: "UNKNOWN", flowUptrend: false, flowPullbackBps: 0, flowUpLegBps: 0,
+  };
+  if (window.length < MIN_FLOW_BARS) return base;
+  let peakIndex = 0;
+  window.forEach((bar, index) => {
+    if (bar.close > window[peakIndex].close) peakIndex = index;
+  });
+  const price = currentPrice ?? window.at(-1).close;
+  const peakClose = Math.max(window[peakIndex].close, price);
+  const upLeg = window.slice(0, peakIndex + 1);
+  const upLegBps = returnBps(upLeg[0].close, window[peakIndex].close);
+  const higherLows = upLeg.slice(1).every((bar, index) => (
+    returnBps(upLeg[index].low, bar.low) >= -FLOW_LOW_TOLERANCE_BPS
+  ));
+  const pullbackBps = Math.max(0, ((peakClose - price) / peakClose) * 10_000);
+  const upLegMinLow = Math.min(...upLeg.map((bar) => bar.low));
+  const afterPeak = window.slice(peakIndex + 1);
+  const pullbackLow = afterPeak.length > 0
+    ? Math.min(price, ...afterPeak.map((bar) => bar.low))
+    : price;
+  const structureIntact = pullbackLow >= upLegMinLow * (1 - FLOW_LOW_TOLERANCE_BPS / 10_000);
+  const upLegOk = peakIndex >= 1 && upLegBps >= MIN_FLOW_UP_LEG_BPS && higherLows;
+  let flowState = "NOT_UPTREND";
+  if (upLegOk && pullbackBps < MIN_FLOW_PULLBACK_BPS) flowState = "UPTREND_AT_HIGH";
+  else if (upLegOk && pullbackBps <= MAX_FLOW_PULLBACK_BPS && structureIntact) flowState = "UPTREND_PULLBACK";
+  return {
+    flowBarCount: window.length,
+    flowState,
+    flowUptrend: flowState === "UPTREND_AT_HIGH" || flowState === "UPTREND_PULLBACK",
+    flowPullbackBps: round(pullbackBps, 2),
+    flowUpLegBps: round(upLegBps, 2),
+  };
+}
+
+// 1분봉은 재상승 타이밍만 본다: 최근 14개 종가의 최고점 이후 바닥에서 다시 올라오는 중인가.
+// 최고점이 지금(마지막 분봉)이면 눌림 없이 신고점이므로 최근 4분봉이 오르는 중인지만 본다.
+function analyzeBounce(bars, currentPrice) {
+  const window = bars.slice(-14);
+  const empty = { bounceRising: false, bounceFromTroughBps: 0, bounceBarsSinceTrough: 0 };
+  if (window.length < 6) return empty;
+  let peakIndex = 0;
+  window.forEach((bar, index) => {
+    if (bar.close >= window[peakIndex].close) peakIndex = index;
+  });
+  const price = currentPrice ?? window.at(-1).close;
+  const lastBarUp = window.at(-1).close >= window.at(-2).close;
+  if (peakIndex === window.length - 1) {
+    const recentBps = returnBps(window.at(-4).close, window.at(-1).close);
+    return {
+      bounceRising: lastBarUp && recentBps >= MIN_RECENT_RISE_BPS,
+      bounceFromTroughBps: round(recentBps, 2),
+      bounceBarsSinceTrough: 0,
+    };
+  }
+  let troughIndex = peakIndex + 1;
+  window.forEach((bar, index) => {
+    if (index > peakIndex && bar.close <= window[troughIndex].close) troughIndex = index;
+  });
+  const barsSinceTrough = window.length - 1 - troughIndex;
+  const bounceFromTroughBps = returnBps(window[troughIndex].close, price);
+  return {
+    bounceRising: barsSinceTrough >= MIN_BARS_SINCE_TROUGH
+      && barsSinceTrough <= MAX_BARS_SINCE_BOUNCE_TROUGH
+      && bounceFromTroughBps >= MIN_RERISE_FROM_TROUGH_BPS
+      && lastBarUp,
+    bounceFromTroughBps: round(bounceFromTroughBps, 2),
+    bounceBarsSinceTrough: barsSinceTrough,
+  };
+}
+
+// 눌림 모양의 출처를 고른다: 15분봉이 있으면 눌림은 15분봉, 재상승은 1분봉 바닥 반등.
+// 15분봉이 없으면(조회 전·미지원) 예전처럼 1분봉 스윙으로 대신한다.
+function pickPullbackShape(swing, flow, bounce) {
+  if (flow.flowBarCount >= MIN_FLOW_BARS) {
+    return {
+      source: "FLOW15",
+      dip: flow.flowState === "UPTREND_PULLBACK",
+      depthBps: flow.flowPullbackBps,
+      upLegBps: flow.flowUpLegBps,
+      rising: bounce.bounceRising,
+    };
+  }
+  return {
+    source: "MIN1",
+    dip: swing.swingDepthBps >= MIN_PULLBACK_DEPTH_BPS,
+    depthBps: swing.swingDepthBps,
+    upLegBps: swing.preSwingRiseBps,
+    rising: swing.reRising,
+  };
+}
+
+function calculateDerived(candidate, bars, orderBook, flowBars = []) {
   const closes = bars.map((bar) => bar.close).filter(Number.isFinite);
   const recent = bars.slice(-4);
   const prior = bars.slice(Math.max(0, bars.length - 14), Math.max(0, bars.length - 4));
@@ -285,6 +479,9 @@ function calculateDerived(candidate, bars, orderBook) {
   const bookImbalance = totalBook > 0
     ? (orderBook.totalBidSize - orderBook.totalAskSize) / totalBook
     : 0;
+  const swing = analyzeSwing(bars, candidate.currentPrice);
+  const flow = analyzeFlow(flowBars, candidate.currentPrice);
+  const bounce = analyzeBounce(bars, candidate.currentPrice);
   return {
     vwap: finiteOrNull(vwap),
     recentHigh: finiteOrNull(recentHigh),
@@ -298,6 +495,10 @@ function calculateDerived(candidate, bars, orderBook) {
     vwapExtensionBps: vwapExtensionBps === null ? null : round(vwapExtensionBps, 2),
     upperLimitDistanceBps: upperLimitDistanceBps === null ? null : round(upperLimitDistanceBps, 2),
     bookImbalance: round(bookImbalance, 4),
+    ...swing,
+    ...flow,
+    ...bounce,
+    shape: pickPullbackShape(swing, flow, bounce),
   };
 }
 
@@ -348,6 +549,8 @@ function normalizeCandidate(input) {
     tickSize: positiveOrNull(input.tickSize) ?? 1,
     orderBook: input.orderBook,
     minuteBars: input.minuteBars,
+    // 배열이면(비어 있어도) 15분 흐름 게이트를 적용하고, 아예 안 주면 적용하지 않는다.
+    flowBars: Array.isArray(input.flowBars) ? input.flowBars : undefined,
     fetchedAt: finiteOrNull(input.fetchedAt),
     evaluatedAt: finiteOrNull(input.evaluatedAt) ?? Date.now(),
   };

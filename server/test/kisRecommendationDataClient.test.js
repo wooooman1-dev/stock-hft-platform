@@ -381,6 +381,50 @@ test("조회 전용 순위 API는 EGW00201만 제한된 횟수로 대기 후 재
   assert.equal(client.status().minimumIntervalMs, 1000);
 });
 
+// 2026-10-07: 흐름(추세)은 15분봉으로 본다. KIS 분봉 API는 1분봉을 한 번에 30개만
+// 주므로 과거로 거슬러 올라가며 받아 15분 단위로 합치고, 같은 종목은 캐시한다.
+test("getFlowBars는 분봉 페이지를 과거로 이어 받아 15분봉으로 합치고 캐시한다", async () => {
+  const requestedHours = [];
+  // 시각 HHMM → 1분봉. 09:00~09:44(45개)를 30개 단위 두 페이지로 나눠 돌려준다.
+  const minute = (hhmm, close) => ({
+    stck_cntg_hour: `${hhmm}00`, stck_oprc: String(close), stck_hgpr: String(close + 5),
+    stck_lwpr: String(close - 5), stck_prpr: String(close), cntg_vol: "10", acml_vol: "0",
+  });
+  const all = [];
+  for (let index = 0; index < 45; index += 1) {
+    const total = 9 * 60 + index;
+    all.push(minute(`${String(Math.floor(total / 60)).padStart(2, "0")}${String(total % 60).padStart(2, "0")}`, 10000 + index));
+  }
+  const fake = {
+    config: { baseUrl: "https://example.test", appKey: "app", appSecret: "secret" },
+    async getAccessToken() { return "token"; },
+    async request(url) {
+      const hour = url.searchParams.get("FID_INPUT_HOUR_1");
+      requestedHours.push(hour);
+      const upto = all.filter((item) => item.stck_cntg_hour <= hour).slice(-30).reverse();
+      return response({ rt_cd: "0", output2: upto });
+    },
+  };
+  const client = new KisRecommendationDataClient({
+    client: fake, now: () => 1_000_000, minimumIntervalMs: 0, sleep: async () => {},
+  });
+  const bars = await client.getFlowBars({ symbol: "005930", hour: "094400" });
+  assert.deepEqual(requestedHours, ["094400", "091400"], "첫 페이지의 가장 이른 시각 1분 전부터 이어 받아야 한다");
+  assert.equal(bars.length, 3);
+  assert.deepEqual(bars.map((bar) => bar.time), ["090000", "091500", "093000"]);
+  assert.equal(bars[0].open, 10000);
+  assert.equal(bars[0].close, 10014);
+  assert.equal(bars[0].high, 10019);
+  assert.equal(bars[0].low, 9995);
+  assert.equal(bars[0].volume, 150);
+
+  const again = await client.getFlowBars({ symbol: "005930", hour: "094400" });
+  assert.equal(requestedHours.length, 2, "캐시가 신선하면 다시 호출하지 않아야 한다");
+  assert.equal(again.length, 3);
+  assert.equal(client.getCachedFlowBars("005930").length, 3);
+  assert.equal(client.getCachedFlowBars("000660"), null);
+});
+
 function row(symbol, name, price, change, volume, value) {
   return {
     mksc_shrn_iscd: symbol,

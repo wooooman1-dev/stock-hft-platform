@@ -125,6 +125,43 @@ test("maximumRealtimeChaseBps 설정이 실시간 확인에 실제로 전달된�
   assert.equal(tightResult.candidates[0].realtime.state, "BLOCKED", "150bp로 되돌리면 추격 제한에 걸려야 한다");
 });
 
+// 2026-10-07: 흐름은 15분봉, 타이밍은 1분봉. 스캐너가 가능성 있는 후보에만 15분봉을 조회해
+// 다시 평가하고, 조회에 실패해도 후보를 막지 않고 WATCH로 남기는지 확인한다.
+test("15분봉 흐름이 상승이면 진입 확인 단계를 유지하고 재상승 종목을 표시한다", async () => {
+  const now = 1_000_000;
+  const client = fakeClient();
+  let flowCalls = 0;
+  client.getFlowBars = async () => {
+    flowCalls += 1;
+    return [
+      { time: "090000", open: 10000, high: 10050, low: 9990, close: 10040, volume: 5000 },
+      { time: "091500", open: 10040, high: 10150, low: 10030, close: 10110, volume: 5000 },
+      { time: "093000", open: 10110, high: 10220, low: 10100, close: 10200, volume: 5000 },
+      { time: "094500", open: 10200, high: 10205, low: 10130, close: 10150, volume: 5000 },
+    ];
+  };
+  client.getCachedFlowBars = () => null;
+  const scanner = new RecommendationScanner({ dataClient: client, settings, now: () => now, sleep: async () => {} });
+  const result = await scanner.refresh({ force: true });
+  assert.equal(flowCalls, 1);
+  assert.equal(result.candidates[0].stage, "CONFIRMATION_REQUIRED");
+  assert.equal(result.candidates[0].pullbackRerise.flowUptrend, true);
+  assert.equal(result.candidates[0].pullbackRerise.confirmed, true);
+});
+
+test("15분봉 조회가 실패해도 후보를 막지 않고 WATCH에 두며 오류를 남긴다", async () => {
+  const now = 1_000_000;
+  const client = fakeClient();
+  client.getFlowBars = async () => { throw new Error("분봉 조회 실패"); };
+  client.getCachedFlowBars = () => null;
+  const scanner = new RecommendationScanner({ dataClient: client, settings, now: () => now, sleep: async () => {} });
+  const result = await scanner.refresh({ force: true });
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].stage, "WATCH");
+  assert.equal(result.candidates[0].reasons[0], "15분 흐름 확인 불가 — 진입 대기");
+  assert.ok(result.errors.some((item) => item.source === "FLOW_BARS"));
+});
+
 function fakeClient() {
   return {
     status() {
