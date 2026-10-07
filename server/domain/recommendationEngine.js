@@ -9,8 +9,11 @@ const MIN_RECENT_RISE_BPS = 8;
 const MIN_PULLBACK_DEPTH_BPS = 15;
 const MIN_RERISE_FROM_TROUGH_BPS = 15;
 const MIN_BARS_SINCE_TROUGH = 2;
-// 15분봉 흐름: 이 개수 이상의 봉이 있어야 추세를 판단한다.
-const MIN_FLOW_BARS = 3;
+// 15분봉 흐름: 이 개수 이상의 봉이 있어야 추세를 판단한다. 3개로 두면 09:30에야 열려서
+// 9시부터 오르는 종목을 09:10~09:30에 못 잡는다(2026-10-07, 장 초반이 이 시스템에서 가장
+// 덜 나빴던 시간대라 열어둔다). 봉이 2개뿐인 구간도 상승 다리(+30bp)·눌림·구조 조건은
+// 그대로 적용한다. 09:00~09:10은 별도 진입 금지 시간대(noEntryWindows)가 막는다.
+const MIN_FLOW_BARS = 2;
 const FLOW_LOW_TOLERANCE_BPS = 10;
 // 15분봉 상승 다리(처음 봉 종가 → 최고 종가)가 이 이상이어야 "상승 흐름"으로 본다.
 const MIN_FLOW_UP_LEG_BPS = 30;
@@ -347,7 +350,9 @@ function analyzeSwing(bars, currentPrice) {
   };
 }
 
-// 15분봉 흐름과 눌림(2026-10-07): 최근 최대 8개 봉에서 최고 종가 봉(peak)을 찾는다.
+// 15분봉 흐름과 눌림(2026-10-07): 최근 최대 8개 봉에서 최고가(고가) 봉(peak)을 찾는다.
+// 종가가 아니라 고가를 쓰는 이유: 진행 중인 마지막 봉의 종가는 곧 현재가라서, 같은 봉 안에서
+// 올랐다가 빠진 눌림(예: 09:15~09:30 봉 안의 눌림)이 종가로는 안 보인다.
 // peak까지가 상승 다리(처음 종가 대비 +30bp 이상, 저점이 허용 오차 안에서 높아짐)이고,
 // peak 대비 현재가 낙폭이 20~300bp이며 눌림 저점이 상승 다리 최저 저점 아래로 안 내려갔으면
 // "상승 흐름 속 눌림"(UPTREND_PULLBACK). 낙폭이 20bp 미만이면 신고점 근처(UPTREND_AT_HIGH).
@@ -359,12 +364,12 @@ function analyzeFlow(flowBars, currentPrice) {
   if (window.length < MIN_FLOW_BARS) return base;
   let peakIndex = 0;
   window.forEach((bar, index) => {
-    if (bar.close > window[peakIndex].close) peakIndex = index;
+    if (bar.high > window[peakIndex].high) peakIndex = index;
   });
   const price = currentPrice ?? window.at(-1).close;
-  const peakClose = Math.max(window[peakIndex].close, price);
+  const peakClose = Math.max(window[peakIndex].high, price);
   const upLeg = window.slice(0, peakIndex + 1);
-  const upLegBps = returnBps(upLeg[0].close, window[peakIndex].close);
+  const upLegBps = returnBps(upLeg[0].close, window[peakIndex].high);
   const higherLows = upLeg.slice(1).every((bar, index) => (
     returnBps(upLeg[index].low, bar.low) >= -FLOW_LOW_TOLERANCE_BPS
   ));

@@ -288,6 +288,23 @@ test("15분봉에서 눌림이 아니거나(신고점 근처·구조 붕괴·하
   }
 });
 
+// 2026-10-07: 장 초반(09:15~09:30)에는 15분봉이 2개뿐이다. 9시부터 오르는 종목을 놓치지 않도록
+// 2개로도 판단하되, 1개뿐이면 확인 불가다. 진행 중인 봉의 종가는 곧 현재가라서 눌림은 고가 기준으로 본다.
+test("장 초반 15분봉 2개로도 상승 흐름 속 눌림을 판단하고, 1개뿐이면 확인 불가로 막는다", () => {
+  const early = [
+    bar("090000", 10000, 10050, 9990, 10040, 5000),
+    bar("091500", 10040, 10220, 10030, 10140, 5000),
+  ];
+  const confirmed = evaluateRecommendationCandidate(pullbackResumeCandidate(early), settings);
+  assert.equal(confirmed.pullbackRerise.flowState, "UPTREND_PULLBACK");
+  assert.equal(confirmed.stage, "CONFIRMATION_REQUIRED");
+  assert.equal(confirmed.pullbackRerise.confirmed, true);
+
+  const tooEarly = evaluateRecommendationCandidate(pullbackResumeCandidate(early.slice(0, 1)), settings);
+  assert.equal(tooEarly.stage, "WATCH");
+  assert.equal(tooEarly.reasons[0], "15분 흐름 확인 불가 — 진입 대기");
+});
+
 test("15분봉 눌림이어도 1분봉이 아직 하락 중(바닥이 방금 찍힘)이면 WATCH에 머문다", () => {
   const closes = [9800, 9850, 9900, 9950, 10000, 10050, 10040, 10010, 9990, 9970];
   const bars = closes.map((close, index) => bar(
