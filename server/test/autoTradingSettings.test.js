@@ -61,7 +61,7 @@ test("설계 기본값을 그대로 사용한다", () => {
   assert.equal(settings.entryMinimumExecutionStrength, 90);
   assert.equal(settings.entryMinimumVwapExtensionBps, -50);
   assert.equal(settings.entryConfirmMs, 30_000);
-  assert.deepEqual([...settings.noEntryWindows], ["09:00-09:10", "11:30-13:00", "14:15-15:30"]);
+  assert.deepEqual([...settings.noEntryWindows], ["09:00-09:10", "11:30-13:00", "14:45-15:30"]);
   assert.equal(settings.minimumStopTicks, 6);
   assert.equal(settings.minimumRewardRiskRatio, 1.5);
   assert.equal(settings.maxConsecutiveLossesPerDay, 0);
