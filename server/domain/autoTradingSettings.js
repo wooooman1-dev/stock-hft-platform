@@ -16,12 +16,13 @@ export const DEFAULT_AUTO_TRADING_SETTINGS = Object.freeze({
   minimumNetEdgeBps: 50,
   // 자기자본 대비 1회 진입 비중. 실제 수량은 모의계좌 한도로 다시 잘린다.
   // 동시에 최대 maxConcurrentPositions개를 들고 갈 수 있으므로, 전부 채워지면
-  // 최대 노출은 positionSizeRatio × maxConcurrentPositions다(기본값 기준 0.1×5=50%).
+  // 최대 노출은 positionSizeRatio × maxConcurrentPositions다(기본값 기준 0.1×3=30%).
   positionSizeRatio: 0.1,
   // 동시 보유 가능한 종목 수. 원래 1이었다 — 좋은 신호가 떠도 이미 다른 종목을
   // 들고 있으면 그냥 놓쳤다. 진입 문턱(ENTRY_READY)은 그대로 두고 거래 기회만
   // 넓히기 위해 5로 올린다(2026-09-23).
-  maxConcurrentPositions: 5,
+  // 2026-10-08: 실전 자동매매 소액 시험과 같은 3종목으로 맞췄다(예전 기본값 5).
+  maxConcurrentPositions: 3,
   entryMinimumConfidence: 50,
   exitMinimumConfidence: 50,
   maximumSpreadTicks: 2,

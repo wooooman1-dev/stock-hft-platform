@@ -63,6 +63,9 @@ export class KisPaperOrderService {
     this.onUnknownResult = onUnknownResult;
     this.reconciliationRefreshMs = reconciliationRefreshMs;
     this.killSwitch = false;
+    // 킬 스위치가 켜진 이유. "LIMIT"(일 손실·연속 손실 한도)일 때만 보호 매도가 통과한다(실전과 같은 규칙).
+    // 수동("MANUAL")이나 주문 결과 불명·대사 불일치처럼 상태를 믿을 수 없을 때는 매도도 멈춘다.
+    this.killSwitchReason = null;
     this.unknownResult = false;
     this.commands = new Map();
     this.dailyRiskBaselines = new Map();
@@ -115,6 +118,7 @@ export class KisPaperOrderService {
     return {
       killSwitch: this.killSwitch || this.unknownResult || reconciliation.blocked,
       manualKillSwitch: this.killSwitch,
+      killSwitchReason: this.killSwitch ? this.killSwitchReason : null,
       unknownResult: this.unknownResult,
       unknownCommands: this.unknownCommands(),
       trackedOrderNumbers: [...trackedBrokerOrderNumbers(this.commands, null)],
@@ -159,6 +163,7 @@ export class KisPaperOrderService {
       }
     }
     this.killSwitch = Boolean(enabled);
+    this.killSwitchReason = this.killSwitch ? "MANUAL" : null;
     return this.status();
   }
 
@@ -195,20 +200,23 @@ export class KisPaperOrderService {
   // protectiveExit: 손절·익절·트레일링 스톱·최대 보유시간·강제청산처럼 이미 보유한
   // 포지션을 줄이는 매도다. 1회 주문 수량·금액 한도는 "한 번에 새 위험을 얼마나
   // 늘릴 수 있는가"를 막는 장치이므로, 위험을 줄이는 이 매도에는 적용하지 않는다
-  // (2026-09-17: 한도를 넘는 손절이 계속 거절되어 포지션이 묶였다). 킬 스위치는
-  // 이 플래그와 무관하게 그대로 모든 신규·정정 주문을 막는다 — 결과가 불확실하거나
-  // 대사가 어긋난 상태는 사람이 직접 확인하기 전까지 멈추는 게 맞기 때문이다.
+  // (2026-09-17: 한도를 넘는 손절이 계속 거절되어 포지션이 묶였다). 2026-10-08부터는 실전과 같은 규칙이다:
+  // 수량·금액·일 주문수·일 손실·연속 손실 검사를 건너뛰고, 일 손실·연속 손실 한도(LIMIT)로 켜진
+  // 킬 스위치에서도 보호 매도는 통과한다. 결과가 불확실하거나 대사가 어긋난 상태(UNKNOWN_RESULT·대사 차단)와
+  // 수동 킬 스위치에서는 보호 매도도 막는다 — 사람이 직접 확인하기 전까지 멈추는 게 맞기 때문이다.
+  // 보호 매도는 매도에만 인정한다.
   async submitOrder(input) {
+    const request = normalizeSubmitRequest(input);
     return this.enqueue(() => this.execute({
       operation: "SUBMIT",
       clientOrderId: normalizeClientOrderId(input?.clientOrderId),
-      request: normalizeSubmitRequest(input),
+      request,
       orderBookSnapshot: normalizeOrderBookSnapshot(input?.orderBookSnapshot),
-      protectiveExit: Boolean(input?.protectiveExit),
+      protectiveExit: Boolean(input?.protectiveExit) && request.side === "SELL",
       // KIS로 나가는 request에는 안 넣는다 — 실행 저널에만 붙는 내부 메모다.
       reason: input?.reason ?? null,
       context: sanitizeContext(input?.context),
-      call: (request) => this.client.submitOrder(request),
+      call: (payload) => this.client.submitOrder(payload),
     }));
   }
 
@@ -341,15 +349,22 @@ export class KisPaperOrderService {
     const status = this.status();
     if (status.killSwitch) {
       const reconciliation = status.reconciliation;
-      const message = reconciliation?.blocked
-        ? reconciliationBlockMessage(reconciliation)
-        : "한국투자 모의주문 킬 스위치가 활성화되어 신규·정정 주문이 차단되었습니다.";
-      throw new KisPaperOrderServiceError(message, {
-        code: reconciliation?.blocked
-          ? reconciliationErrorCode(reconciliation)
-          : "KIS_PAPER_KILL_SWITCH",
-        statusCode: 423,
-      });
+      // 일 손실·연속 손실 한도로만 켜진 킬 스위치는 신규 진입을 막되, 이미 들고 있는 종목의 보호 매도는
+      // 통과시킨다. 안 그러면 한도에 닿은 바로 그 순간부터 손절이 작동하지 않는다.
+      const limitOnly = this.killSwitchReason === "LIMIT"
+        && !this.unknownResult
+        && !reconciliation?.blocked;
+      if (!(protectiveExit && limitOnly)) {
+        const message = reconciliation?.blocked
+          ? reconciliationBlockMessage(reconciliation)
+          : "한국투자 모의주문 킬 스위치가 활성화되어 신규·정정 주문이 차단되었습니다.";
+        throw new KisPaperOrderServiceError(message, {
+          code: reconciliation?.blocked
+            ? reconciliationErrorCode(reconciliation)
+            : "KIS_PAPER_KILL_SWITCH",
+          statusCode: 423,
+        });
+      }
     }
     const quantity = Number(request.quantity);
     if (!Number.isInteger(quantity) || quantity <= 0) {
@@ -359,32 +374,31 @@ export class KisPaperOrderService {
       );
     }
     // 보호청산(손절·익절·트레일링 스톱·최대 보유시간·강제청산)은 이미 보유한 포지션을
-    // 줄이는 매도라, "한 번에 새 위험을 얼마나 늘릴 수 있는가"를 막는 수량·금액 한도를
-    // 적용하지 않는다. 적용하면 보유 수량·가격이 한도를 넘는 순간 포지션이 영영 묶인다
+    // 줄이는 매도라, "한 번에 새 위험을 얼마나 늘릴 수 있는가"를 막는 한도(수량·금액·일 주문수·
+    // 일 손실·연속 손실)를 적용하지 않는다. 적용하면 한도에 닿는 순간 포지션이 영영 묶인다
     // (2026-09-17: 8주 손절이 계속 거절되어 한도를 올려도 주가가 더 움직이면 다시 걸렸다).
-    if (!protectiveExit) {
-      if (quantity > this.limits.maxOrderQuantity) {
-        throw new KisPaperOrderServiceError(
-          `주문 수량은 1주 이상 ${this.limits.maxOrderQuantity}주 이하여야 합니다.`,
-          { code: "KIS_PAPER_ORDER_QUANTITY_LIMIT", statusCode: 400 },
-        );
-      }
-      const riskPrice = request.type === "LIMIT"
-        ? Number(request.limitPrice)
-        : Number(request.referencePrice);
-      if (!Number.isFinite(riskPrice) || riskPrice <= 0) {
-        throw new KisPaperOrderServiceError(
-          "시장가 주문은 안전 한도 계산을 위한 referencePrice가 필요합니다.",
-          { code: "KIS_PAPER_REFERENCE_PRICE_REQUIRED", statusCode: 400 },
-        );
-      }
-      const orderValue = quantity * riskPrice;
-      if (orderValue > this.limits.maxOrderValue) {
-        throw new KisPaperOrderServiceError(
-          `주문 추정금액 ${orderValue}원이 최대 주문금액 ${this.limits.maxOrderValue}원을 초과합니다.`,
-          { code: "KIS_PAPER_ORDER_VALUE_LIMIT", statusCode: 400 },
-        );
-      }
+    if (protectiveExit) return;
+    if (quantity > this.limits.maxOrderQuantity) {
+      throw new KisPaperOrderServiceError(
+        `주문 수량은 1주 이상 ${this.limits.maxOrderQuantity}주 이하여야 합니다.`,
+        { code: "KIS_PAPER_ORDER_QUANTITY_LIMIT", statusCode: 400 },
+      );
+    }
+    const riskPrice = request.type === "LIMIT"
+      ? Number(request.limitPrice)
+      : Number(request.referencePrice);
+    if (!Number.isFinite(riskPrice) || riskPrice <= 0) {
+      throw new KisPaperOrderServiceError(
+        "시장가 주문은 안전 한도 계산을 위한 referencePrice가 필요합니다.",
+        { code: "KIS_PAPER_REFERENCE_PRICE_REQUIRED", statusCode: 400 },
+      );
+    }
+    const orderValue = quantity * riskPrice;
+    if (orderValue > this.limits.maxOrderValue) {
+      throw new KisPaperOrderServiceError(
+        `주문 추정금액 ${orderValue}원이 최대 주문금액 ${this.limits.maxOrderValue}원을 초과합니다.`,
+        { code: "KIS_PAPER_ORDER_VALUE_LIMIT", statusCode: 400 },
+      );
     }
     const today = koreaDateKey(this.now());
     const todayCount = [...this.commands.values()].filter((state) => state.day === today).length;
@@ -412,6 +426,7 @@ export class KisPaperOrderService {
       const effectiveLoss = Math.max(baselineLoss, evaluationLoss);
       if (effectiveLoss >= this.limits.maxDailyLoss) {
         this.killSwitch = true;
+        this.killSwitchReason = "LIMIT";
         throw new KisPaperOrderServiceError(
           `모의계좌 당일 손실 ${effectiveLoss}원이 일일 손실 한도 ${this.limits.maxDailyLoss}원에 도달했습니다.`,
           { code: "KIS_PAPER_DAILY_LOSS_LIMIT", statusCode: 423 },
@@ -422,6 +437,7 @@ export class KisPaperOrderService {
       const streak = this.performanceTracker.report().trades.consecutiveLossStreak;
       if (streak >= this.limits.maxConsecutiveLosses) {
         this.killSwitch = true;
+        this.killSwitchReason = "LIMIT";
         throw new KisPaperOrderServiceError(
           `실현손실 거래가 ${streak}회 연속 발생해 연속 손실 한도 ${this.limits.maxConsecutiveLosses}회에 도달했습니다.`,
           { code: "KIS_PAPER_CONSECUTIVE_LOSS_LIMIT", statusCode: 423 },

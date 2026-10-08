@@ -141,12 +141,15 @@ export function publicKisPaperConfiguration(config) {
 
 // 한도의 허용 범위. 화면에서 조절할 때도 같은 규칙을 쓴다.
 // 모의계좌 전용이다 — 실전(kisLiveConfig)의 한도는 런타임 변경을 허용하지 않는다.
+// 기본값(fallback)은 2026-10-08부터 실전 자동매매의 "소액 시험" 한도와 같다(종목당 20만원, 일 주문 30건,
+// 일 손실 5만원, 연속 손실 3회) — 모의가 실전과 같은 조건에서 돌아야 두 화면이 헷갈리지 않는다.
+// 예전 기본값은 100주/1,000,000원/200건/2,000,000원/연속 손실 해제였다.
 export const KIS_PAPER_LIMIT_BOUNDS = Object.freeze({
-  maxOrderQuantity: { fallback: 100, minimum: 1, maximum: 10_000 },
-  maxOrderValue: { fallback: 1_000_000, minimum: 1, maximum: 10_000_000_000 },
-  maxDailyOrders: { fallback: 200, minimum: 1, maximum: 10_000 },
-  maxDailyLoss: { fallback: 2_000_000, minimum: 0, maximum: 10_000_000_000 },
-  maxConsecutiveLosses: { fallback: 0, minimum: 0, maximum: 100 },
+  maxOrderQuantity: { fallback: 1_000, minimum: 1, maximum: 10_000 },
+  maxOrderValue: { fallback: 200_000, minimum: 1, maximum: 10_000_000_000 },
+  maxDailyOrders: { fallback: 30, minimum: 1, maximum: 10_000 },
+  maxDailyLoss: { fallback: 50_000, minimum: 0, maximum: 10_000_000_000 },
+  maxConsecutiveLosses: { fallback: 3, minimum: 0, maximum: 100 },
 });
 
 // 부분 입력을 받아 현재 한도 위에 덮어쓴다. 범위를 벗어나면 거부한다.

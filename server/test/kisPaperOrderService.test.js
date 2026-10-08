@@ -321,3 +321,59 @@ test("a protective exit still rejects a nonsensical (zero/negative) quantity", a
   );
   assert.equal(broker.submitCalls, 0);
 });
+
+// 2026-10-08: 모의도 실전과 같은 규칙 — 일 손실·연속 손실 한도(LIMIT)로 켜진 킬 스위치에서는 신규 진입은
+// 막히지만 보유 종목의 보호 매도는 통과하고, 수동 킬 스위치·주문 결과 불명에서는 보호 매도도 막힌다.
+test("a loss-limit kill switch blocks new entries but lets a protective sell through", async () => {
+  const broker = client({
+    async getBalance() { return { summary: { evaluationProfitLoss: -100_000 } }; },
+  });
+  const orders = service({ client: broker });
+  await assert.rejects(
+    () => orders.submitOrder({ clientOrderId: "limit-buy-1", side: "BUY", symbol: "005930", type: "MARKET", quantity: 1, referencePrice: 70_000 }),
+    (error) => error.code === "KIS_PAPER_DAILY_LOSS_LIMIT",
+  );
+  assert.equal(orders.status().killSwitch, true);
+  assert.equal(orders.status().killSwitchReason, "LIMIT");
+
+  // 매수는 보호 매도 표시를 붙여도 막힌다. 표시 없는 매도도 막힌다.
+  await assert.rejects(
+    () => orders.submitOrder({ clientOrderId: "limit-buy-2", side: "BUY", symbol: "005930", type: "MARKET", quantity: 1, referencePrice: 70_000, protectiveExit: true }),
+    (error) => error.code === "KIS_PAPER_KILL_SWITCH",
+  );
+  await assert.rejects(
+    () => orders.submitOrder({ clientOrderId: "limit-sell-plain", side: "SELL", symbol: "005930", type: "MARKET", quantity: 1, referencePrice: 70_000 }),
+    (error) => error.code === "KIS_PAPER_KILL_SWITCH",
+  );
+  // 한도(수량 10주)를 넘는 보유분도 보호 매도로는 나간다.
+  const exit = await orders.submitOrder({
+    clientOrderId: "limit-sell-protective", side: "SELL", symbol: "005930", type: "MARKET", quantity: 50,
+    referencePrice: 70_000, protectiveExit: true, reason: "STOP_LOSS",
+  });
+  assert.equal(exit.status, "ACCEPTED");
+  assert.equal(broker.submitCalls, 1);
+});
+
+test("a manual kill switch still blocks protective sells, and clearing it clears the reason", async () => {
+  const orders = service();
+  orders.setKillSwitch(true);
+  assert.equal(orders.status().killSwitchReason, "MANUAL");
+  await assert.rejects(
+    () => orders.submitOrder({ clientOrderId: "manual-1", side: "SELL", symbol: "005930", type: "MARKET", quantity: 1, referencePrice: 70_000, protectiveExit: true }),
+    (error) => error.code === "KIS_PAPER_KILL_SWITCH",
+  );
+  orders.setKillSwitch(false);
+  assert.equal(orders.status().killSwitch, false);
+  assert.equal(orders.status().killSwitchReason, null);
+});
+
+test("a protective sell is not stopped by the daily order count", async () => {
+  const orders = service({ limits: { maxOrderQuantity: 10, maxOrderValue: 1_000_000, maxDailyOrders: 1, maxDailyLoss: 100_000 } });
+  await orders.submitOrder({ clientOrderId: "count-1", side: "BUY", symbol: "005930", type: "MARKET", quantity: 1, referencePrice: 70_000 });
+  await assert.rejects(
+    () => orders.submitOrder({ clientOrderId: "count-2", side: "BUY", symbol: "000660", type: "MARKET", quantity: 1, referencePrice: 70_000 }),
+    (error) => error.code === "KIS_PAPER_DAILY_ORDER_LIMIT",
+  );
+  const exit = await orders.submitOrder({ clientOrderId: "count-3", side: "SELL", symbol: "005930", type: "MARKET", quantity: 1, referencePrice: 70_000, protectiveExit: true });
+  assert.equal(exit.status, "ACCEPTED");
+});
