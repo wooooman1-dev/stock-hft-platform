@@ -386,6 +386,9 @@ function render() {
             <div><span>보유 시간</span><strong>${duration(holding.heldMs)}</strong></div>
           </div>
         </div>`).join("") : `<div class="at-empty">보유 중인 종목이 없습니다.</div>`}
+      ${(status.ignoredHoldings ?? []).length ? `
+        <div class="at-reset-note">자동매매가 건드리지 않는 기존 보유 ${status.ignoredHoldings.length}종목(손절·청산 대상 아님):
+          ${status.ignoredHoldings.map((symbol) => labelFor(symbol, names)).join(", ")}</div>` : ""}
     </div>
 
     <div class="at-section">

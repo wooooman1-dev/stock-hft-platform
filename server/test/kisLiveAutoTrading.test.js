@@ -165,7 +165,7 @@ test("주문 사유와 진단 메모(context)가 명령 저널에 남고 KIS 요
 
 // ── 자동매매기 + 실전 주문 서비스 통합 ─────────────────────────────────────────────────
 
-function liveTrader({ service, settings = {}, exchange = "KRX" } = {}) {
+function liveTrader({ service, settings = {}, exchange = "KRX", adoptExistingPositions = true } = {}) {
   const adapter = {
     submitOrder: (input) => service.submitOrder(input, { automated: true }),
     getBalance: () => service.getBalance(),
@@ -179,6 +179,7 @@ function liveTrader({ service, settings = {}, exchange = "KRX" } = {}) {
     costModel: COST,
     now: () => BASE,
     exchange,
+    adoptExistingPositions,
   });
 }
 
@@ -234,4 +235,58 @@ test("실전 자동매매 손절 매도는 일 손실 한도로 킬 스위치가
 test("exchange 옵션은 SOR·KRX·NXT만 받는다", () => {
   const { service } = liveService();
   assert.throws(() => liveTrader({ service, exchange: "ALL" }), TypeError);
+});
+
+// 실전 계좌에는 사람이 직접 산 보유 종목이 이미 있을 수 있다 — 자동매매를 켜는 순간 그걸 손절·시간 청산으로
+// 팔아 버리면 안 된다(2026-10-08, 실전 잔고에 -87%·-78% 종목이 있었다).
+test("자동매매를 켜기 전부터 있던 보유 종목은 손실이 커도 팔지 않고, 그 종목에 자동 진입도 하지 않는다", async () => {
+  const { service, client } = liveService();
+  const auto = liveTrader({ service, adoptExistingPositions: false });
+  const existing = { symbol: "000660", quantity: 1, averagePrice: 52_000, currentPrice: 6_510 }; // -87%
+  const decision = await auto.evaluate({ candidates: [], balance: account([existing]) });
+  assert.notEqual(decision.side, "SELL");
+  assert.equal(client.submitted.length, 0, "기존 보유분에는 어떤 주문도 나가지 않는다");
+  assert.deepEqual(auto.status().ignoredHoldings, ["000660"]);
+  assert.equal(auto.status().holdings.length, 0);
+
+  const sameSymbol = { ...readyCandidate(), symbol: "000660" };
+  const entry = await auto.evaluate({ candidates: [sameSymbol], balance: account([existing]) });
+  assert.equal(entry.evaluated?.[0]?.reason, "ALREADY_HELD_OR_PENDING");
+  assert.equal(client.submitted.length, 0);
+});
+
+test("자동매매가 직접 산 종목은 재시작 뒤에도 자기 것으로 보고 손절한다", async () => {
+  const { service, journal } = liveService();
+  const first = liveTrader({ service, adoptExistingPositions: false });
+  const bought = await first.evaluate({ candidates: [readyCandidate()], balance: account() });
+  assert.equal(bought.side, "BUY");
+  const command = journal.events.find((event) => event.type === "BROKER_ORDER_COMMAND");
+  assert.match(command.payload.clientOrderId, /^AUTO:BUY:005930:/);
+
+  // 재시작: 새 인스턴스는 저장된 상태가 없지만 실행 저널에서 자동매매의 매수 이력을 찾는다.
+  const restarted = liveTrader({ service, adoptExistingPositions: false });
+  const held = [{ symbol: "005930", quantity: 2, averagePrice: 70_000, currentPrice: 65_000 }]; // -714bp
+  const exit = await restarted.evaluate({ candidates: [], balance: account(held) });
+  assert.equal(exit.side, "SELL");
+  assert.equal(exit.reason, "STOP_LOSS");
+  assert.deepEqual(restarted.status().ignoredHoldings, []);
+});
+
+test("기존 보유분을 사람이 전부 팔면 표시가 풀리고 그 종목을 다시 살 수 있다", async () => {
+  const { service } = liveService();
+  const auto = liveTrader({ service, adoptExistingPositions: false });
+  const existing = { symbol: "000660", quantity: 1, averagePrice: 52_000, currentPrice: 50_000 };
+  await auto.evaluate({ candidates: [], balance: account([existing]) });
+  assert.deepEqual(auto.status().ignoredHoldings, ["000660"]);
+  await auto.evaluate({ candidates: [], balance: account([]) });
+  assert.deepEqual(auto.status().ignoredHoldings, []);
+});
+
+test("모의 자동매매(기본)는 계좌의 모든 보유 종목을 자기 포지션으로 관리한다", async () => {
+  const { service } = liveService();
+  const auto = liveTrader({ service });
+  const held = [{ symbol: "000660", quantity: 2, averagePrice: 70_000, currentPrice: 65_000 }];
+  const decision = await auto.evaluate({ candidates: [], balance: account(held) });
+  assert.equal(decision.side, "SELL");
+  assert.deepEqual(auto.status().ignoredHoldings, []);
 });

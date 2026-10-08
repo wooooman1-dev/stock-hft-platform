@@ -37,6 +37,10 @@ export class KisPaperAutoTrader {
     now = Date.now,
     // 주문 거래소. 모의는 SOR(그 순간 열린 거래소로 라우팅), 실전 자동매매는 정규장 KRX로만 낸다.
     exchange = "SOR",
+    // false(실전)이면 자동매매를 처음 켜는 시점에 계좌에 이미 있던 보유분(사람이 직접 산 종목)은 건드리지
+    // 않는다 — 손절·시간 청산·강제 청산이 사용자의 기존 보유 종목을 팔아 버리면 안 된다. 모의 계좌는
+    // 이 자동매매의 전용이라 전부 자기 포지션으로 본다.
+    adoptExistingPositions = true,
   } = {}) {
     if (!orderService || typeof orderService.submitOrder !== "function") {
       throw new TypeError("KisPaperOrderService가 필요합니다.");
@@ -44,6 +48,9 @@ export class KisPaperAutoTrader {
     if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
     if (!["SOR", "KRX", "NXT"].includes(exchange)) throw new TypeError("exchange는 SOR, KRX, NXT 중 하나여야 합니다.");
     this.exchange = exchange;
+    this.adoptExistingPositions = adoptExistingPositions !== false;
+    // adoptExistingPositions=false일 때 첫 잔고를 보는 시점에 채운다(null = 아직 못 봄).
+    this.foreignSymbols = null;
     this.orderService = orderService;
     this.settings = normalizeAutoTradingSettings(settings);
     this.costModel = { ...costModel };
@@ -129,6 +136,8 @@ export class KisPaperAutoTrader {
       lastOrderAt: this.lastOrderAt || null,
       pendingOrders: [...this.pendingOrders.values()].map((order) => ({ ...order })),
       holdings: [...this.holdings.values()].map((holding) => ({ ...holding })),
+      // 자동매매가 건드리지 않는 기존 보유 종목(실전). 모의는 항상 빈 목록이다.
+      ignoredHoldings: [...(this.foreignSymbols ?? [])],
       recentDecisions: this.decisions.slice(-20),
     };
   }
@@ -332,7 +341,9 @@ export class KisPaperAutoTrader {
       return eventfulExit ?? decision;
     }
 
-    const entryDecision = await this.evaluateEntry({ candidates, balance, at, heldSymbols });
+    // 기존 보유분(실전)은 관리하지 않지만, 그 종목에 자동 진입해 평단이 섞이는 일은 막는다.
+    const entryExcluded = this.foreignSymbols?.size ? new Set([...heldSymbols, ...this.foreignSymbols]) : heldSymbols;
+    const entryDecision = await this.evaluateEntry({ candidates, balance, at, heldSymbols: entryExcluded });
     if (eventfulExit) return eventfulExit;
     // 신규 진입이 실제로 나갔으면 그게 이번 주기의 대표 결과다. 아니면(진입 없음)
     // 보유 중인 종목의 상태(HOLD)를 대표로 보여준다 — "아무 것도 안 샀다"보다
@@ -395,7 +406,23 @@ export class KisPaperAutoTrader {
   // 잔고에 수량이 있는 종목을 전부(최대 maxConcurrentPositions개) 돌려준다.
   resolvePositions(balance) {
     const positions = Array.isArray(balance?.positions) ? balance.positions : [];
-    const held = positions.filter((item) => Number(item?.quantity) > 0);
+    const allHeld = positions.filter((item) => Number(item?.quantity) > 0);
+    const allHeldSymbols = new Set(allHeld.map((item) => String(item.symbol ?? "")));
+    if (!this.adoptExistingPositions) {
+      if (this.foreignSymbols === null && balance?.summary) {
+        // 이 자동매매가 직접 낸 매수(실행 저널의 AUTO:BUY 주문)나 재시작 전에 저장해 둔 포지션은 자기 것이다.
+        // 그 밖에 이미 잔고에 있던 종목만 "기존 보유분"으로 본다.
+        const own = this.botBoughtSymbols();
+        this.foreignSymbols = new Set([...allHeldSymbols].filter((symbol) =>
+          !own.has(symbol) && !this.restoredPositions.has(symbol) && !this.pendingOrders.has(symbol)));
+      }
+      // 전부 팔려 잔고에서 사라지면 기존 보유분 표시를 푼다(그 종목을 자동매매가 다시 살 수 있다).
+      for (const symbol of [...(this.foreignSymbols ?? [])]) {
+        if (!allHeldSymbols.has(symbol)) this.foreignSymbols.delete(symbol);
+      }
+    }
+    const foreign = this.foreignSymbols ?? new Set();
+    const held = allHeld.filter((item) => !foreign.has(String(item.symbol ?? "")));
     const heldSymbols = new Set(held.map((item) => String(item.symbol ?? "")));
     // 잔고에 반영된 매수는 대기 목록에서 뺀다 — 이때 실제 매수 제출 시각을
     // 기억해뒀다가 아래에서 포지션에 실어 보낸다(30분 카운트를 이 시각부터
@@ -447,6 +474,25 @@ export class KisPaperAutoTrader {
         knownOpenedAt: knownBuyAtBySymbol.get(symbol) ?? null,
       };
     });
+  }
+
+  // 실행 저널에서 이 자동매매가 최근 3일 안에 매수 주문(clientOrderId가 AUTO:BUY:로 시작)을 낸 종목들.
+  botBoughtSymbols() {
+    const symbols = new Set();
+    let events = [];
+    try {
+      events = this.orderService.journal?.readAll?.() ?? [];
+    } catch {
+      return symbols;
+    }
+    const since = this.now() - 3 * 24 * 60 * 60 * 1_000;
+    for (const event of events) {
+      if (event?.type !== "BROKER_ORDER_COMMAND") continue;
+      if (Number(event.timestamp) < since) continue;
+      const match = /^AUTO:BUY:([^:]+):/.exec(String(event.payload?.clientOrderId ?? ""));
+      if (match) symbols.add(match[1]);
+    }
+    return symbols;
   }
 
   // 주문 직후 잔고 반영 지연 구간(settlementGraceMs)이 지나도 잔고에 안 잡혔으면

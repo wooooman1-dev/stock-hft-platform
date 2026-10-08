@@ -343,6 +343,8 @@ const kisLiveAutoTrader = liveAutoTradingActive
     stateStore: new PaperAutoTraderStateStore(join(dataDir, "live-auto-trading-state.json")),
     // 실전은 정규장 KRX로만 낸다. SOR 라우팅(NXT 포함)은 실전에서 검증하지 않았다.
     exchange: "KRX",
+    // 사람이 직접 산 기존 보유 종목은 손절·시간 청산·강제 청산으로 팔지 않는다.
+    adoptExistingPositions: false,
   })
   : null;
 
