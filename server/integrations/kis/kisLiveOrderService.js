@@ -38,6 +38,7 @@ export class KisLiveOrderService {
     commandIdFactory = randomUUID,
     onUnknownResult = () => {},
     reconciliationRefreshMs = 30_000,
+    costModel = {},
   }) {
     if (!client || typeof client.submitOrder !== "function") {
       throw new TypeError("KIS live client가 필요합니다.");
@@ -60,6 +61,9 @@ export class KisLiveOrderService {
     this.onUnknownResult = onUnknownResult;
     this.reconciliationRefreshMs = reconciliationRefreshMs;
     this.killSwitch = false;
+    // 킬 스위치가 켜진 이유. "LIMIT"(일 손실·연속 손실 한도)일 때만 자동매매의 보호 매도가 통과한다.
+    // 수동("MANUAL")이나 주문 결과 불명·대사 불일치처럼 상태를 믿을 수 없을 때는 매도도 멈춘다.
+    this.killSwitchReason = null;
     this.unknownResult = false;
     this.commands = new Map();
     this.dailyRiskBaselines = new Map();
@@ -74,7 +78,7 @@ export class KisLiveOrderService {
       ? new KisLiveReconciler({ journal, now })
       : null;
     this.performanceTracker = typeof client.getDailyOrders === "function"
-      ? new KisLivePerformanceTracker({ journal, now })
+      ? new KisLivePerformanceTracker({ journal, now, costModel })
       : null;
   }
 
@@ -102,6 +106,7 @@ export class KisLiveOrderService {
     return {
       killSwitch: this.killSwitch || this.unknownResult || reconciliation.blocked,
       manualKillSwitch: this.killSwitch,
+      killSwitchReason: this.killSwitch ? this.killSwitchReason : null,
       unknownResult: this.unknownResult,
       unknownCommands: this.unknownCommands(),
       trackedOrderNumbers: [...trackedBrokerOrderNumbers(this.commands, null)],
@@ -139,6 +144,7 @@ export class KisLiveOrderService {
       }
     }
     this.killSwitch = Boolean(enabled);
+    this.killSwitchReason = this.killSwitch ? "MANUAL" : null;
     return this.status();
   }
 
@@ -148,13 +154,23 @@ export class KisLiveOrderService {
     return balance;
   }
 
-  async submitOrder(input) {
+  // automated: 서버 코드(자동매매 어댑터)만 두 번째 인자로 넘긴다. HTTP 본문의 같은 이름 필드는
+  // 무시한다(라우트는 submitOrder(body)만 호출). 자동이 아니면 기존 1주 카나리가 그대로 적용된다.
+  // protectiveExit(보호 매도)는 자동 주문의 매도에만 인정한다 — 수량·금액·일 한도를 건너뛰고,
+  // 한도(LIMIT)로 켜진 킬 스위치에서도 통과한다(결과 불명·대사 불일치·수동 킬 스위치에서는 차단).
+  async submitOrder(input, { automated = false } = {}) {
+    const request = normalizeSubmitRequest(input);
     return this.enqueue(() => this.execute({
       operation: "SUBMIT",
       clientOrderId: normalizeClientOrderId(input?.clientOrderId),
-      request: normalizeSubmitRequest(input),
+      request,
       orderBookSnapshot: normalizeOrderBookSnapshot(input?.orderBookSnapshot),
-      call: (request) => this.client.submitOrder(request),
+      automated: automated === true,
+      protectiveExit: automated === true && Boolean(input?.protectiveExit) && request.side === "SELL",
+      // KIS로 나가는 request에는 안 넣는다 — 실행 저널에만 붙는 내부 메모다.
+      reason: input?.reason ?? null,
+      context: sanitizeContext(input?.context),
+      call: (payload) => this.client.submitOrder(payload),
     }));
   }
 
@@ -182,10 +198,13 @@ export class KisLiveOrderService {
     return next;
   }
 
-  async execute({ operation, clientOrderId, request, call, orderBookSnapshot = null }) {
+  async execute({
+    operation, clientOrderId, request, call, orderBookSnapshot = null,
+    automated = false, protectiveExit = false, reason = null, context = null,
+  }) {
     const existing = this.commands.get(clientOrderId);
     if (existing) return replayExisting(existing);
-    await this.enforceSafety(operation, request);
+    await this.enforceSafety(operation, request, { automated, protectiveExit });
     const timestamp = this.now();
     const command = {
       commandId: String(this.commandIdFactory()),
@@ -193,6 +212,9 @@ export class KisLiveOrderService {
       operation,
       request: safeRequest(request),
       orderBookSnapshot: orderBookSnapshot ? structuredClone(orderBookSnapshot) : null,
+      reason: reason === null || reason === undefined ? null : (String(reason).trim() || null),
+      // 매수는 진입 시점의 필터 값, 매도는 보유 중 최대 상승·하락 같은 사후 분석용 메모다.
+      context,
       timestamp,
       day: koreaDateKey(timestamp),
     };
@@ -274,30 +296,47 @@ export class KisLiveOrderService {
     }
   }
 
-  async enforceSafety(operation, request) {
+  async enforceSafety(operation, request, { automated = false, protectiveExit = false } = {}) {
     if (operation === "CANCEL") return;
     await this.refreshReconciliation({ force: true });
     const status = this.status();
     if (status.killSwitch) {
       const reconciliation = status.reconciliation;
-      const message = reconciliation?.blocked
-        ? reconciliationBlockMessage(reconciliation)
-        : "한국투자 실전주문 킬 스위치가 활성화되어 신규·정정 주문이 차단되었습니다.";
-      throw new KisLiveOrderServiceError(message, {
-        code: reconciliation?.blocked
-          ? reconciliationErrorCode(reconciliation)
-          : "KIS_LIVE_KILL_SWITCH",
-        statusCode: 423,
-      });
+      // 일 손실·연속 손실 한도로만 켜진 킬 스위치는 신규 진입을 막되, 이미 들고 있는 종목의 보호 매도는
+      // 통과시킨다. 안 그러면 한도에 닿은 바로 그 순간부터 손절이 작동하지 않는다.
+      const limitOnly = this.killSwitchReason === "LIMIT"
+        && !this.unknownResult
+        && !reconciliation?.blocked;
+      if (!(protectiveExit && limitOnly)) {
+        const message = reconciliation?.blocked
+          ? reconciliationBlockMessage(reconciliation)
+          : "한국투자 실전주문 킬 스위치가 활성화되어 신규·정정 주문이 차단되었습니다.";
+        throw new KisLiveOrderServiceError(message, {
+          code: reconciliation?.blocked
+            ? reconciliationErrorCode(reconciliation)
+            : "KIS_LIVE_KILL_SWITCH",
+          statusCode: 423,
+        });
+      }
     }
     const quantity = Number(request.quantity);
-    if (!Number.isInteger(quantity) || quantity !== CANARY_MAX_ORDER_QUANTITY) {
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new KisLiveOrderServiceError(
+        "주문 수량은 1주 이상의 정수여야 합니다.",
+        { code: "KIS_LIVE_ORDER_QUANTITY_INVALID", statusCode: 400 },
+      );
+    }
+    // 수동 주문은 카나리 단계의 1주 하드 상한을 그대로 따른다. 자동매매 주문만 limits로 제한한다.
+    if (!automated && quantity !== CANARY_MAX_ORDER_QUANTITY) {
       throw new KisLiveOrderServiceError(
         `카나리 단계에서는 주문 수량이 정확히 ${CANARY_MAX_ORDER_QUANTITY}주여야 합니다.`,
         { code: "KIS_LIVE_CANARY_QUANTITY_LIMIT", statusCode: 400 },
       );
     }
-    if (quantity <= 0 || quantity > this.limits.maxOrderQuantity) {
+    // 보호 매도는 이미 보유한 포지션을 줄이는 주문이라 "새 위험을 얼마나 늘릴 수 있는가"를 막는 한도
+    // (수량·금액·일 주문수·일 손실·연속 손실)를 적용하지 않는다. 적용하면 한도에 닿는 순간 손절이 막힌다.
+    if (protectiveExit) return;
+    if (quantity > this.limits.maxOrderQuantity) {
       throw new KisLiveOrderServiceError(
         `주문 수량은 1주 이상 ${this.limits.maxOrderQuantity}주 이하여야 합니다.`,
         { code: "KIS_LIVE_ORDER_QUANTITY_LIMIT", statusCode: 400 },
@@ -345,6 +384,7 @@ export class KisLiveOrderService {
       const effectiveLoss = Math.max(baselineLoss, evaluationLoss);
       if (effectiveLoss >= this.limits.maxDailyLoss) {
         this.killSwitch = true;
+        this.killSwitchReason = "LIMIT";
         throw new KisLiveOrderServiceError(
           `실전계좌 당일 손실 ${effectiveLoss}원이 일일 손실 한도 ${this.limits.maxDailyLoss}원에 도달했습니다.`,
           { code: "KIS_LIVE_DAILY_LOSS_LIMIT", statusCode: 423 },
@@ -355,6 +395,7 @@ export class KisLiveOrderService {
       const streak = this.performanceTracker.report().trades.consecutiveLossStreak;
       if (streak >= this.limits.maxConsecutiveLosses) {
         this.killSwitch = true;
+        this.killSwitchReason = "LIMIT";
         throw new KisLiveOrderServiceError(
           `실현손실 거래가 ${streak}회 연속 발생해 연속 손실 한도 ${this.limits.maxConsecutiveLosses}회에 도달했습니다.`,
           { code: "KIS_LIVE_CONSECUTIVE_LOSS_LIMIT", statusCode: 423 },
@@ -402,11 +443,11 @@ export class KisLiveOrderService {
     }
   }
 
-  getPerformance() {
+  getPerformance({ recentLimit } = {}) {
     if (!this.performanceTracker) {
       return { available: false, reason: "KIS 당일 주문내역 조회를 사용할 수 없어 성과 통계를 계산할 수 없습니다." };
     }
-    return { available: true, ...this.performanceTracker.report() };
+    return { available: true, ...this.performanceTracker.report({ recentLimit }) };
   }
 
   getFillComparison() {
@@ -888,4 +929,15 @@ function reconciliationBlockMessage(reconciliation) {
     return `KIS 증권사 반영 대기 중에는 추가 신규·정정 주문이 차단됩니다.${firstPending ? ` ${firstPending}` : ""}`;
   }
   return `KIS 주문내역·잔고 대조를 완료하지 못해 신규·정정 주문이 차단되었습니다.${firstIssue ? ` ${firstIssue}` : ""}`;
+}
+
+// 사후 분석용 메모는 JSON으로 안전하게 직렬화되고 너무 크지 않은 일반 객체만 남긴다.
+function sanitizeContext(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized.length <= 4_000 ? JSON.parse(serialized) : null;
+  } catch {
+    return null;
+  }
 }

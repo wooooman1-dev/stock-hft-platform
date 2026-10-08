@@ -7,11 +7,11 @@ PulseHFT의 한국투자증권 **실전 계좌** 연동입니다. 실제 돈이 
 - 기본값은 `DISABLED`입니다.
 - 실전투자 전용 App Key·App Secret·실계좌가 모두 있어야 시작됩니다(모의투자·실전 시세 읽기 전용 자격정보와 양방향으로 재사용 금지).
 - **이중 게이트**: `PULSEHFT_KIS_LIVE_MODE=LIVE_TRADING`만으로는 주문을 낼 수 없습니다. `PULSEHFT_KIS_LIVE_ORDER_ENABLED=true`까지 별도로 켜야만 `KisLiveOrderService`가 생성되고 주문 API가 응답합니다. 잔고 조회만 켜고 싶을 때 실수로 주문까지 가능해지는 사고를 막기 위한 것입니다.
-- **1주 하드 상한**: 설정 로드 시점(`maxOrderQuantity`의 상한 자체가 1)과 주문 처리 시점(`quantity !== 1`이면 즉시 거부) 두 곳에서 각각 독립적으로 강제됩니다. 둘 중 하나가 나중에 실수로 완화되어도 다른 하나가 카나리 규모를 계속 1주로 제한합니다.
+- **수동 주문의 1주 하드 상한**: 수동 주문(`POST /api/kis/live/orders`)은 주문 처리 시점에 `quantity !== 1`이면 즉시 거부됩니다. 이 검사는 HTTP 본문으로 우회할 수 없습니다(자동매매 어댑터만 서버 코드에서 `automated` 옵션을 넘깁니다). 설정 로드 시점의 `maxOrderQuantity` 상한은 2026-10-08 실전 자동매매 도입과 함께 1에서 10,000으로 완화했습니다.
 - 모의투자·실전 시세 읽기 전용과 완전히 분리된 실행 저널(`execution-journal-live.jsonl`)과 토큰 파일(`kis-live-token.json`)을 사용합니다. 같은 `clientOrderId`가 다른 계좌의 주문과 섞이지 않습니다.
 - 기존 `MarketRuntime`, 내부 `PaperTrader`, 자동전략은 계속 `SIMULATION`이며 실전 계좌와 무관합니다.
-- 실전 주문은 자동전략에 연결하지 않았습니다. 반자동 승인 모드(`approvalMode: SEMI_AUTO`)도 SIMULATION 전용이며 실전 주문과는 무관합니다.
-- **UI가 없습니다.** API·테스트로만 완결되어 있으며, 대시보드(`public/`)에 실전 주문 화면을 추가하지 않았습니다.
+- 내부 시뮬레이터의 자동전략과 반자동 승인 모드(`approvalMode: SEMI_AUTO`)는 SIMULATION 전용이며 실전 주문과 무관합니다. 실전 자동매매는 아래 "실전 자동매매" 절의 별도 경로입니다(세 번째 게이트가 꺼져 있으면 연결되지 않습니다).
+- 수동 실전 주문 화면은 `public/kisLiveOrderPanel.js`, 실전 자동매매 화면은 자동매매 패널(`public/autoTradingPanel.js`)의 "실전투자" 탭입니다.
 - 진단 전용 기능인 내부 체결모델 비교(`fill-comparison`)는 이번 카나리 범위에서 제외했습니다.
 - 주문 명령을 실행 저널에 먼저 `fsync`한 뒤 증권사 요청을 보냅니다.
 - 네트워크 단절·시간초과·5xx·비정상 응답으로 결과를 확정할 수 없으면 `UNKNOWN_RESULT`로 고정하고 킬 스위치를 켭니다.
@@ -58,7 +58,7 @@ PULSEHFT_KIS_LIVE_ORDER_ENABLED=true
 기본값(카나리 단계 승인 시 사용자가 직접 정한 값 — 실제 계좌 자본 규모에 맞게 재조정해야 합니다):
 
 ```dotenv
-PULSEHFT_KIS_LIVE_MAX_ORDER_QUANTITY=1        # 이 값의 상한 자체가 1로 고정되어 있어 그 이상 설정 시 기동 실패
+PULSEHFT_KIS_LIVE_MAX_ORDER_QUANTITY=1        # 설정 상한은 10,000. 수동 주문은 이 값과 무관하게 정확히 1주
 PULSEHFT_KIS_LIVE_MAX_ORDER_VALUE=2000000
 PULSEHFT_KIS_LIVE_MAX_DAILY_ORDERS=5
 PULSEHFT_KIS_LIVE_MAX_DAILY_LOSS=20000
@@ -69,6 +69,36 @@ PULSEHFT_KIS_LIVE_MAX_CONSECUTIVE_LOSSES=2
 - 연속 손실 한도는 실행 저널의 체결 이벤트로 FIFO 매칭한 실현손익 기준 연속 손실 거래 횟수가 한도에 도달하면 킬 스위치를 켭니다.
 - 장 종료 이후 보유 포지션은 `/api/kis/live/status`의 `service.marketSession.afterHoursPositionsOpen`으로만 알림이 뜨며 자동 청산은 없습니다.
 
+## 실전 자동매매 (2026-10-08)
+
+모의투자 자동매매(`docs/AUTO_TRADING_PAPER_DESIGN.md`)와 **같은 매매 로직**(`KisPaperAutoTrader`)을 실전 주문 서비스에 다른 인스턴스로 붙인 것입니다. 진입·청산 조건, 설정 항목, 화면이 모의와 같고, 다른 점은 아래뿐입니다.
+
+- **세 번째 게이트**: `PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED=true`(그리고 `LIVE_MODE`, `ORDER_ENABLED`)가 모두 있어야 연결됩니다. 기본은 꺼짐입니다.
+- **항상 꺼진 채 시작**: 서버가 시작될 때 실전 자동매매는 저장 파일에 `enabled:true`가 있어도 꺼진 상태입니다. 화면 "실전투자" 탭에서 매번 직접 켜며, 켤 때 확인창과 서버 쪽 확인(`confirmLive`)을 거칩니다.
+- **정규장 KRX만**: 자동 주문은 `exchange: "KRX"`로 내고, 평가는 평일 09:00~15:30에만 돕니다. SOR/NXT 라우팅은 실전에서 검증하지 않았습니다.
+- **분리된 상태 파일**: 설정 `.pulsehft/live-auto-trading-config.json`, 보유 상태 `.pulsehft/live-auto-trading-state.json`, 실행 저널은 기존 `execution-journal-live.jsonl`. 동시 보유 기본값은 3종목입니다.
+- **한도는 .env로만**: 화면에서는 읽기 전용입니다. 자동매매 플래그를 켜면 기본 한도가 "소액 시험"으로 바뀝니다(아래 표). `PULSEHFT_KIS_LIVE_MAX_*`로 덮어쓸 수 있습니다.
+
+| 한도 | 수동만(플래그 꺼짐) | 자동매매 켬(소액 시험) |
+|---|---|---|
+| 1회 최대 수량 | 1 | 1,000 (금액 한도가 먼저 걸림) |
+| 1회 최대 금액 | 2,000,000원 | 200,000원 |
+| 일일 주문 수 | 5 | 30 |
+| 일일 손실 한도 | 20,000원 | 50,000원 |
+| 연속 손실 한도 | 2회 | 3회 |
+
+### 킬 스위치와 보호 매도
+
+- 일 손실·연속 손실 **한도로 켜진** 킬 스위치(`killSwitchReason: "LIMIT"`)에서는 신규 진입은 막히지만, 이미 보유한 종목의 보호 매도(손절·익절·시간 청산·강제 청산)는 통과합니다. 보호 매도는 수량·금액·일 한도 검사도 받지 않습니다.
+- **주문 결과 불명(`UNKNOWN_RESULT`)·계좌 대사 불일치·수동 킬 스위치**에서는 보호 매도도 차단됩니다. 상태를 믿을 수 없을 때는 사람이 증권사 앱에서 직접 확인·정리해야 합니다.
+- 이 규칙은 자동매매 어댑터(`automated`)에서 `protectiveExit`가 붙은 **매도**에만 적용됩니다. 수동 주문과 매수에는 적용되지 않습니다.
+
+### 알려진 한계
+
+- 모의 검증은 짧은 기간이고 모의 체결은 시뮬레이션이라, 실전 슬리피지·체결은 다를 수 있습니다.
+- 성과 화면의 비용은 모의와 같은 설정값 기반 추정치(수수료·세금)입니다. 실제 정산내역과 대조해야 합니다.
+- 실전에는 성과 집계 시작 시각(`performance/reset`) 개념이 없습니다.
+
 ## 로컬 API
 
 ```text
@@ -78,6 +108,10 @@ GET  /api/kis/live/performance
 POST /api/kis/live/orders
 POST /api/kis/live/orders/revise
 POST /api/kis/live/orders/cancel
+GET  /api/kis/live/auto-trading              # 자동매매 상태·설정 (세 번째 게이트가 꺼져 있으면 503)
+POST /api/kis/live/auto-trading              # 설정 변경·시작·정지 (꺼진 상태에서 켜려면 본문에 confirmLive:true)
+POST /api/kis/live/auto-trading/resume       # 자동매매 멈춤 해제
+GET  /api/kis/live/limits                    # 안전 한도 (읽기 전용)
 POST /api/kis/live/orders/resolve-unknown
 POST /api/kis/live/kill-switch
 ```

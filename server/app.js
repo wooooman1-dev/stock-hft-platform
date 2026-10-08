@@ -32,6 +32,7 @@ import { KisPaperOrderService } from "./integrations/kis/kisPaperOrderService.js
 import { KisPaperAutoTrader } from "./domain/kisPaperAutoTrader.js";
 import {
   assertTradeableConfiguration,
+  DEFAULT_AUTO_TRADING_SETTINGS,
   loadAutoTradingSettings,
   normalizeAutoTradingSettings,
 } from "./domain/autoTradingSettings.js";
@@ -151,6 +152,12 @@ const mainRealtimeClient = lsMainRealtimeClient ?? realtimeCoordinator?.createVi
 // 실시간 트레일링 스톱(2026-09-23)이 계속 작동한다.
 const heldPositionsRealtimeClient = realtimeCoordinator?.createView(
   "held-positions",
+  { priority: 50 },
+) ?? null;
+// 실전 자동매매 보유 종목은 별도 뷰로 구독한다 — 같은 뷰를 쓰면 모의·실전이 서로의 보유 종목 구독을
+// 덮어쓴다(coordinator의 setGroup이 뷰 단위로 목록을 통째로 교체한다).
+const liveHeldPositionsRealtimeClient = realtimeCoordinator?.createView(
+  "held-positions-live",
   { priority: 50 },
 ) ?? null;
 
@@ -280,7 +287,6 @@ const kisPaperAutoTrader = kisPaperOrderService
     stateStore: new PaperAutoTraderStateStore(join(dataDir, "paper-auto-trading-state.json")),
   })
   : null;
-let autoTradingTimer = null;
 
 // 공모주청약일정은 하루에도 거의 안 바뀌는 데이터라, 매수추천 팝업을 열 때마다
 // KIS를 다시 부르지 않게 짧게 캐시한다(2026-10-01).
@@ -293,6 +299,50 @@ const kisLiveOrderService = kisLiveClient && kisLiveConfiguration.orderEnabled
     journal: kisLiveJournal,
     limits: kisLiveConfiguration.limits,
     onUnknownResult: () => runtime.setKillSwitch(true),
+    costModel: loadPaperCostModel(process.env),
+  })
+  : null;
+
+// 실전 자동매매(2026-10-08): 모의와 같은 KisPaperAutoTrader를 다른 인스턴스로 쓴다. 세 번째 게이트
+// (PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED)가 켜져 있을 때만 만들고, 설정·상태 파일은 모의와 분리한다.
+// 서버가 시작될 때는 항상 꺼진 채로 시작한다 — 저장 파일에 enabled:true가 있어도 무시하고, 화면에서
+// 사용자가 매번 직접 켠다.
+const liveAutoTradingConfigStore = new PaperAutoTradingConfigStore(
+  join(dataDir, "live-auto-trading-config.json"),
+);
+const liveAutoTradingActive = Boolean(kisLiveOrderService && kisLiveConfiguration.autoTradingEnabled);
+const persistedLiveAutoTradingConfig = liveAutoTradingActive ? liveAutoTradingConfigStore.load() : null;
+const liveAutoTradingSettings = liveAutoTradingActive
+  ? normalizeAutoTradingSettings({
+    ...DEFAULT_AUTO_TRADING_SETTINGS,
+    // 소액 시험: 동시 보유 3종목. 화면에서 저장한 값이 있으면 그걸 우선한다.
+    maxConcurrentPositions: 3,
+    ...(persistedLiveAutoTradingConfig?.settings ?? {}),
+    enabled: false,
+  })
+  : null;
+if (liveAutoTradingSettings) assertTradeableConfiguration(liveAutoTradingSettings, autoTradingCostModel);
+// 자동매매기는 server/domain에 있고 주문 서비스의 공개 메서드만 부른다. 자동 주문에만 `automated`를 붙여
+// 1주 카나리 대신 안전 한도(maxOrderValue 등)를 적용하고 보호 매도를 인정한다. HTTP 주문 경로는 이 어댑터를
+// 거치지 않으므로 수동 주문은 계속 1주 카나리다.
+const liveAutoTradingOrderService = liveAutoTradingActive
+  ? {
+    submitOrder: (input) => kisLiveOrderService.submitOrder(input, { automated: true }),
+    getBalance: () => kisLiveOrderService.getBalance(),
+    getPerformance: (options) => kisLiveOrderService.getPerformance(options),
+    status: () => kisLiveOrderService.status(),
+    journal: kisLiveJournal,
+  }
+  : null;
+const kisLiveAutoTrader = liveAutoTradingActive
+  ? new KisPaperAutoTrader({
+    orderService: liveAutoTradingOrderService,
+    settings: liveAutoTradingSettings,
+    costModel: autoTradingCostModel,
+    realtimeClient: liveHeldPositionsRealtimeClient,
+    stateStore: new PaperAutoTraderStateStore(join(dataDir, "live-auto-trading-state.json")),
+    // 실전은 정규장 KRX로만 낸다. SOR 라우팅(NXT 포함)은 실전에서 검증하지 않았다.
+    exchange: "KRX",
   })
   : null;
 
@@ -521,7 +571,7 @@ function getKisLiveStatus() {
         token: { state: "MISSING", expiresAt: null },
       }),
     service: kisLiveOrderService
-      ? kisLiveOrderService.status()
+      ? { ...kisLiveOrderService.status(), automaticStrategyConnected: Boolean(kisLiveAutoTrader) }
       : {
         killSwitch: false,
         unknownResult: false,
@@ -543,10 +593,19 @@ function getKisLiveHealthStatus() {
     mode: publicConfig.mode,
     balanceApiAvailable: Boolean(kisLiveClient),
     orderApiAvailable: Boolean(kisLiveOrderService),
-    automaticStrategyConnected: false,
+    automaticStrategyConnected: Boolean(kisLiveAutoTrader),
     killSwitch: kisLiveOrderService?.status().killSwitch ?? false,
     unknownResult: kisLiveOrderService?.status().unknownResult ?? false,
   };
+}
+
+function requireKisLiveAutoTrader(response) {
+  if (kisLiveAutoTrader) return kisLiveAutoTrader;
+  json(response, 503, {
+    error: "한국투자 실전 자동매매가 비활성화되어 있습니다(PULSEHFT_KIS_LIVE_MODE, PULSEHFT_KIS_LIVE_ORDER_ENABLED, PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED 모두 필요).",
+    code: "KIS_LIVE_AUTO_TRADING_DISABLED",
+  });
+  return null;
 }
 
 function requireKisLiveService(response) {
@@ -907,7 +966,7 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && url.pathname === "/api/kis/live/status") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
-      return json(response, 200, getKisLiveStatus());
+      return json(response, 200, { ...getKisLiveStatus(), autoTradingAvailable: Boolean(kisLiveAutoTrader) });
     }
     if (request.method === "GET" && url.pathname === "/api/kis/live/balance") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
@@ -919,7 +978,54 @@ const server = createServer(async (request, response) => {
       if (rejectNonLoopbackKisRequest(request, response)) return;
       const service = requireKisLiveService(response);
       if (!service) return;
-      return json(response, 200, service.getPerformance());
+      const recentLimit = url.searchParams.get("recent") === "all" ? 0 : undefined;
+      return json(response, 200, await withTradeNames(service.getPerformance({ recentLimit })));
+    }
+    // 실전 자동매매 상태·설정·한도. 한도는 .env로만 바꾼다(화면에서 올릴 수 없다).
+    if (request.method === "GET" && url.pathname === "/api/kis/live/auto-trading") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const trader = requireKisLiveAutoTrader(response);
+      if (!trader) return;
+      return json(response, 200, trader.status());
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/live/auto-trading") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const trader = requireKisLiveAutoTrader(response);
+      if (!trader) return;
+      const { confirmLive, ...body } = await readJson(request);
+      // 꺼진 상태에서 켜는 요청은 화면의 확인창을 거쳤다는 표시가 있어야 한다.
+      if (body.enabled === true && !trader.settings.enabled && confirmLive !== true) {
+        return json(response, 400, {
+          error: "실전 자동매매를 켜려면 실제 자금으로 주문된다는 확인(confirmLive)이 필요합니다.",
+          code: "KIS_LIVE_AUTO_TRADING_CONFIRM_REQUIRED",
+        });
+      }
+      let next;
+      try {
+        next = normalizeAutoTradingSettings({ ...trader.settings, ...body });
+        assertTradeableConfiguration(next, autoTradingCostModel);
+      } catch (error) {
+        return json(response, error?.statusCode ?? 400, {
+          error: error instanceof Error ? error.message : String(error),
+          code: error?.code ?? "INVALID_AUTO_TRADING_SETTINGS",
+        });
+      }
+      trader.updateSettings(next);
+      liveAutoTradingConfigStore.save({ settings: next });
+      restartLiveAutoTradingTimer();
+      return json(response, 200, trader.status());
+    }
+    if (request.method === "POST" && url.pathname === "/api/kis/live/auto-trading/resume") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const trader = requireKisLiveAutoTrader(response);
+      if (!trader) return;
+      return json(response, 200, trader.clearHalt());
+    }
+    if (request.method === "GET" && url.pathname === "/api/kis/live/limits") {
+      if (rejectNonLoopbackKisRequest(request, response)) return;
+      const service = requireKisLiveService(response);
+      if (!service) return;
+      return json(response, 200, { limits: service.status().limits, bounds: null, readOnly: true });
     }
     if (request.method === "POST" && url.pathname === "/api/kis/live/orders") {
       if (rejectNonLoopbackKisRequest(request, response)) return;
@@ -1063,44 +1169,64 @@ server.listen(port, "0.0.0.0", () => {
 });
 
 // 자동매매 평가 주기. 실제 주문은 KisPaperAutoTrader가 판단하며, 여기서는 입력만 모아 넘긴다.
-// 장 시간 밖에서는 불필요한 잔고·시세 조회를 하지 않는다.
-let autoTradingCycleInFlight = false;
+// 장 시간 밖에서는 불필요한 잔고·시세 조회를 하지 않는다. 모의와 실전이 각자 루프(타이머·중복 방지)를 갖는다.
+function createAutoTradingLoop({ trader, service }) {
+  let timer = null;
+  let cycleInFlight = false;
 
-async function runAutoTradingCycle() {
-  if (!kisPaperAutoTrader || !kisPaperAutoTrader.settings.enabled) return;
-  if (!isKoreaTradingWindow(Date.now())) return;
-  // 한 주기가 평가 간격보다 오래 걸리면 다음 틱이 겹쳐 돌면서 같은 판단을 두 번 내린다.
-  if (autoTradingCycleInFlight) return;
-  autoTradingCycleInFlight = true;
-  try {
-    const [recommendations, balance] = await Promise.all([
-      recommendationScanner.get({ refreshIfStale: true }),
-      kisPaperOrderService.getBalance(),
-    ]);
-    await kisPaperAutoTrader.evaluate({
-      candidates: recommendations?.candidates ?? [],
-      balance,
-    });
-  } catch (error) {
-    // 입력 수집 실패는 주문 실패와 다르다. 다음 주기에 다시 시도한다.
-    kisPaperAutoTrader.record({
-      action: "CYCLE_ERROR",
-      at: Date.now(),
-      detail: error instanceof Error ? error.message : String(error),
-    });
-  } finally {
-    autoTradingCycleInFlight = false;
+  async function runCycle() {
+    if (!trader || !service || !trader.settings.enabled) return;
+    if (!isKoreaTradingWindow(Date.now())) return;
+    // 한 주기가 평가 간격보다 오래 걸리면 다음 틱이 겹쳐 돌면서 같은 판단을 두 번 내린다.
+    if (cycleInFlight) return;
+    cycleInFlight = true;
+    try {
+      const [recommendations, balance] = await Promise.all([
+        recommendationScanner.get({ refreshIfStale: true }),
+        service.getBalance(),
+      ]);
+      await trader.evaluate({
+        candidates: recommendations?.candidates ?? [],
+        balance,
+      });
+    } catch (error) {
+      // 입력 수집 실패는 주문 실패와 다르다. 다음 주기에 다시 시도한다.
+      trader.record({
+        action: "CYCLE_ERROR",
+        at: Date.now(),
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      cycleInFlight = false;
+    }
   }
+
+  function stop() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  function restart() {
+    stop();
+    if (!trader || !trader.settings.enabled) return;
+    timer = setInterval(() => {
+      void runCycle();
+    }, trader.settings.evaluationIntervalMs);
+    if (typeof timer.unref === "function") timer.unref();
+  }
+
+  return { restart, stop };
 }
 
+const paperAutoTradingLoop = createAutoTradingLoop({ trader: kisPaperAutoTrader, service: kisPaperOrderService });
+const liveAutoTradingLoop = createAutoTradingLoop({ trader: kisLiveAutoTrader, service: kisLiveOrderService });
+
 function restartAutoTradingTimer() {
-  if (autoTradingTimer) clearInterval(autoTradingTimer);
-  autoTradingTimer = null;
-  if (!kisPaperAutoTrader || !kisPaperAutoTrader.settings.enabled) return;
-  autoTradingTimer = setInterval(() => {
-    void runAutoTradingCycle();
-  }, kisPaperAutoTrader.settings.evaluationIntervalMs);
-  if (typeof autoTradingTimer.unref === "function") autoTradingTimer.unref();
+  paperAutoTradingLoop.restart();
+}
+
+function restartLiveAutoTradingTimer() {
+  liveAutoTradingLoop.restart();
 }
 
 // 모의투자(KIS 계정)는 정규장(09:00~15:30 KST)에만 주문을 받는다 — 08:00~20:00
@@ -1129,6 +1255,7 @@ function startOfKoreaDay(timestamp) {
 }
 
 restartAutoTradingTimer();
+restartLiveAutoTradingTimer();
 
 let shuttingDown = false;
 function shutdown() {
@@ -1136,10 +1263,12 @@ function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(heartbeat);
-  if (autoTradingTimer) clearInterval(autoTradingTimer);
+  paperAutoTradingLoop.stop();
+  liveAutoTradingLoop.stop();
   mainWorkspace.stop();
   recommendationScanner.stop();
   kisPaperAutoTrader?.stop();
+  kisLiveAutoTrader?.stop();
   realtimeCoordinator?.stop();
   lsMainRealtimeClient?.stop();
   runtime.stop();

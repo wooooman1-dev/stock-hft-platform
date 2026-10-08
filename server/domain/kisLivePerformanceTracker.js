@@ -1,3 +1,5 @@
+import { computePerformanceReport as computeNetPerformanceReport } from "./kisPaperPerformance.js";
+
 const EQUITY_EVENT = "BROKER_EQUITY_SNAPSHOT";
 const FILL_EVENT = "BROKER_FILL_OBSERVED";
 
@@ -8,13 +10,14 @@ const FILL_EVENT = "BROKER_FILL_OBSERVED";
  * costBasisIncompleteQuantity로 별도 집계된다.
  */
 export class KisLivePerformanceTracker {
-  constructor({ journal, now = Date.now } = {}) {
+  constructor({ journal, now = Date.now, costModel = {} } = {}) {
     if (!journal || typeof journal.append !== "function" || typeof journal.readAll !== "function") {
       throw new TypeError("append/readAll을 제공하는 실행 저널이 필요합니다.");
     }
     if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
     this.journal = journal;
     this.now = now;
+    this.costModel = { ...costModel };
     this.observedExecutedQuantity = new Map();
     this.replayJournal();
   }
@@ -71,8 +74,17 @@ export class KisLivePerformanceTracker {
     }
   }
 
-  report() {
-    return computePerformanceReport(this.journal.readAll(), { now: this.now() });
+  // 거래별 비용 차감 후 손익(netPnl)·총비용은 모의 성과 계산기와 같은 방식으로 추정한다(자동매매 화면과
+  // 연속 손실 판단이 모의와 같은 필드를 읽는다). 비용은 설정값 기반 추정치라 실제 정산내역과 대사해야 한다.
+  report({ recentLimit } = {}) {
+    const events = this.journal.readAll();
+    const base = computePerformanceReport(events, { now: this.now() });
+    const net = computeNetPerformanceReport(events, {
+      now: this.now(),
+      costModel: this.costModel,
+      ...(recentLimit === undefined ? {} : { recentLimit }),
+    });
+    return { ...base, resetAt: null, costModel: net.costModel, trades: net.trades };
   }
 }
 

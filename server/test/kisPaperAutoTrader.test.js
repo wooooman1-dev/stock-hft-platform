@@ -107,6 +107,24 @@ test("ENTRY_READY이고 비용 문턱을 넘으면 시장가로 진입한다", a
   assert.equal(order.quantity, 10);
 });
 
+test("주문 거래소는 기본 SOR이고, 실전 자동매매처럼 exchange를 지정하면 그대로 낸다", async () => {
+  const defaultService = fakeService();
+  await trader({}, defaultService).evaluate({ candidates: [candidate()], balance: balance() });
+  assert.equal(defaultService.submitted[0].exchange, "SOR");
+
+  const krxService = fakeService();
+  const krx = new KisPaperAutoTrader({
+    orderService: krxService,
+    settings: { enabled: true, settlementGraceMs: 0, entryConfirmMs: 0, stopConfirmMs: 0 },
+    costModel: COST,
+    now: () => BASE,
+    exchange: "KRX",
+  });
+  await krx.evaluate({ candidates: [candidate()], balance: balance() });
+  assert.equal(krxService.submitted[0].exchange, "KRX");
+  assert.throws(() => new KisPaperAutoTrader({ orderService: krxService, exchange: "ALL" }), TypeError);
+});
+
 test("ENTRY_READY도 WATCH도 아니면 진입하지 않는다", async () => {
   const service = fakeService();
   const auto = trader({}, service);

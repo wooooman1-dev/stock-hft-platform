@@ -35,11 +35,15 @@ export class KisPaperAutoTrader {
     realtimeClient = null,
     stateStore = null,
     now = Date.now,
+    // 주문 거래소. 모의는 SOR(그 순간 열린 거래소로 라우팅), 실전 자동매매는 정규장 KRX로만 낸다.
+    exchange = "SOR",
   } = {}) {
     if (!orderService || typeof orderService.submitOrder !== "function") {
       throw new TypeError("KisPaperOrderService가 필요합니다.");
     }
     if (typeof now !== "function") throw new TypeError("now는 함수여야 합니다.");
+    if (!["SOR", "KRX", "NXT"].includes(exchange)) throw new TypeError("exchange는 SOR, KRX, NXT 중 하나여야 합니다.");
+    this.exchange = exchange;
     this.orderService = orderService;
     this.settings = normalizeAutoTradingSettings(settings);
     this.costModel = { ...costModel };
@@ -778,7 +782,7 @@ export class KisPaperAutoTrader {
         // SOR(Smart Order Routing) — KRX 정규장이든 넥스트레이드 프리마켓·
         // 애프터마켓이든 그 순간 열려 있는 거래소로 KIS가 알아서 라우팅한다
         // (2026-09-17, isKoreaTradingWindow가 08:00~20:00으로 넓어진 것과 짝).
-        exchange: "SOR",
+        exchange: this.exchange,
         orderBookSnapshot,
         // 이 자동매매(v1, 동시 보유 1종목)는 매도를 손절·익절·트레일링 스톱·최대
         // 보유시간·강제청산 용도로만 낸다 — 매도는 전부 보호청산이다.

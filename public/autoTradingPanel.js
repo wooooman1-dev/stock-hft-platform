@@ -24,6 +24,36 @@ let loadingAllTrades = false;
 const draft = { strategy: {}, limits: {}, recommendation: {} };
 let focusState = null;
 
+// 모의 | 실전 전환(2026-10-08). 같은 화면·같은 표를 쓰고 엔드포인트 접두사만 바꿔서 두 계좌가 헷갈리지
+// 않게 한다. 선택은 이 브라우저에 기억한다. 서버가 켜질 때마다 실전은 꺼진 채 시작한다.
+const MODE_STORAGE_KEY = "pulsehft.autoTradingMode";
+const MODES = {
+  paper: {
+    base: "/api/kis/paper",
+    eyebrow: "모의계좌 자동매매",
+    sub: "모의투자 계좌입니다. 실제 자금이 아닙니다.",
+    limitsTitle: "모의계좌 안전 한도",
+  },
+  live: {
+    base: "/api/kis/live",
+    eyebrow: "실전계좌 자동매매",
+    sub: "실제 자금으로 주문됩니다. 정규장(09:00~15:30)에만 동작하고, 켜진 채로 서버를 재시작하면 꺼진 상태로 시작합니다.",
+    limitsTitle: "실전계좌 안전 한도 (읽기 전용 — .env로만 바꿀 수 있음)",
+  },
+};
+let mode = loadStoredMode();
+let statusChecked = false;
+const isLive = () => mode === "live";
+const apiBase = () => MODES[mode].base;
+
+function loadStoredMode() {
+  try {
+    return localStorage.getItem(MODE_STORAGE_KEY) === "live" ? "live" : "paper";
+  } catch {
+    return "paper";
+  }
+}
+
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
 })[char]);
@@ -89,6 +119,57 @@ const REASON_TEXT = {
 };
 const reasonText = (code) => REASON_TEXT[code] ?? code ?? "-";
 
+function modeTabsHtml() {
+  const tab = (key, label) => `<button type="button" class="at-mode-tab is-${key}${mode === key ? " is-active" : ""}"
+    data-at-action="mode-${key}" aria-pressed="${mode === key}">${label}</button>`;
+  return `<div class="at-mode-tabs">${tab("paper", "모의투자")}${tab("live", "실전투자")}</div>`;
+}
+
+function switchMode(next) {
+  if (next === mode) return;
+  mode = next;
+  try { localStorage.setItem(MODE_STORAGE_KEY, mode); } catch { /* 저장소를 못 쓰면 이번 화면에서만 유지 */ }
+  // 이전 계좌의 값이 새 계좌 화면에 잠깐이라도 비치지 않게 전부 비운다.
+  status = null; balance = null; performance = null; limits = null; limitBounds = null;
+  allTrades = null; loadingAllTrades = false; showSettings = false; message = null;
+  draft.strategy = {}; draft.limits = {}; draft.recommendation = {};
+  focusState = null;
+  statusChecked = false;
+  render();
+  void refresh();
+}
+
+function confirmLiveStart() {
+  const cap = limits?.maxOrderValue ? `종목당 최대 ${won(limits.maxOrderValue)}` : "한도는 .env 설정";
+  const positions = status?.settings?.maxConcurrentPositions;
+  return window.confirm(
+    `실전 자동매매를 시작합니다.\n\n실제 자금으로 주문이 나가며, 손익은 실제 계좌에 반영됩니다.\n`
+    + `(${cap}${positions ? `, 동시 최대 ${positions}종목` : ""})\n\n정말 시작할까요?`,
+  );
+}
+
+// 서버에 실전 자동매매가 연결돼 있지 않으면(.env에서 안 켬) 전환 탭과 안내만 보여준다.
+function renderUnavailable(existing) {
+  const panel = existing ?? document.createElement("div");
+  panel.className = "auto-trading-panel at-live-mode";
+  panel.querySelector(":scope > .at-settings")?.remove();
+  let box = panel.querySelector(":scope > .at-live");
+  if (!box) {
+    panel.textContent = "";
+    box = document.createElement("div");
+    box.className = "at-live";
+    panel.append(box);
+  }
+  box.innerHTML = `${modeTabsHtml()}
+    <div class="at-head"><div>
+      <div class="at-eyebrow">${MODES.live.eyebrow}</div>
+      <h3>설정되지 않음</h3>
+      <div class="at-sub">서버에서 실전 자동매매가 꺼져 있습니다. 실전 키·주문 게이트와
+      PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED=true를 .env에 설정하고 서버를 다시 시작해야 켤 수 있습니다.</div>
+    </div></div>`;
+  if (document.body.lastElementChild !== panel) document.body.append(panel);
+}
+
 injectStyles();
 
 async function api(path, options) {
@@ -100,19 +181,25 @@ async function api(path, options) {
 
 async function refresh() {
   if (stopped) return;
+  // 응답을 기다리는 사이 모의|실전을 바꿨으면 그 응답은 버린다(다른 계좌 값이 섞이면 안 된다).
+  const requestMode = mode;
+  const base = apiBase();
   try {
     const [next, paper] = await Promise.all([
-      api("/api/kis/paper/auto-trading").catch(() => null),
-      api("/api/kis/paper/status").catch(() => null),
+      api(`${base}/auto-trading`).catch(() => null),
+      api(`${base}/status`).catch(() => null),
     ]);
+    if (requestMode !== mode) return;
     status = next;
+    statusChecked = true;
     if (status) {
       const [nextBalance, nextPerformance, nextLimits, nextRecommendationSettings] = await Promise.all([
-        api("/api/kis/paper/balance").catch(() => null),
-        api("/api/kis/paper/performance").catch(() => null),
-        api("/api/kis/paper/limits").catch(() => null),
+        api(`${base}/balance`).catch(() => null),
+        api(`${base}/performance`).catch(() => null),
+        api(`${base}/limits`).catch(() => null),
         api("/api/recommendations/settings").catch(() => null),
       ]);
+      if (requestMode !== mode) return;
       balance = nextBalance;
       performance = nextPerformance;
       if (nextLimits) { limits = nextLimits.limits; limitBounds = nextLimits.bounds; }
@@ -138,23 +225,27 @@ async function run(action) {
   }
 }
 
-const setEnabled = (enabled) => run(() => api("/api/kis/paper/auto-trading", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ enabled }),
-}));
+const setEnabled = (enabled) => {
+  // 실전은 켜기 전에 한 번 더 확인하고, 서버에도 확인했다는 표시(confirmLive)를 함께 보낸다.
+  if (enabled && isLive() && !confirmLiveStart()) return undefined;
+  return run(() => api(`${apiBase()}/auto-trading`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled, ...(enabled && isLive() ? { confirmLive: true } : {}) }),
+  }));
+};
 
 // 멈춤 해제는 두 단계다. 주문 서비스의 차단을 먼저 풀고(대사 확인 포함),
 // 그 다음 자동매매의 멈춤을 푼다. 순서가 바뀌면 다음 주기에 다시 멈춘다.
 const releaseHalt = () => run(async () => {
   if (status?.paperService?.killSwitch) {
-    await api("/api/kis/paper/kill-switch", {
+    await api(`${apiBase()}/kill-switch`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: false }),
     });
   }
-  await api("/api/kis/paper/auto-trading/resume", { method: "POST" });
+  await api(`${apiBase()}/auto-trading/resume`, { method: "POST" });
 });
 
 // 초기 오류가 있던 기간의 손익이 지금 성과를 계속 가려서 "오늘부터 새로 보고
@@ -203,7 +294,12 @@ function render() {
   // 매수추천 리스트 화면이든 종목 상세 화면이든 상관없이 항상 body 맨 끝에
   // 붙어 있어야 하므로(2026-09-17), 더 이상 #app 안에서 찾지 않는다.
   const existing = document.querySelector(".auto-trading-panel");
-  if (!status) { existing?.remove(); return; }
+  if (!status) {
+    // 실전 자동매매가 서버에 없을 때만 안내를 보여준다. 첫 응답 전이나 모의가 없을 때는 예전처럼 숨긴다.
+    if (isLive() && statusChecked) renderUnavailable(existing);
+    else existing?.remove();
+    return;
+  }
 
   const names = buildNameMap();
   const running = Boolean(status.enabled);
@@ -213,7 +309,7 @@ function render() {
   const trades = allTrades ?? performance?.trades ?? null;
 
   const panel = existing ?? document.createElement("div");
-  panel.className = "auto-trading-panel";
+  panel.className = `auto-trading-panel${isLive() ? " at-live-mode" : ""}`;
 
   // 3초마다 폴링하면서 innerHTML을 통째로 갈아엎으면 사용자가 타이핑 중인 입력이
   // 매번 지워진다. 실시간 영역만 다시 그리고, 설정 폼은 열고 닫을 때만 만든다.
@@ -230,11 +326,12 @@ function render() {
   // 위치를 기억해뒀다가 새로 그린 뒤 그대로 되돌린다.
   const previousTradesScrollTop = live.querySelector(".at-table-scroll")?.scrollTop ?? 0;
   live.innerHTML = `
+    ${modeTabsHtml()}
     <div class="at-head">
       <div>
-        <div class="at-eyebrow">모의계좌 자동매매</div>
+        <div class="at-eyebrow">${MODES[mode].eyebrow}</div>
         <h3>${!running ? "정지" : halted ? "멈춤" : "작동 중"}</h3>
-        <div class="at-sub">모의투자 계좌입니다. 실제 자금이 아닙니다.</div>
+        <div class="at-sub">${MODES[mode].sub}</div>
       </div>
       <div class="at-actions">
         <button type="button" class="at-btn ${running ? "at-btn-stop" : "at-btn-start"}"
@@ -300,7 +397,7 @@ function render() {
           </button>` : ""}
         ${allTrades ? `
           <button type="button" class="at-btn at-btn-ghost at-btn-tiny" data-at-action="collapse-trades">최근만 보기</button>` : ""}
-        ${performance?.resetAt ? `
+        ${isLive() ? "" : performance?.resetAt ? `
           <button type="button" class="at-btn at-btn-ghost at-btn-tiny" data-at-action="clear-performance-reset" ${busy ? "disabled" : ""}>전체 기록 보기</button>
         ` : `
           <button type="button" class="at-btn at-btn-ghost at-btn-tiny" data-at-action="reset-performance-today" ${busy ? "disabled" : ""}>오늘부터 새로 집계</button>
@@ -486,6 +583,7 @@ function fieldRow(key, label, unit, hint, value, group) {
       inputmode="${key === "forcedExitTime" ? "text" : "decimal"}"
       autocomplete="off" spellcheck="false"
       data-at-field="${escapeHtml(key)}" data-at-group="${group}"
+      ${group === "limits" && isLive() ? "disabled" : ""}
       value="${escapeHtml(String(shown))}" />
     ${hint ? `<small>${escapeHtml(hint)}</small>` : ""}
   </label>`;
@@ -513,7 +611,7 @@ function settingsHtml() {
     <div class="at-fields">
       ${STRATEGY_FIELDS.map(([k, l, u, h]) => fieldRow(k, l, u, h, strategy[k], "strategy")).join("")}
     </div>
-    <div class="at-section-title" style="margin-top:12px">모의계좌 안전 한도</div>
+    <div class="at-section-title" style="margin-top:12px">${MODES[mode].limitsTitle}</div>
     <div class="at-fields">
       ${LIMIT_FIELDS.map(([k, l, u, h]) => fieldRow(k, l, u, h, limits?.[k], "limits")).join("")}
     </div>
@@ -544,12 +642,15 @@ async function saveSettings(panel) {
     if (raw === "") { target[key] = null; continue; }
     target[key] = key === "forcedExitTime" ? raw : Number(raw);
   }
-  await api("/api/kis/paper/limits", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(nextLimits),
-  });
-  await api("/api/kis/paper/auto-trading", {
+  // 실전 한도는 화면에서 바꿀 수 없다(.env로만). 모의만 한도를 저장한다.
+  if (!isLive()) {
+    await api(`${apiBase()}/limits`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(nextLimits),
+    });
+  }
+  await api(`${apiBase()}/auto-trading`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(strategy),
@@ -603,6 +704,7 @@ document.addEventListener("click", (event) => {
     focusState = null;
     render();
   }
+  if (action === "mode-paper" || action === "mode-live") switchMode(action === "mode-live" ? "live" : "paper");
   if (action === "dismiss") { message = null; render(); }
   if (action === "load-all-trades") void loadAllTrades();
   if (action === "collapse-trades") { allTrades = null; render(); }
@@ -617,7 +719,7 @@ async function loadAllTrades() {
   loadingAllTrades = true;
   render();
   try {
-    const full = await api("/api/kis/paper/performance?recent=all");
+    const full = await api(`${apiBase()}/performance?recent=all`);
     allTrades = full?.trades ?? null;
   } catch (error) {
     message = { tone: "error", text: error instanceof Error ? error.message : String(error) };
@@ -692,6 +794,15 @@ function injectStyles() {
     .at-btn-save{background:#1d5c8a;border-color:#2e7fb5;color:#eaf6ff;font-weight:600}
     .at-save-row small{font-size:10px;color:#5d7385}
     .at-ok{background:#0f2a1c;border:1px solid #2e7a52;color:#9fe3c0}
+    .at-mode-tabs{display:flex;gap:6px;margin-bottom:10px}
+    .at-mode-tab{background:transparent;border:1px solid #2b4f68;color:#8fbcd8;border-radius:8px;padding:6px 14px;font-size:11px;cursor:pointer}
+    .at-mode-tab.is-active{background:#1d5c8a;border-color:#2e7fb5;color:#eaf6ff;font-weight:700}
+    .at-mode-tab.is-live.is-active{background:#8a1f2e;border-color:#d1475b;color:#fff}
+    .auto-trading-panel.at-live-mode{border-color:#a8323f;background:linear-gradient(180deg,#1c0d12,#12080b)}
+    .at-live-mode .at-eyebrow{color:#ff8f9e}
+    .at-live-mode .at-sub{color:#d89aa5}
+    .at-live-mode .at-table thead th{background:#1c0d12}
+    .at-field input[disabled]{opacity:.65;cursor:not-allowed}
   `;
   document.head.append(style);
 }

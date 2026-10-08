@@ -35,6 +35,7 @@ export function loadKisLiveConfiguration(filePath, { env = process.env } = {}) {
       credentialSource: null,
       credentialsPath: filePath,
       orderEnabled: false,
+      autoTradingEnabled: false,
       limits: defaultLimits(env),
     });
   }
@@ -115,6 +116,8 @@ export function loadKisLiveConfiguration(filePath, { env = process.env } = {}) {
   });
 
   const orderEnabled = String(env.PULSEHFT_KIS_LIVE_ORDER_ENABLED ?? "false").trim().toLowerCase() === "true";
+  // 실전 자동매매는 주문 게이트와 별개로 한 번 더 켜야 한다(이중 게이트 위에 세 번째 게이트).
+  const autoTradingEnabled = orderEnabled && isAutoTradingFlag(env);
 
   return Object.freeze({
     enabled: true,
@@ -129,6 +132,7 @@ export function loadKisLiveConfiguration(filePath, { env = process.env } = {}) {
     accountNumber: credentials.accountNumber,
     accountProductCode: credentials.accountProductCode,
     orderEnabled,
+    autoTradingEnabled,
     sharedQuoteCredential,
     limits: defaultLimits(env),
   });
@@ -145,18 +149,35 @@ export function publicKisLiveConfiguration(config) {
     accountNumberMasked: config?.accountNumber ? maskAccount(config.accountNumber) : null,
     balanceApiAvailable: Boolean(config?.enabled),
     orderApiAvailable: Boolean(config?.enabled && config?.orderEnabled),
+    autoTradingAvailable: Boolean(config?.enabled && config?.orderEnabled && config?.autoTradingEnabled),
     sharedQuoteCredential: Boolean(config?.sharedQuoteCredential),
     limits: config?.limits ? structuredClone(config.limits) : null,
   };
 }
 
+function isAutoTradingFlag(env) {
+  return String(env.PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED ?? "false").trim().toLowerCase() === "true";
+}
+
+// 수동 카나리 기본값(1주/2,000,000원/5건/2만원/2회)과 실전 자동매매 "소액 시험" 기본값. 자동매매
+// 플래그를 켠 경우에만 후자가 기본이 된다. 수량 상한은 자동매매 주문에만 쓰이고(수동 주문은
+// kisLiveOrderService의 1주 카나리가 그대로 막는다), 실제 규모는 maxOrderValue가 먼저 제한한다.
+// 모든 값은 PULSEHFT_KIS_LIVE_MAX_*로 덮어쓸 수 있다.
+const MANUAL_LIMIT_DEFAULTS = Object.freeze({
+  maxOrderQuantity: 1, maxOrderValue: 2_000_000, maxDailyOrders: 5, maxDailyLoss: 20_000, maxConsecutiveLosses: 2,
+});
+const AUTO_TRADING_LIMIT_DEFAULTS = Object.freeze({
+  maxOrderQuantity: 1_000, maxOrderValue: 200_000, maxDailyOrders: 30, maxDailyLoss: 50_000, maxConsecutiveLosses: 3,
+});
+
 function defaultLimits(env) {
+  const defaults = isAutoTradingFlag(env) ? AUTO_TRADING_LIMIT_DEFAULTS : MANUAL_LIMIT_DEFAULTS;
   return Object.freeze({
-    maxOrderQuantity: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_ORDER_QUANTITY, 1, 1, 1),
-    maxOrderValue: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_ORDER_VALUE, 2_000_000, 1, 10_000_000_000),
-    maxDailyOrders: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_DAILY_ORDERS, 5, 1, 10_000),
-    maxDailyLoss: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_DAILY_LOSS, 20_000, 0, 10_000_000_000),
-    maxConsecutiveLosses: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_CONSECUTIVE_LOSSES, 2, 0, 100),
+    maxOrderQuantity: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_ORDER_QUANTITY, defaults.maxOrderQuantity, 1, 10_000),
+    maxOrderValue: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_ORDER_VALUE, defaults.maxOrderValue, 1, 10_000_000_000),
+    maxDailyOrders: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_DAILY_ORDERS, defaults.maxDailyOrders, 1, 10_000),
+    maxDailyLoss: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_DAILY_LOSS, defaults.maxDailyLoss, 0, 10_000_000_000),
+    maxConsecutiveLosses: integerEnv(env.PULSEHFT_KIS_LIVE_MAX_CONSECUTIVE_LOSSES, defaults.maxConsecutiveLosses, 0, 100),
   });
 }
 

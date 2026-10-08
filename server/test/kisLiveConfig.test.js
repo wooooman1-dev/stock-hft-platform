@@ -114,17 +114,57 @@ test("KIS live config defaults the canary limits to the user-approved conservati
   });
 });
 
-test("KIS live config hard-ceilings order quantity at 1 share even if overridden", () => {
+// 2026-10-08: 실전 자동매매를 붙이면서 설정 상한을 1주에서 10,000주로 완화했다. 수동 주문의 1주 카나리는
+// kisLiveOrderService의 런타임 검사가 그대로 지킨다(kisLiveOrderService.test.js).
+const LIVE_ENV = {
+  PULSEHFT_KIS_LIVE_MODE: "LIVE_TRADING",
+  PULSEHFT_KIS_LIVE_APP_KEY: "live-key",
+  PULSEHFT_KIS_LIVE_APP_SECRET: "live-secret",
+  PULSEHFT_KIS_LIVE_ACCOUNT_NUMBER: "12345678",
+  PULSEHFT_KIS_LIVE_ACCOUNT_PRODUCT_CODE: "01",
+};
+
+test("KIS live config caps order quantity at 10,000 shares and still validates overrides", () => {
+  assert.equal(loadKisLiveConfiguration(null, {
+    env: { ...LIVE_ENV, PULSEHFT_KIS_LIVE_MAX_ORDER_QUANTITY: "5" },
+  }).limits.maxOrderQuantity, 5);
   assert.throws(() => loadKisLiveConfiguration(null, {
-    env: {
-      PULSEHFT_KIS_LIVE_MODE: "LIVE_TRADING",
-      PULSEHFT_KIS_LIVE_APP_KEY: "live-key",
-      PULSEHFT_KIS_LIVE_APP_SECRET: "live-secret",
-      PULSEHFT_KIS_LIVE_ACCOUNT_NUMBER: "12345678",
-      PULSEHFT_KIS_LIVE_ACCOUNT_PRODUCT_CODE: "01",
-      PULSEHFT_KIS_LIVE_MAX_ORDER_QUANTITY: "5",
-    },
+    env: { ...LIVE_ENV, PULSEHFT_KIS_LIVE_MAX_ORDER_QUANTITY: "10001" },
   }), (error) => error.code === "KIS_LIVE_LIMIT_INVALID");
+});
+
+test("KIS live config keeps the manual canary limits unless live auto-trading is switched on", () => {
+  const manual = loadKisLiveConfiguration(null, { env: LIVE_ENV });
+  assert.equal(manual.autoTradingEnabled, false);
+  assert.deepEqual({ ...manual.limits }, {
+    maxOrderQuantity: 1, maxOrderValue: 2_000_000, maxDailyOrders: 5, maxDailyLoss: 20_000, maxConsecutiveLosses: 2,
+  });
+});
+
+test("KIS live config switches to the small-trial auto-trading limits only with the third gate", () => {
+  const withOrders = loadKisLiveConfiguration(null, {
+    env: { ...LIVE_ENV, PULSEHFT_KIS_LIVE_ORDER_ENABLED: "true", PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED: "true" },
+  });
+  assert.equal(withOrders.autoTradingEnabled, true);
+  assert.deepEqual({ ...withOrders.limits }, {
+    maxOrderQuantity: 1_000, maxOrderValue: 200_000, maxDailyOrders: 30, maxDailyLoss: 50_000, maxConsecutiveLosses: 3,
+  });
+  // 주문 게이트가 꺼져 있으면 자동매매 플래그만으로는 켜지지 않는다.
+  const withoutOrders = loadKisLiveConfiguration(null, {
+    env: { ...LIVE_ENV, PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED: "true" },
+  });
+  assert.equal(withoutOrders.autoTradingEnabled, false);
+  assert.equal(publicKisLiveConfiguration(withoutOrders).autoTradingAvailable, false);
+  assert.equal(publicKisLiveConfiguration(withOrders).autoTradingAvailable, true);
+  // 개별 한도는 환경변수로 덮어쓴다.
+  const overridden = loadKisLiveConfiguration(null, {
+    env: {
+      ...LIVE_ENV, PULSEHFT_KIS_LIVE_ORDER_ENABLED: "true", PULSEHFT_KIS_LIVE_AUTO_TRADING_ENABLED: "true",
+      PULSEHFT_KIS_LIVE_MAX_ORDER_VALUE: "500000",
+    },
+  });
+  assert.equal(overridden.limits.maxOrderValue, 500_000);
+  assert.equal(overridden.limits.maxDailyOrders, 30);
 });
 
 test("KIS live config's env var namespace never collides with the read-only quote config's forbidden fields", () => {
