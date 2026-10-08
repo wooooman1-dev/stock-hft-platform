@@ -61,8 +61,11 @@ export class KisPaperAutoTrader {
     // 확정된 매도만 붙잡아두고, REJECTED·결과불명·전송실패는 바로 풀어 재시도를
     // 허용한다 — resolvePositions()가 더 이상 보유가 아님을 확인하면 완전히 지운다.
     this.exitingSymbols = new Set();
-    // 청산된 종목은 같은 거래일 안에는 다시 사지 않는다(2026-09-23, 실측 데이터로
+    // 손절로 청산된 종목은 같은 거래일 안에는 다시 사지 않는다(2026-09-23, 실측 데이터로
     // 확인 — 변동성 큰 한 종목에서 손절 후에도 반복 재진입해 손실이 쌓인 정황).
+    // 시간·강제 청산 종목은 막지 않는다(2026-10-08): 신호 데이터셋에서 같은 날 재진입이
+    // 첫 진입보다 나빴다는 근거가 없었고(재진입 49건 평균 +26.9bp, 첫 진입 117건 +1.4bp),
+    // 오히려 신호가 가장 좋은 종목을 후보에서 지우고 있었다.
     // ACCEPTED로 확정된 매도만 기록한다 — REJECTED·전송실패는 그 종목이 아직
     // 실제로 청산되지 않았을 수 있어 재시도가 계속 허용돼야 한다.
     this.exitedSymbolsToday = new Map(); // symbol -> KST 거래일 키
@@ -555,7 +558,7 @@ export class KisPaperAutoTrader {
         });
         continue;
       }
-      // 오늘 이미 한 번 청산된 종목이다 — 승패 무관하게 같은 날 재진입하지 않는다.
+      // 오늘 손절로 청산된 종목이다 — 같은 날 재진입하지 않는다.
       if (symbol && this.exitedSymbolsToday.has(symbol)) {
         evaluated.push({
           symbol, name: candidate?.name ?? null,
@@ -811,7 +814,7 @@ export class KisPaperAutoTrader {
     // 방치할 수 없으므로 즉시 풀어 다음 주기에 다시 시도할 수 있게 한다.
     if (side === "SELL") {
       if (result?.status === "ACCEPTED") {
-        this.exitedSymbolsToday.set(symbol, kstDayKey(at));
+        if (reason === "STOP_LOSS") this.exitedSymbolsToday.set(symbol, kstDayKey(at));
       } else {
         this.exitingSymbols.delete(symbol);
       }

@@ -706,8 +706,9 @@ test("실시간 client가 있으면 marketData를 구독하고 stop()에서 해�
 });
 
 // 2026-09-23: 실측 21건을 대조해보니 변동성 큰 한 종목(072950)에 재진입이 몰려
-// 손실이 반복 누적됐다 — 승패 무관, 청산된 종목은 같은 거래일에는 다시 사지 않는다.
-test("청산된 종목은 같은 날 다시 매수 후보에서 제외된다", async () => {
+// 손실이 반복 누적됐다 — 손절로 청산된 종목은 같은 거래일에는 다시 사지 않는다.
+// (2026-10-08부터 시간·강제 청산 종목은 막지 않는다: 아래 테스트.)
+test("손절로 청산된 종목은 같은 날 다시 매수 후보에서 제외된다", async () => {
   const service = fakeService();
   const auto = trader(
     { maxConcurrentPositions: 5, stopLossBps: 100, forcedExitTime: null, cooldownMs: 0 },
@@ -726,6 +727,37 @@ test("청산된 종목은 같은 날 다시 매수 후보에서 제외된다", a
   assert.equal(again.reason, "NO_ELIGIBLE_CANDIDATE");
   assert.equal(again.evaluated[0].reason, "EXITED_TODAY");
   assert.equal(service.submitted.length, 1, "당일 재진입 금지 종목은 다시 매수하면 안 된다");
+});
+
+test("최대 보유시간으로 청산된 종목은 같은 날 다시 매수할 수 있다", async () => {
+  const service = fakeService();
+  let tick = BASE;
+  const auto = new KisPaperAutoTrader({
+    orderService: service,
+    settings: {
+      enabled: true, cooldownMs: 0, settlementGraceMs: 0, maxHoldingMs: 300_000,
+      forcedExitTime: null, entryConfirmMs: 0, maxConcurrentPositions: 5,
+    },
+    costModel: COST,
+    now: () => tick,
+  });
+  const held = [{ symbol: "005930", quantity: 10, averagePrice: 70_000, currentPrice: 70_050 }];
+  await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+
+  tick = BASE + 400_000;
+  const sell = await auto.evaluate({ candidates: [], balance: balance(10_000_000, held) });
+  assert.equal(sell.reason, "MAX_HOLDING_TIME");
+  assert.equal(sell.status, "ACCEPTED");
+
+  tick = BASE + 410_000;
+  const again = await auto.evaluate({
+    candidates: [candidate({
+      realtime: { state: "ENTRY_READY", latestAt: tick, metrics: { currentPrice: 70_000, spreadBps: 14, executionStrength: 110 } },
+    })],
+    balance: balance(),
+  });
+  assert.equal(again.action, "ORDER", "시간 청산 종목은 신호가 다시 나오면 재진입할 수 있다");
+  assert.equal(again.side, "BUY");
 });
 
 test("REJECTED된 매도는 당일 재진입 금지 기록을 남기지 않는다", async () => {
