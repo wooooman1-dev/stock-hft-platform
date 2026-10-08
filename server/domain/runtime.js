@@ -8,12 +8,22 @@ import { evaluateAutoStrategy } from "./strategyPolicy.js";
 import {
   DEFAULT_STRATEGY_SETTINGS,
   normalizeStrategySettings,
+  StrategySettingsError,
 } from "./strategySettings.js";
 
 export class InstrumentSwitchError extends Error {
   constructor(message, code, statusCode = 409) {
     super(message);
     this.name = "InstrumentSwitchError";
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+export class StrategyApprovalError extends Error {
+  constructor(message, code, statusCode = 404) {
+    super(message);
+    this.name = "StrategyApprovalError";
     this.code = code;
     this.statusCode = statusCode;
   }
@@ -32,6 +42,9 @@ export class MarketRuntime extends EventEmitter {
     instrumentPriceSource = "ENV_DEFAULT",
     instrumentQuoteFetchedAt = null,
     instrumentSelectedAt = null,
+    costModel = {},
+    marketSource = null,
+    maxMarketDataAgeMs = 5_000,
   } = {}) {
     super();
     this.symbol = symbol;
@@ -44,7 +57,7 @@ export class MarketRuntime extends EventEmitter {
     this.instrumentSelectedAt = nullableTimestamp(instrumentSelectedAt);
     this.now = now;
     this.simulator = new MarketSimulator(initialPrice, { tickSize: instrumentTickSize });
-    this.trader = new PaperTrader(10_000_000, { now });
+    this.trader = new PaperTrader(10_000_000, { now, costModel });
     this.executionJournalRecorder = new ExecutionJournalRecorder(executionJournal);
     this.positionRiskTracker = new PositionRiskTracker();
     this.strategySettingsStore = strategySettingsStore;
@@ -54,19 +67,84 @@ export class MarketRuntime extends EventEmitter {
     this.killSwitch = false;
     this.autoPaperTrading = false;
     this.lastAutoOrderAt = 0;
+    this.pendingApprovals = new Map();
+    this.approvalSequence = 0;
     this.timer = null;
-    const initialTick = this.simulator.next(this.now());
+    // 외부 시세 소스(예: LS증권 Open API)가 주어지면 내부 시뮬레이터 대신 그 이벤트로 구동한다.
+    this.marketSource = marketSource;
+    this.maxMarketDataAgeMs = maxMarketDataAgeMs;
+    this.feedError = null;
+    this.sourceStarted = false;
+    const initialTick = this.marketSource
+      ? createEmptyTick(initialPrice, this.now())
+      : this.simulator.next(this.now());
     this.snapshotValue = this.makeSnapshot(initialTick, 0);
     this.syncPositionRisk(initialTick.lastPrice, initialTick.timestamp);
+    if (this.marketSource) this.bindMarketSource();
   }
 
-  start() {
-    if (!this.timer) this.timer = setInterval(() => this.advance(), 200);
+  get tickSize() {
+    return this.marketSource?.tickSize ?? this.simulator.tickSize;
+  }
+
+  bindMarketSource() {
+    this.marketSource.on("tick", (tick) => this.handleTick(tick));
+    this.marketSource.on("status", (status) => {
+      const system = this.snapshotValue.system;
+      system.feedConnected = Boolean(status.connected);
+      system.connectionState = status.state ?? (status.connected ? "connected" : "disconnected");
+      system.mode = status.mode ?? this.marketSource.mode ?? system.mode;
+      system.provider = status.provider ?? this.marketSource.provider ?? system.provider;
+      if (status.connected) {
+        this.feedError = null;
+        system.lastError = null;
+      }
+      this.emitSnapshot();
+    });
+    this.marketSource.on("error", (error) => this.setFeedError(error));
+  }
+
+  async start() {
+    if (!this.marketSource) {
+      if (!this.timer) this.timer = setInterval(() => this.advance(), 200);
+      return;
+    }
+    if (this.sourceStarted) return;
+    this.sourceStarted = true;
+    try {
+      await this.marketSource.start();
+    } catch (error) {
+      this.sourceStarted = false;
+      this.setFeedError(error);
+    }
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.marketSource) {
+      this.marketSource.stop();
+      this.sourceStarted = false;
+    }
+  }
+
+  setFeedError(error) {
+    this.feedError = error instanceof Error ? error.message : String(error);
+    const system = this.snapshotValue.system;
+    system.feedConnected = false;
+    system.connectionState = "error";
+    system.lastError = this.feedError;
+    this.emitSnapshot();
+  }
+
+  getMarketDataIssue() {
+    if (!this.marketSource) return null;
+    if (!this.snapshotValue.system.feedConnected) return "시세 연결 끊김";
+    const lastEventAt = Number(this.snapshotValue.system.lastEventAt);
+    if (!Number.isFinite(lastEventAt) || this.now() - lastEventAt > this.maxMarketDataAgeMs) {
+      return "시세 데이터 지연";
+    }
+    return null;
   }
 
   snapshot() { return structuredClone(this.snapshotValue); }
@@ -99,11 +177,33 @@ export class MarketRuntime extends EventEmitter {
     return this.getStrategySettings();
   }
 
-  switchInstrument(input, { persist = null } = {}) {
-    const selection = normalizeRuntimeInstrument(input, this.now());
-    if (selection.symbol === this.symbol) {
-      return { changed: false, snapshot: this.snapshot() };
+  getStrategySettingsHistory() {
+    if (!this.strategySettingsStore) return [];
+    return this.strategySettingsStore.history();
+  }
+
+  restoreStrategySettings(version) {
+    if (!this.strategySettingsStore) {
+      throw new StrategySettingsError(
+        "전략 설정 저장소가 구성되지 않아 이전 버전을 복원할 수 없습니다.",
+        "STRATEGY_SETTINGS_STORE_UNAVAILABLE",
+      );
     }
+    this.strategySettings = this.strategySettingsStore.restore(version);
+    this.snapshotValue.strategy.settings = this.getStrategySettings();
+    this.emitSnapshot();
+    return this.getStrategySettings();
+  }
+
+  switchInstrument(input, { persist = null } = {}) {
+    if (this.marketSource) {
+      throw new InstrumentSwitchError(
+        "외부 시세 소스 모드에서는 실행 중 종목 변경을 지원하지 않습니다. 설정을 바꾼 뒤 재시작하세요.",
+        "INSTRUMENT_SWITCH_EXTERNAL_SOURCE",
+      );
+    }
+    const selection = normalizeRuntimeInstrument(input, this.now());
+    const sameSymbol = selection.symbol === this.symbol;
     const account = this.trader.snapshot(this.snapshotValue.lastPrice);
     if (this.autoPaperTrading) {
       throw new InstrumentSwitchError(
@@ -125,7 +225,9 @@ export class MarketRuntime extends EventEmitter {
     }
     if (account.orders.length !== 0) {
       throw new InstrumentSwitchError(
-        "다른 종목의 주문 내역이 섞이지 않도록 내부 모의계좌를 초기화한 뒤 종목을 변경하세요.",
+        sameSymbol
+          ? "최신 KIS 가격으로 다시 초기화하려면 내부 모의계좌를 먼저 초기화하세요."
+          : "다른 종목의 주문 내역이 섞이지 않도록 내부 모의계좌를 초기화한 뒤 종목을 변경하세요.",
         "INSTRUMENT_SWITCH_ACCOUNT_NOT_RESET",
       );
     }
@@ -150,7 +252,11 @@ export class MarketRuntime extends EventEmitter {
     this.snapshotValue.account = this.trader.snapshot(tick.lastPrice);
     this.syncPositionRisk(tick.lastPrice, tick.timestamp);
     this.emitSnapshot();
-    return { changed: true, snapshot: this.snapshot() };
+    return {
+      changed: !sameSymbol,
+      refreshed: sameSymbol,
+      snapshot: this.snapshot(),
+    };
   }
 
   submitOrder(sideOrInput, quantity, source = "MANUAL", emit = true) {
@@ -158,15 +264,17 @@ export class MarketRuntime extends EventEmitter {
       ? { ...sideOrInput }
       : { side: sideOrInput, quantity, source };
     const timestamp = Number.isFinite(Number(request.timestamp)) ? Number(request.timestamp) : this.now();
+    const marketDataIssue = this.getMarketDataIssue();
     const order = this.trader.submit({
       ...request,
       type: request.type ?? "MARKET",
       source: request.source ?? source,
       referencePrice: this.snapshotValue.lastPrice,
       book: this.snapshotValue.book,
-      tickSize: this.simulator.tickSize,
+      tickSize: this.tickSize,
       timestamp,
       killSwitch: this.killSwitch,
+      ...(marketDataIssue === null ? {} : { marketDataAvailable: false, marketDataReason: marketDataIssue }),
     });
     this.captureExecutionJournal();
     this.snapshotValue.account = this.trader.snapshot(this.snapshotValue.lastPrice);
@@ -192,7 +300,7 @@ export class MarketRuntime extends EventEmitter {
   }
 
   setAutoPaperTrading(enabled) {
-    this.autoPaperTrading = Boolean(enabled) && !this.killSwitch;
+    this.autoPaperTrading = Boolean(enabled) && !this.killSwitch && this.getMarketDataIssue() === null;
     this.snapshotValue.system.autoPaperTrading = this.autoPaperTrading;
     this.emitSnapshot();
   }
@@ -212,8 +320,14 @@ export class MarketRuntime extends EventEmitter {
   }
 
   advance(now = this.now()) {
+    this.handleTick(this.simulator.next(now));
+  }
+
+  handleTick(tick) {
     const startedAt = performance.now();
-    const tick = this.simulator.next(now);
+    if (this.marketSource && Number.isFinite(tick.previousClose) && tick.previousClose > 0) {
+      this.previousClose = tick.previousClose;
+    }
     this.snapshotValue = this.makeSnapshot(tick, Number((performance.now() - startedAt).toFixed(2)));
     this.trader.processOpenOrders({ book: tick.book, timestamp: tick.timestamp });
     this.captureExecutionJournal();
@@ -229,7 +343,7 @@ export class MarketRuntime extends EventEmitter {
     const metrics = calculateMicrostructureMetrics({
       book: tick.book,
       trades: tick.trades,
-      tickSize: this.simulator.tickSize,
+      tickSize: this.tickSize,
       now: tick.timestamp,
     });
     return {
@@ -241,7 +355,7 @@ export class MarketRuntime extends EventEmitter {
         priceSource: this.instrumentPriceSource,
         quoteFetchedAt: this.instrumentQuoteFetchedAt,
         selectedAt: this.instrumentSelectedAt,
-        simulation: true,
+        simulation: !this.marketSource,
       },
       timestamp: tick.timestamp,
       lastPrice: tick.lastPrice,
@@ -253,16 +367,20 @@ export class MarketRuntime extends EventEmitter {
       metrics,
       account: this.trader.snapshot(tick.lastPrice),
       riskLimits: this.trader.limits,
-      tickSize: this.simulator.tickSize,
+      tickSize: this.tickSize,
       strategy: {
         settings: this.getStrategySettings(),
         lastAutoOrderAt: this.lastAutoOrderAt,
         enabledOnRestart: false,
         riskState: this.positionRiskTracker.snapshot(),
+        pendingApprovals: this.getPendingApprovals(),
       },
       system: {
-        mode: "SIMULATION",
-        feedConnected: true,
+        mode: this.marketSource?.mode ?? "SIMULATION",
+        provider: this.marketSource?.provider ?? "INTERNAL_SIMULATOR",
+        feedConnected: this.marketSource ? Boolean(this.marketSource.connected) : true,
+        connectionState: this.marketSource ? (this.marketSource.connected ? "connected" : "starting") : "connected",
+        lastError: this.feedError ?? null,
         killSwitch: this.killSwitch,
         autoPaperTrading: this.autoPaperTrading,
         latencyMs,
@@ -298,7 +416,8 @@ export class MarketRuntime extends EventEmitter {
   }
 
   maybeRunStrategy(now = this.now()) {
-    if (!this.autoPaperTrading || this.killSwitch) return;
+    if (!this.autoPaperTrading || this.killSwitch || this.getMarketDataIssue() !== null) return;
+    this.expirePendingApprovals(now);
     let intent = evaluateAutoStrategy({
       metrics: this.snapshotValue.metrics,
       account: this.snapshotValue.account,
@@ -311,12 +430,21 @@ export class MarketRuntime extends EventEmitter {
     if (!intent) return;
 
     if (intent.side === "SELL") {
+      // 보호 청산(손절·트레일링·익절·최대보유시간)과 일반 매도신호는 반자동 승인 모드에서도
+      // 항상 즉시 실행한다. 승인 대기는 새 위험(진입)에만 적용하고 위험 축소를 지연시키지 않는다.
       this.cancelOpenOrdersForStrategyExit(now, intent.reason);
       const positionQuantity = this.snapshotValue.account.position.quantity;
       if (!Number.isInteger(positionQuantity) || positionQuantity <= 0) return;
       intent = { ...intent, quantity: positionQuantity };
+    } else if (this.strategySettings.approvalMode === "SEMI_AUTO") {
+      this.requestApproval(intent, now);
+      return;
     }
 
+    this.executeStrategyIntent(intent, now);
+  }
+
+  executeStrategyIntent(intent, now) {
     const reason = intent.reason.toLowerCase().replaceAll("_", "-");
     const order = this.submitOrder({
       side: intent.side,
@@ -330,6 +458,82 @@ export class MarketRuntime extends EventEmitter {
       this.lastAutoOrderAt = now;
       this.snapshotValue.strategy.lastAutoOrderAt = now;
     }
+    return order;
+  }
+
+  requestApproval(intent, now) {
+    const hasPending = [...this.pendingApprovals.values()].some((item) => item.status === "PENDING");
+    if (hasPending) return;
+    this.approvalSequence += 1;
+    const id = `approval-${now}-${this.approvalSequence}`;
+    const request = {
+      id,
+      side: intent.side,
+      quantity: intent.quantity,
+      reason: intent.reason,
+      requestedAt: now,
+      expiresAt: now + this.strategySettings.approvalExpiryMs,
+      status: "PENDING",
+      resolvedAt: null,
+      lastPriceAtRequest: this.snapshotValue.lastPrice,
+    };
+    this.pendingApprovals.set(id, request);
+    this.executionJournalRecorder.recordStrategyApproval("STRATEGY_APPROVAL_REQUESTED", { ...request }, now);
+    this.snapshotValue.strategy.pendingApprovals = this.getPendingApprovals();
+    this.emitSnapshot();
+  }
+
+  expirePendingApprovals(now) {
+    for (const request of this.pendingApprovals.values()) {
+      if (request.status !== "PENDING" || now < request.expiresAt) continue;
+      request.status = "EXPIRED";
+      request.resolvedAt = now;
+      this.executionJournalRecorder.recordStrategyApproval("STRATEGY_APPROVAL_EXPIRED", { ...request }, now);
+    }
+  }
+
+  approveOrder(id) {
+    const now = this.now();
+    this.expirePendingApprovals(now);
+    const request = this.pendingApprovals.get(String(id));
+    if (!request || request.status !== "PENDING") {
+      throw new StrategyApprovalError(
+        "승인 대기 중인 요청을 찾을 수 없습니다(이미 처리됐거나 만료됨).",
+        "STRATEGY_APPROVAL_NOT_FOUND",
+      );
+    }
+    request.status = "APPROVED";
+    request.resolvedAt = now;
+    this.executionJournalRecorder.recordStrategyApproval("STRATEGY_APPROVAL_APPROVED", { ...request }, now);
+    const order = this.executeStrategyIntent({ side: request.side, quantity: request.quantity, reason: request.reason }, now);
+    this.snapshotValue.strategy.pendingApprovals = this.getPendingApprovals();
+    this.emitSnapshot();
+    return order;
+  }
+
+  rejectOrder(id) {
+    const now = this.now();
+    this.expirePendingApprovals(now);
+    const request = this.pendingApprovals.get(String(id));
+    if (!request || request.status !== "PENDING") {
+      throw new StrategyApprovalError(
+        "승인 대기 중인 요청을 찾을 수 없습니다(이미 처리됐거나 만료됨).",
+        "STRATEGY_APPROVAL_NOT_FOUND",
+      );
+    }
+    request.status = "REJECTED";
+    request.resolvedAt = now;
+    this.executionJournalRecorder.recordStrategyApproval("STRATEGY_APPROVAL_REJECTED", { ...request }, now);
+    this.snapshotValue.strategy.pendingApprovals = this.getPendingApprovals();
+    this.emitSnapshot();
+    return structuredClone(request);
+  }
+
+  getPendingApprovals() {
+    return [...this.pendingApprovals.values()]
+      .sort((left, right) => right.requestedAt - left.requestedAt)
+      .slice(0, 20)
+      .map((request) => structuredClone(request));
   }
 
   captureExecutionJournal() {
@@ -351,6 +555,16 @@ export class MarketRuntime extends EventEmitter {
   }
 
   emitSnapshot() { this.emit("snapshot", this.snapshot()); }
+}
+
+function createEmptyTick(initialPrice, timestamp) {
+  return {
+    timestamp,
+    lastPrice: initialPrice,
+    book: { bids: [], asks: [] },
+    trades: [],
+    candles: [],
+  };
 }
 
 function normalizeRuntimeInstrument(input, selectedAt) {

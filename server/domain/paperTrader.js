@@ -2,6 +2,85 @@ const OPEN_STATUSES = new Set(["ACCEPTED", "PARTIALLY_FILLED"]);
 const VALID_SIDES = new Set(["BUY", "SELL"]);
 const VALID_TYPES = new Set(["MARKET", "LIMIT"]);
 
+// PaperTrader() 생성자의 기본값. 기존 단위테스트가 비용 0을 가정하므로 반드시 0으로 유지한다.
+const DEFAULT_COST_MODEL = Object.freeze({
+  buyCommissionBps: 0,
+  sellCommissionBps: 0,
+  sellTaxBps: 0,
+  slippageTicks: 0,
+});
+
+// 환경변수가 설정되지 않았을 때 실제 서버 실행에 적용되는 대략적인 참고값.
+// 온라인 위탁매매 수수료·거래세는 증권사·법령 개정에 따라 달라지므로 반드시 실제 계좌 정산내역과 대사해야 한다.
+const REFERENCE_DEFAULT_COST_MODEL = Object.freeze({
+  buyCommissionBps: 1.40527,
+  sellCommissionBps: 1.40527,
+  sellTaxBps: 20,
+  slippageTicks: 1,
+});
+
+export function loadPaperCostModel(env = process.env) {
+  return normalizeCostModel({
+    buyCommissionBps: env.PULSEHFT_PAPER_BUY_COMMISSION_BPS,
+    sellCommissionBps: env.PULSEHFT_PAPER_SELL_COMMISSION_BPS,
+    sellTaxBps: env.PULSEHFT_PAPER_SELL_TAX_BPS,
+    slippageTicks: env.PULSEHFT_PAPER_SLIPPAGE_TICKS,
+  }, REFERENCE_DEFAULT_COST_MODEL);
+}
+
+function normalizeCostModel(input, defaults = DEFAULT_COST_MODEL) {
+  const source = input && typeof input === "object" ? input : {};
+  const merged = { ...defaults };
+  for (const key of Object.keys(DEFAULT_COST_MODEL)) {
+    if (source[key] !== undefined && source[key] !== null && source[key] !== "") merged[key] = source[key];
+  }
+  return {
+    buyCommissionBps: nonNegativeNumber(merged.buyCommissionBps, "buyCommissionBps"),
+    sellCommissionBps: nonNegativeNumber(merged.sellCommissionBps, "sellCommissionBps"),
+    sellTaxBps: nonNegativeNumber(merged.sellTaxBps, "sellTaxBps"),
+    slippageTicks: nonNegativeInteger(merged.slippageTicks, "slippageTicks"),
+  };
+}
+
+function nonNegativeNumber(value, label) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new TypeError(`${label}는 0 이상의 숫자여야 합니다.`);
+  }
+  return number;
+}
+
+function nonNegativeInteger(value, label) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 0) {
+    throw new TypeError(`${label}는 0 이상의 정수여야 합니다.`);
+  }
+  return number;
+}
+
+const OVERRIDABLE_LIMIT_KEYS = new Set([
+  "maxOrderQuantity",
+  "maxPositionQuantity",
+  "maxPositionNotional",
+  "dailyLossLimit",
+]);
+
+function normalizeLimitsOverride(input) {
+  const source = input && typeof input === "object" ? input : {};
+  const overrides = {};
+  for (const key of Object.keys(source)) {
+    if (!OVERRIDABLE_LIMIT_KEYS.has(key)) continue;
+    const value = source[key];
+    if (value === undefined || value === null) continue;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) {
+      throw new TypeError(`${key}는 0보다 큰 숫자여야 합니다.`);
+    }
+    overrides[key] = number;
+  }
+  return overrides;
+}
+
 export class PaperOrderError extends Error {
   constructor(message, statusCode = 400, code = "PAPER_ORDER_ERROR") {
     super(message);
@@ -12,15 +91,17 @@ export class PaperOrderError extends Error {
 }
 
 export class PaperTrader {
-  constructor(initialCash = 10_000_000, { now = Date.now } = {}) {
+  constructor(initialCash = 10_000_000, { now = Date.now, costModel = {}, limits = {} } = {}) {
     this.limits = {
       maxOrderQuantity: 100,
       maxPositionQuantity: 200,
       maxPositionNotional: 20_000_000,
       dailyLossLimit: 500_000,
+      ...normalizeLimitsOverride(limits),
     };
     this.initialCash = initialCash;
     this.now = now;
+    this.costModel = normalizeCostModel(costModel);
     this.orderSequence = 0;
     this.fillSequence = 0;
     this.ordersById = new Map();
@@ -291,22 +372,33 @@ export class PaperTrader {
   }
 
   applyFill(order, { price, quantity, timestamp }) {
-    const value = price * quantity;
+    const slippageOffset = order.type === "MARKET" && this.costModel.slippageTicks > 0
+      ? this.costModel.slippageTicks * order.tickSize * (order.side === "BUY" ? 1 : -1)
+      : 0;
+    const executionPrice = Math.max(0, price + slippageOffset);
+    const value = executionPrice * quantity;
+    const commissionBps = order.side === "BUY" ? this.costModel.buyCommissionBps : this.costModel.sellCommissionBps;
+    const fee = Math.round(value * commissionBps / 10_000);
+    const tax = order.side === "SELL" ? Math.round(value * this.costModel.sellTaxBps / 10_000) : 0;
+    const costs = fee + tax;
+
     if (order.side === "BUY") {
       const currentQuantity = this.account.position.quantity;
       const nextQuantity = currentQuantity + quantity;
-      const totalCost = this.account.position.averagePrice * currentQuantity + value;
-      this.account.cash -= value;
+      const totalCost = this.account.position.averagePrice * currentQuantity + value + fee;
+      this.account.cash -= (value + fee);
       this.account.position = { quantity: nextQuantity, averagePrice: totalCost / nextQuantity };
     } else {
-      this.account.cash += value;
-      this.account.realizedPnl += (price - this.account.position.averagePrice) * quantity;
+      this.account.cash += (value - costs);
+      this.account.realizedPnl += (executionPrice - this.account.position.averagePrice) * quantity - costs;
       const remainingPosition = this.account.position.quantity - quantity;
       this.account.position = {
         quantity: remainingPosition,
         averagePrice: remainingPosition === 0 ? 0 : this.account.position.averagePrice,
       };
     }
+    this.account.totalFeesPaid += fee;
+    this.account.totalTaxPaid += tax;
 
     const previousValue = order.averageFilledPrice * order.filledQuantity;
     order.filledQuantity += quantity;
@@ -320,9 +412,12 @@ export class PaperTrader {
       orderId: order.id,
       timestamp,
       side: order.side,
-      price,
+      bookPrice: price,
+      price: executionPrice,
       quantity,
       value,
+      fee,
+      tax,
     };
     order.fills.push(fill);
     this.account.fills = [fill, ...this.account.fills].slice(0, 200);
@@ -386,6 +481,8 @@ export class PaperTrader {
       equity: this.initialCash,
       realizedPnl: 0,
       unrealizedPnl: 0,
+      totalFeesPaid: 0,
+      totalTaxPaid: 0,
       position: { quantity: 0, averagePrice: 0 },
       orders: [],
       fills: [],

@@ -15,10 +15,11 @@ const account = ({ quantity = 10, averagePrice = 10_000, sellableQuantity = quan
   sellableQuantity,
 });
 
-const riskState = ({ openedAt = 1_000, peakPrice = 10_000 } = {}) => ({
+const riskState = ({ openedAt = 1_000, peakPrice = 10_000, belowPeakSince = null } = {}) => ({
   quantity: 10,
   openedAt,
   peakPrice,
+  belowPeakSince,
 });
 
 test("risk exits are disabled by default and old persisted settings gain OFF fields", () => {
@@ -101,6 +102,74 @@ test("trailing stop uses peak price rather than average entry price", () => {
   assert.equal(intent.reason, "TRAILING_STOP");
   assert.ok(intent.diagnostics.returnBps > 0);
   assert.ok(intent.diagnostics.drawdownFromPeakBps >= 100);
+});
+
+// 2026-09-23: "0.7% 다 빠질 때까지 왜 기다리냐" 지적에 따라 트레일링 스톱을
+// "진입가 대비 문턱만큼 오른 적이 있으면(armed) 그 뒤 신고점을 못 찍고 조금만
+// 빠져도 폭 안 따지고 바로 판다"로 바꿨다.
+test("트레일링 스톱은 진입가 대비 문턱만큼 오르기 전에는(armed 전) 하락에도 발동하지 않는다", () => {
+  const intent = evaluatePositionRiskExit({
+    account: account({ averagePrice: 10_000 }),
+    settings: { ...DEFAULT_STRATEGY_SETTINGS, trailingStopBps: 100 },
+    now: 2_000,
+    // 고점이 진입가 대비 50bp밖에 안 올랐다(문턱 100bp 미달) — 아직 armed 전.
+    lastPrice: 10_040,
+    positionRiskState: riskState({ peakPrice: 10_050 }),
+  });
+  assert.equal(intent, null, "문턱을 넘어본 적이 없으면 하락 중이어도 매도하면 안 된다");
+});
+
+test("트레일링 스톱은 armed된 뒤에는 신고점 경신 중에는 발동하지 않는다", () => {
+  const intent = evaluatePositionRiskExit({
+    account: account({ averagePrice: 10_000 }),
+    settings: { ...DEFAULT_STRATEGY_SETTINGS, trailingStopBps: 100 },
+    now: 2_000,
+    // 현재가가 곧 신고점이다(peakPrice와 동일) — 계속 오르는 중이므로 매도 금지.
+    lastPrice: 10_150,
+    positionRiskState: riskState({ peakPrice: 10_150 }),
+  });
+  assert.equal(intent, null, "신고점을 계속 경신하는 동안은 매도하면 안 된다");
+});
+
+test("트레일링 스톱은 armed된 뒤 첫 하락 틱에서 폭과 무관하게 즉시 발동한다", () => {
+  const intent = evaluatePositionRiskExit({
+    account: account({ averagePrice: 10_000 }),
+    settings: { ...DEFAULT_STRATEGY_SETTINGS, trailingStopBps: 100 },
+    now: 2_000,
+    // 고점(10,150, 진입가 대비 150bp로 armed) 대비 딱 1원(1bp도 안 됨)만 빠졌다.
+    lastPrice: 10_149,
+    positionRiskState: riskState({ peakPrice: 10_150 }),
+  });
+  assert.equal(intent.reason, "TRAILING_STOP");
+  assert.ok(intent.diagnostics.drawdownFromPeakBps < 1, "폭이 문턱(100bp)보다 훨씬 작아도 발동해야 한다");
+});
+
+// 2026-09-23: 실시간 틱(observeTick)으로 더 자주 확인할수록 찰나의 호가 흔들림
+// 하나에 바로 팔릴 위험이 커진다 — trailingConfirmMs는 "고점 밑으로 내려온 상태가
+// 이만큼 유지돼야 진짜 하락으로 인정"하는 debounce다.
+test("trailingConfirmMs 설정 시, 고점 밑으로 내려온 지 얼마 안 됐으면 아직 발동하지 않는다", () => {
+  const intent = evaluatePositionRiskExit({
+    account: account({ averagePrice: 10_000 }),
+    settings: { ...DEFAULT_STRATEGY_SETTINGS, trailingStopBps: 100, trailingConfirmMs: 1_500 },
+    now: 12_000,
+    lastPrice: 10_149,
+    // 11_000시각에 처음 고점 밑으로 내려왔다 — 지금(12_000)까지 1000ms밖에 안 지났다.
+    positionRiskState: riskState({ peakPrice: 10_150, belowPeakSince: 11_000 }),
+  });
+  assert.equal(intent, null, "확인 시간(1500ms)이 아직 안 지났으면 팔면 안 된다");
+});
+
+test("trailingConfirmMs 설정 시, 확인 시간이 지나면 그제서야 발동한다", () => {
+  const intent = evaluatePositionRiskExit({
+    account: account({ averagePrice: 10_000 }),
+    settings: { ...DEFAULT_STRATEGY_SETTINGS, trailingStopBps: 100, trailingConfirmMs: 1_500 },
+    now: 12_600,
+    lastPrice: 10_149,
+    // 11_000시각에 처음 고점 밑으로 내려왔다 — 지금(12_600)까지 1600ms 지났다.
+    positionRiskState: riskState({ peakPrice: 10_150, belowPeakSince: 11_000 }),
+  });
+  assert.equal(intent.reason, "TRAILING_STOP");
+  assert.equal(intent.diagnostics.belowPeakMs, 1_600);
 });
 
 test("maximum holding time triggers at the exact boundary", () => {

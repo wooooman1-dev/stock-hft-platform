@@ -1,0 +1,181 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  assertTradeableConfiguration,
+  AutoTradingSettingsError,
+  calculateExpectedNetEdgeBps,
+  calculateRewardRiskRatio,
+  DEFAULT_AUTO_TRADING_SETTINGS,
+  loadAutoTradingSettings,
+  matchingTimeWindow,
+  normalizeAutoTradingSettings,
+} from "../domain/autoTradingSettings.js";
+
+// 2026-10-02 12:00 KST
+const KST_NOON = Date.parse("2026-10-02T03:00:00Z");
+
+test("v1로 저장된 설정의 익절 150(옛 기본값)은 현재 기본값으로 올리고, 직접 바꾼 값은 그대로 둔다", () => {
+  assert.equal(
+    normalizeAutoTradingSettings({ schemaVersion: 1, takeProfitBps: 150 }).takeProfitBps,
+    DEFAULT_AUTO_TRADING_SETTINGS.takeProfitBps,
+  );
+  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1, takeProfitBps: 300 }).takeProfitBps, 300);
+  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 2, takeProfitBps: 150 }).takeProfitBps, 150);
+  assert.equal(normalizeAutoTradingSettings({ schemaVersion: 1 }).schemaVersion, 2);
+});
+
+test("진입 금지 시간대는 시작 포함·끝 미포함으로 판정하고, 형식이 틀리면 거부한다", () => {
+  const windows = ["11:30-13:00"];
+  assert.equal(matchingTimeWindow(windows, KST_NOON), "11:30-13:00");
+  assert.equal(matchingTimeWindow(windows, Date.parse("2026-10-02T04:00:00Z")), null, "13:00은 끝이라 허용");
+  assert.equal(matchingTimeWindow(windows, Date.parse("2026-10-02T02:29:00Z")), null, "11:29는 허용");
+  assert.deepEqual(
+    [...normalizeAutoTradingSettings({ noEntryWindows: "09:00-09:10, 11:30-13:00" }).noEntryWindows],
+    ["09:00-09:10", "11:30-13:00"],
+    "환경변수처럼 쉼표로 이은 문자열도 받는다",
+  );
+  assert.deepEqual([...normalizeAutoTradingSettings({ noEntryWindows: [] }).noEntryWindows], []);
+  for (const bad of [["13:00-11:30"], ["11:30"], ["25:00-26:00"]]) {
+    assert.throws(() => normalizeAutoTradingSettings({ noEntryWindows: bad }), AutoTradingSettingsError);
+  }
+});
+
+test("손익비는 익절·손절 양쪽에 비용과 스프레드를 반영한다", () => {
+  // (250 - 22.81 - 14) / (100 + 22.81 + 14) = 213.19 / 136.81
+  const ratio = calculateRewardRiskRatio({ takeProfitBps: 250, stopLossBps: 100, costModel: COST, spreadBps: 14 });
+  assert.ok(Math.abs(ratio - 1.5583) < 0.001, `손익비 계산이 어긋난다: ${ratio}`);
+  assert.equal(calculateRewardRiskRatio({ takeProfitBps: null, stopLossBps: 100, costModel: COST }), null);
+});
+
+const COST = { buyCommissionBps: 1.40527, sellCommissionBps: 1.40527, sellTaxBps: 20 };
+
+test("설계 기본값을 그대로 사용한다", () => {
+  const settings = normalizeAutoTradingSettings({});
+  assert.equal(settings.enabled, false, "자동매매는 기본으로 꺼져 있어야 한다");
+  assert.equal(settings.minimumNetEdgeBps, 50);
+  assert.equal(settings.positionSizeRatio, 0.1);
+  // 2026-10-07 신호 측정으로 고가 근처 모멘텀 60분 보유 정책에 맞춰 바꿨다(autoTradingSettings.js 주석).
+  assert.equal(settings.stopLossBps, 300);
+  assert.equal(settings.takeProfitBps, 1_000);
+  assert.equal(settings.stopConfirmMs, 2_000);
+  assert.equal(settings.entryMinimumExecutionStrength, 90);
+  assert.equal(settings.entryMinimumVwapExtensionBps, -50);
+  assert.equal(settings.entryConfirmMs, 30_000);
+  assert.deepEqual([...settings.noEntryWindows], ["09:00-09:10", "11:30-13:00", "14:45-15:30"]);
+  assert.equal(settings.minimumStopTicks, 6);
+  assert.equal(settings.minimumRewardRiskRatio, 1.5);
+  assert.equal(settings.maxConsecutiveLossesPerDay, 0);
+  assert.equal(settings.trailingStopBps, null);
+  assert.equal(settings.maxHoldingMs, 3_600_000);
+  assert.equal(settings.forcedExitTime, "15:15");
+  assert.equal(settings.staleQuoteMs, 5_000);
+  assert.equal(settings.evaluationIntervalMs, 5_000);
+  assert.equal(settings.settlementGraceMs, 180_000);
+  assert.equal(settings.haltOnUnknownResult, true);
+  assert.equal(settings.haltOnReconciliationMismatch, true);
+});
+
+test("모든 항목을 설정으로 덮어쓸 수 있다", () => {
+  const settings = normalizeAutoTradingSettings({
+    enabled: true,
+    minimumNetEdgeBps: 80,
+    positionSizeRatio: 0.25,
+    entryMinimumConfidence: 70,
+    exitMinimumConfidence: 40,
+    maximumSpreadTicks: 1,
+    cooldownMs: 10_000,
+    stopLossBps: 60,
+    takeProfitBps: 200,
+    trailingStopBps: 40,
+    maxHoldingMs: 600_000,
+    forcedExitTime: "14:50",
+    staleQuoteMs: 3_000,
+    haltOnUnknownResult: false,
+    haltOnReconciliationMismatch: false,
+  });
+  assert.equal(settings.enabled, true);
+  assert.equal(settings.minimumNetEdgeBps, 80);
+  assert.equal(settings.positionSizeRatio, 0.25);
+  assert.equal(settings.forcedExitTime, "14:50");
+  assert.equal(settings.haltOnUnknownResult, false);
+});
+
+test("보호 청산과 강제 청산은 null로 끌 수 있다", () => {
+  const settings = normalizeAutoTradingSettings({
+    stopLossBps: null,
+    takeProfitBps: null,
+    trailingStopBps: null,
+    maxHoldingMs: null,
+    forcedExitTime: null,
+  });
+  assert.equal(settings.stopLossBps, null);
+  assert.equal(settings.takeProfitBps, null);
+  assert.equal(settings.forcedExitTime, null);
+});
+
+test("환경변수로 설정한다", () => {
+  const settings = loadAutoTradingSettings({
+    PULSEHFT_AUTO_TRADING_ENABLED: "true",
+    PULSEHFT_AUTO_TRADING_MIN_NET_EDGE_BPS: "75",
+    PULSEHFT_AUTO_TRADING_POSITION_SIZE_RATIO: "0.2",
+    PULSEHFT_AUTO_TRADING_FORCED_EXIT_TIME: "15:00",
+  });
+  assert.equal(settings.enabled, true);
+  assert.equal(settings.minimumNetEdgeBps, 75);
+  assert.equal(settings.positionSizeRatio, 0.2);
+  assert.equal(settings.forcedExitTime, "15:00");
+  // 지정하지 않은 항목은 기본값을 유지한다.
+  assert.equal(settings.takeProfitBps, DEFAULT_AUTO_TRADING_SETTINGS.takeProfitBps);
+});
+
+test("환경변수가 비어 있으면 기본값을 쓴다", () => {
+  const settings = loadAutoTradingSettings({});
+  assert.deepEqual({ ...settings }, { ...DEFAULT_AUTO_TRADING_SETTINGS });
+});
+
+test("범위를 벗어난 값과 알 수 없는 항목을 거부한다", () => {
+  const cases = [
+    [{ positionSizeRatio: 0 }, "비율 0"],
+    [{ positionSizeRatio: 1.5 }, "비율 1 초과"],
+    [{ entryMinimumConfidence: 101 }, "확신도 범위 초과"],
+    [{ minimumNetEdgeBps: -1 }, "음수 문턱"],
+    [{ maximumSpreadTicks: 1.5 }, "정수 아님"],
+    [{ forcedExitTime: "25:00" }, "잘못된 시각"],
+    [{ forcedExitTime: "1515" }, "형식 불일치"],
+    [{ staleQuoteMs: 0 }, "0 이하"],
+    [{ unknownKey: 1 }, "알 수 없는 항목"],
+  ];
+  for (const [input, label] of cases) {
+    assert.throws(
+      () => normalizeAutoTradingSettings(input),
+      AutoTradingSettingsError,
+      `${label}은 거부해야 한다`,
+    );
+  }
+});
+
+test("기대 순익은 고정비용과 실측 스프레드·슬리피지를 모두 뺀다", () => {
+  const net = calculateExpectedNetEdgeBps({
+    takeProfitBps: 150,
+    costModel: COST,
+    spreadBps: 25,
+    slippageBps: 6.3,
+  });
+  // 150 - (1.40527 + 1.40527 + 20) - 25 - 6.3
+  assert.ok(Math.abs(net - 95.889) < 0.01, `기대 순익 계산이 어긋난다: ${net}`);
+});
+
+test("익절 목표가 문턱과 고정비용의 합 이하이면 설정 오류로 거부한다", () => {
+  // 문턱 50 + 고정비용 22.81 = 72.81. 익절 70은 어떤 국면에서도 진입 불가.
+  assert.throws(
+    () => assertTradeableConfiguration(
+      normalizeAutoTradingSettings({ takeProfitBps: 70, minimumNetEdgeBps: 50 }),
+      COST,
+    ),
+    (error) => error.code === "AUTO_TRADING_UNREACHABLE_TARGET",
+  );
+  // 기본값(익절 150, 문턱 50)은 통과해야 한다.
+  assert.doesNotThrow(
+    () => assertTradeableConfiguration(normalizeAutoTradingSettings({}), COST),
+  );
+});

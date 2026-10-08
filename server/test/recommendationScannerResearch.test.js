@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { RecommendationScanner } from "../domain/recommendationScanner.js";
 
+// 기존(눌림목·반전·추세) 신호 로직을 검증하는 테스트들이라 legacy 신호를 켠다. 기본값은 꺼짐이다
+// (고가 근처 모멘텀만 진입 확인 단계에 오름 — 전용 테스트가 따로 있다).
 const settings = {
+  enableLegacyEntrySignals: true,
   cacheTtlMs: 15_000,
   maxUniverse: 10,
   maxEnriched: 3,

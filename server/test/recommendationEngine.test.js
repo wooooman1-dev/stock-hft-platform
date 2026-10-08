@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { estimateTarget, evaluateRecommendationCandidate } from "../domain/recommendationEngine.js";
+import { estimateTarget, evaluateRecommendationCandidate, screenPullbackShape } from "../domain/recommendationEngine.js";
 
+// 기존(눌림목·반전·추세) 신호 로직을 검증하는 테스트들이라 legacy 신호를 켠다. 기본값은 꺼짐이다
+// (고가 근처 모멘텀만 진입 확인 단계에 오름 — 전용 테스트가 따로 있다).
 const settings = {
+  enableLegacyEntrySignals: true,
   cacheTtlMs: 15_000,
   maxUniverse: 30,
   maxEnriched: 8,
@@ -110,6 +113,403 @@ test("급등·VWAP 과이격·상한가 근접 후보는 감시 점수와 무관
   assert.ok(result.blockReasons.some((reason) => reason.includes("상한가")));
 });
 
+// 2026-10-01: "상승추세 종목을 빨리 찾아야 하는데 못 찾는 것 같다"는 지적으로
+// 추가 — 한 번도 안 쉬고(눌림 없이) 꾸준히 신고점을 갱신하는 패턴은 PULLBACK/
+// REVERSAL 둘 다 핵심 가산점(눌림·반등 전제)을 못 받는다. MOMENTUM 경로가 이
+// 패턴을 잡아내 CONFIRMATION_REQUIRED까지 끌어올리는지 확인한다.
+test("눌림 없이 꾸준히 신고점을 갱신하는 후보는 MOMENTUM으로 분류되고 진입 확인 문턱에 도달한다", () => {
+  const bars = [
+    bar("090000", 10000, 10050, 9995, 10040, 1000),
+    bar("090100", 10040, 10090, 10030, 10080, 1000),
+    bar("090200", 10080, 10130, 10070, 10120, 1000),
+    bar("090300", 10120, 10170, 10110, 10160, 1000),
+    bar("090400", 10160, 10210, 10150, 10200, 1000),
+    bar("090500", 10200, 10250, 10190, 10240, 1000),
+    bar("090600", 10240, 10290, 10230, 10280, 1000),
+    bar("090700", 10280, 10330, 10270, 10320, 1000),
+    bar("090800", 10320, 10370, 10310, 10360, 1000),
+    bar("090900", 10360, 10410, 10350, 10400, 1000),
+  ];
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930",
+    name: "쉬지않고상승",
+    market: "KRX",
+    currentPrice: 10400,
+    changePercent: 4,
+    accumulatedTradingValue: 20_000_000_000,
+    tickSize: 10,
+    orderBook: { bestBid: 10390, bestAsk: 10400, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.equal(result.microstructure.pullbackDepthBps <= 20, true, "눌림이 거의 없어야 이 테스트의 전제가 성립한다");
+  assert.equal(result.candidateType, "MOMENTUM");
+  assert.notEqual(result.stage, "BLOCKED");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.ok(result.score >= 75);
+});
+
+// 2026-10-06 파미셀: 최근 4분봉이 -110bp 하락하는 중에 눌림목 점수 84로 진입해 반등
+// 없이 2분 만에 손절됐다. 재상승 가산점(16점)이 없어도 나머지 항목만으로 84점이
+// 나왔기 때문이다. 재상승 확인 전에는 진입 확인 단계(75점)에 오를 수 없어야 한다.
+test("눌리는 도중(재상승 확인 전)인 눌림목 후보는 다른 조건이 좋아도 WATCH에 머문다", () => {
+  const closes = [9800, 9850, 9900, 9950, 10000, 10050, 10040, 10010, 9990, 9970];
+  const bars = closes.map((close, index) => bar(
+    `09${String(index).padStart(2, "0")}00`,
+    close + 5,
+    close + 10,
+    close - 10,
+    close,
+    index < 6 ? 2000 : 900,
+  ));
+  const result = evaluateRecommendationCandidate({
+    symbol: "005690",
+    name: "눌림중",
+    currentPrice: 9970,
+    changePercent: 9,
+    accumulatedTradingValue: 20_000_000_000,
+    tickSize: 10,
+    orderBook: { bestBid: 9960, bestAsk: 9970, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.ok(result.microstructure.recentReturnBps < 0, "최근 분봉이 하락 중이라는 전제");
+  assert.equal(result.candidateType, "PULLBACK");
+  assert.equal(result.stage, "WATCH");
+  assert.ok(result.score <= 74);
+  assert.equal(result.reasons[0], "재상승 확인 전 — 진입 대기");
+});
+
+test("반전형도 재상승 확인 전에는 진입 확인 단계에 오르지 못한다", () => {
+  const closes = [10000, 9960, 9920, 9880, 9840, 9800, 9795, 9800, 9802, 9801];
+  const lows = [9990, 9950, 9910, 9870, 9830, 9790, 9785, 9790, 9795, 9798];
+  const bars = closes.map((close, index) => bar(
+    `09${String(index).padStart(2, "0")}00`, close, close + 10, lows[index], close, 1000,
+  ));
+  const result = evaluateRecommendationCandidate({
+    symbol: "000001",
+    name: "반전대기",
+    currentPrice: 9815,
+    changePercent: -0.5,
+    accumulatedTradingValue: 20_000_000_000,
+    executionStrength: 118,
+    tickSize: 10,
+    orderBook: { bestBid: 9810, bestAsk: 9815, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.ok(result.microstructure.recentReturnBps < 8, "아직 재상승이 확인되지 않았다는 전제");
+  assert.equal(result.candidateType, "REVERSAL");
+  assert.equal(result.stage, "WATCH");
+  assert.ok(result.score <= 74);
+});
+
+// 2026-10-07: 흐름은 15분봉, 타이밍은 1분봉으로 본다. 1분봉에서 짧게 눌렸다가 바닥에서
+// 다시 올라오는 후보가 15분 상승 흐름 안에 있을 때만 진입 확인 단계에 오른다.
+function pullbackResumeBars() {
+  return [
+    bar("090000", 10000, 10010, 9990, 10000, 2000),
+    bar("090100", 10000, 10040, 9995, 10030, 2200),
+    bar("090200", 10030, 10070, 10020, 10060, 2300),
+    bar("090300", 10060, 10100, 10050, 10090, 2400),
+    bar("090400", 10090, 10120, 10070, 10110, 2500),
+    bar("090500", 10110, 10130, 10090, 10100, 1000),
+    bar("090600", 10100, 10115, 10080, 10090, 900),
+    bar("090700", 10090, 10105, 10085, 10095, 800),
+    bar("090800", 10095, 10125, 10090, 10120, 1000),
+    bar("090900", 10120, 10145, 10110, 10140, 1200),
+  ];
+}
+
+function pullbackResumeCandidate(flowBars) {
+  return {
+    symbol: "005930",
+    name: "삼성전자",
+    currentPrice: 10140,
+    changePercent: 2.42,
+    accumulatedTradingValue: 20_000_000_000,
+    executionStrength: 118,
+    tickSize: 10,
+    orderBook: { bestBid: 10130, bestAsk: 10140, totalBidSize: 18000, totalAskSize: 12000 },
+    minuteBars: pullbackResumeBars(),
+    flowBars,
+    fetchedAt: Date.now(),
+  };
+}
+
+// 15분봉에서 상승 다리(10040→10200) 뒤 -59bp 눌린 상태(현재가 10140): 상승 흐름 속 눌림.
+const pullbackFlow = [
+  bar("090000", 10000, 10050, 9990, 10040, 5000),
+  bar("091500", 10040, 10150, 10030, 10110, 5000),
+  bar("093000", 10110, 10220, 10100, 10200, 5000),
+  bar("094500", 10200, 10205, 10130, 10150, 5000),
+];
+// 상승 다리 뒤 신고점 근처(눌림 없음).
+const atHighFlow = [
+  bar("090000", 10000, 10050, 9990, 10040, 5000),
+  bar("091500", 10040, 10100, 10030, 10090, 5000),
+  bar("093000", 10090, 10130, 10080, 10120, 5000),
+  bar("094500", 10120, 10145, 10110, 10140, 5000),
+];
+// 상승 다리 뒤 -500bp 넘게 빠져 구조가 깨진 상태.
+const brokenFlow = [
+  bar("090000", 10300, 10320, 10290, 10310, 5000),
+  bar("091500", 10310, 10400, 10300, 10390, 5000),
+  bar("093000", 10390, 10400, 9900, 9950, 5000),
+  bar("094500", 9950, 10000, 9880, 9900, 5000),
+];
+const fallingFlow = [
+  bar("090000", 10300, 10320, 10290, 10310, 5000),
+  bar("091500", 10310, 10320, 10250, 10260, 5000),
+  bar("093000", 10260, 10270, 10200, 10210, 5000),
+  bar("094500", 10210, 10220, 10150, 10160, 5000),
+];
+
+test("15분봉 상승 흐름 속 눌림에서 1분봉이 바닥에서 다시 오르면 확인되어 진입 확인 단계에 오른다", () => {
+  const result = evaluateRecommendationCandidate(pullbackResumeCandidate(pullbackFlow), settings);
+  assert.equal(result.candidateType, "PULLBACK");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.equal(result.pullbackRerise.confirmed, true);
+  assert.equal(result.pullbackRerise.source, "FLOW15");
+  assert.equal(result.pullbackRerise.flowState, "UPTREND_PULLBACK");
+  assert.ok(result.pullbackRerise.swingDepthBps >= 20, "눌림폭은 15분봉 기준이다");
+});
+
+test("15분봉에서 눌림이 아니거나(신고점 근처·구조 붕괴·하락·확인 불가) 눌림목은 WATCH에 머문다", () => {
+  const expectations = [
+    [atHighFlow, "15분봉 상승 흐름 속 눌림 아님 — 진입 대기"],
+    [brokenFlow, "15분봉 상승 흐름 속 눌림 아님 — 진입 대기"],
+    [fallingFlow, "15분봉 상승 흐름 속 눌림 아님 — 진입 대기"],
+    [[], "15분 흐름 확인 불가 — 진입 대기"],
+  ];
+  for (const [flow, reason] of expectations) {
+    const result = evaluateRecommendationCandidate(pullbackResumeCandidate(flow), settings);
+    assert.equal(result.stage, "WATCH", reason);
+    assert.ok(result.score <= 74);
+    assert.equal(result.reasons[0], reason);
+    assert.equal(result.pullbackRerise.confirmed, false);
+  }
+});
+
+// 2026-10-07: 장 초반(09:15~09:30)에는 15분봉이 2개뿐이다. 9시부터 오르는 종목을 놓치지 않도록
+// 2개로도 판단하되, 1개뿐이면 확인 불가다. 진행 중인 봉의 종가는 곧 현재가라서 눌림은 고가 기준으로 본다.
+test("장 초반 15분봉 2개로도 상승 흐름 속 눌림을 판단하고, 1개뿐이면 확인 불가로 막는다", () => {
+  const early = [
+    bar("090000", 10000, 10050, 9990, 10040, 5000),
+    bar("091500", 10040, 10220, 10030, 10140, 5000),
+  ];
+  const confirmed = evaluateRecommendationCandidate(pullbackResumeCandidate(early), settings);
+  assert.equal(confirmed.pullbackRerise.flowState, "UPTREND_PULLBACK");
+  assert.equal(confirmed.stage, "CONFIRMATION_REQUIRED");
+  assert.equal(confirmed.pullbackRerise.confirmed, true);
+
+  const tooEarly = evaluateRecommendationCandidate(pullbackResumeCandidate(early.slice(0, 1)), settings);
+  assert.equal(tooEarly.stage, "WATCH");
+  assert.equal(tooEarly.reasons[0], "15분 흐름 확인 불가 — 진입 대기");
+});
+
+test("15분봉 눌림이어도 1분봉이 아직 하락 중(바닥이 방금 찍힘)이면 WATCH에 머문다", () => {
+  const closes = [9800, 9850, 9900, 9950, 10000, 10050, 10040, 10010, 9990, 9970];
+  const bars = closes.map((close, index) => bar(
+    `09${String(index).padStart(2, "0")}00`, close + 5, close + 10, close - 10, close, index < 6 ? 2000 : 900,
+  ));
+  const flow = [
+    bar("090000", 9800, 9850, 9790, 9840, 5000),
+    bar("091500", 9840, 10000, 9830, 9990, 5000),
+    bar("093000", 9990, 10060, 9980, 10050, 5000),
+    bar("094500", 10050, 10055, 9960, 9980, 5000),
+  ];
+  const result = evaluateRecommendationCandidate({
+    ...pullbackResumeCandidate(flow), currentPrice: 9970, minuteBars: bars,
+    orderBook: { bestBid: 9960, bestAsk: 9970, totalBidSize: 18000, totalAskSize: 10000 },
+  }, settings);
+  assert.equal(result.pullbackRerise.flowState, "UPTREND_PULLBACK", "전제: 15분봉으로는 눌림이다");
+  assert.equal(result.stage, "WATCH");
+  assert.equal(result.pullbackRerise.confirmed, false);
+  assert.equal(result.reasons[0], "재상승 확인 전 — 진입 대기");
+});
+
+test("15분봉 신고점 근처에서 계속 오르는 추세형 후보는 15분 흐름이 있으면 진입 확인 단계에 오른다", () => {
+  const bars = [];
+  for (let index = 0; index < 10; index += 1) {
+    const close = 10000 + index * 40 + 40;
+    bars.push(bar(`09${String(index).padStart(2, "0")}00`, close - 40, close + 10, close - 45, close, 1000));
+  }
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930", name: "추세", currentPrice: 10400, changePercent: 4,
+    accumulatedTradingValue: 20_000_000_000, tickSize: 10,
+    orderBook: { bestBid: 10390, bestAsk: 10400, totalBidSize: 18000, totalAskSize: 10000 },
+    minuteBars: bars, flowBars: [
+      bar("090000", 10000, 10100, 9990, 10080, 5000),
+      bar("091500", 10080, 10250, 10070, 10240, 5000),
+      bar("093000", 10240, 10420, 10230, 10400, 5000),
+    ], fetchedAt: Date.now(),
+  }, settings);
+  assert.equal(result.candidateType, "MOMENTUM");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.equal(result.pullbackRerise.flowState, "UPTREND_AT_HIGH");
+});
+
+test("screenPullbackShape는 눌린 뒤 재상승 중인 1분봉에 가장 높은 우선순위를 준다", () => {
+  const resume = screenPullbackShape({ symbol: "005930", currentPrice: 10140, tickSize: 10 }, pullbackResumeBars());
+  assert.equal(resume.priority, 3);
+  const flat = Array.from({ length: 10 }, (_, index) => bar(`09${String(index).padStart(2, "0")}00`, 10000, 10005, 9995, 10000, 1000));
+  assert.equal(screenPullbackShape({ symbol: "005930", currentPrice: 10000, tickSize: 10 }, flat).priority, 0);
+  assert.equal(screenPullbackShape({ symbol: "005930", currentPrice: 10000, tickSize: 10 }, flat.slice(0, 3)).priority, -1);
+});
+
+// 2026-10-07: 신호 단위 측정에서 이 구간만 비용을 넘는 방향성이 있었다(고가 150bp 이내 + 등락률
+// 2.5~8.7%, 60분 보유 평균 +23.5bp). 기존 신호는 기본값에서 75점 미만에 묶인다.
+function highMomentumCandidate(overrides = {}) {
+  const bars = Array.from({ length: 10 }, (_, index) => bar(
+    `09${String(index).padStart(2, "0")}00`, 10000 + index * 5, 10020 + index * 5, 9990 + index * 5, 10010 + index * 5, 1000,
+  ));
+  return {
+    symbol: "005930", name: "고가근처", currentPrice: 10_055, highPrice: 10_070, changePercent: 5,
+    accumulatedTradingValue: 20_000_000_000, tickSize: 10,
+    orderBook: { bestBid: 10_050, bestAsk: 10_060, totalBidSize: 10_000, totalAskSize: 14_000 },
+    minuteBars: bars, fetchedAt: Date.now(), ...overrides,
+  };
+}
+
+test("당일 고가 근처에서 적정 등락률이면 기본 설정에서 HIGH_MOMENTUM으로 진입 확인 단계에 오른다", () => {
+  const result = evaluateRecommendationCandidate(highMomentumCandidate(), { ...settings, enableLegacyEntrySignals: false });
+  assert.equal(result.candidateType, "HIGH_MOMENTUM");
+  assert.equal(result.stage, "CONFIRMATION_REQUIRED");
+  assert.ok(result.score >= 76);
+  assert.equal(result.highMomentum.qualifies, true);
+  assert.ok(result.highMomentum.nearHighBps <= 150);
+});
+
+test("고가에서 멀거나 등락률이 범위 밖이면 HIGH_MOMENTUM이 아니고 WATCH 이하에 머문다", () => {
+  const config = { ...settings, enableLegacyEntrySignals: false };
+  for (const overrides of [
+    { highPrice: 10_600 }, // 고가에서 약 520bp
+    { changePercent: 1.5 },
+    { changePercent: 9.5 },
+  ]) {
+    const result = evaluateRecommendationCandidate(highMomentumCandidate(overrides), config);
+    assert.notEqual(result.candidateType, "HIGH_MOMENTUM", JSON.stringify(overrides));
+    assert.notEqual(result.stage, "CONFIRMATION_REQUIRED", JSON.stringify(overrides));
+    assert.ok(result.score <= 74);
+  }
+});
+
+test("기존 신호는 legacy가 꺼져 있으면(기본값) 점수가 아무리 높아도 진입 확인 단계에 못 오른다", () => {
+  const off = evaluateRecommendationCandidate(pullbackResumeCandidate(pullbackFlow), { ...settings, enableLegacyEntrySignals: false });
+  assert.equal(off.stage, "WATCH");
+  assert.ok(off.score <= 74);
+  assert.equal(off.reasons[0], "고가 근처·적정 상승 조건 미충족 — 진입 대기");
+  const on = evaluateRecommendationCandidate(pullbackResumeCandidate(pullbackFlow), { ...settings, enableLegacyEntrySignals: true });
+  assert.equal(on.stage, "CONFIRMATION_REQUIRED", "같은 후보가 legacy를 켜면 예전처럼 통과한다");
+});
+
+test("screenPullbackShape는 고가 근처 모멘텀 모양에 가장 높은 우선순위를 준다", () => {
+  const bars = highMomentumCandidate().minuteBars;
+  assert.equal(
+    screenPullbackShape({ symbol: "005930", currentPrice: 10_055, changePercent: 5, tickSize: 10 }, bars).priority,
+    4,
+  );
+});
+
+test("신규상장 종목은 당일 상승률·상한가 근접 가드가 완화되지만 VWAP 이격 가드는 유지된다", () => {
+  const bars = Array.from({ length: 10 }, (_, index) => bar(
+    `09${String(index).padStart(2, "0")}00`,
+    10000 + index * 100,
+    10100 + index * 100,
+    9950 + index * 100,
+    10050 + index * 100,
+    1000,
+  ));
+  const result = evaluateRecommendationCandidate({
+    symbol: "069500",
+    name: "새내기전자",
+    isNewlyListed: true,
+    daysSinceListing: 3,
+    listingDate: "2026-09-21",
+    currentPrice: 12500,
+    previousClose: 10000,
+    openPrice: 10100,
+    highPrice: 12600,
+    lowPrice: 10000,
+    upperLimitPrice: 13000,
+    changePercent: 25,
+    accumulatedTradingValue: 100_000_000_000,
+    executionStrength: 140,
+    tickSize: 10,
+    orderBook: { bestBid: 12490, bestAsk: 12500, totalBidSize: 20000, totalAskSize: 10000 },
+    minuteBars: bars,
+    fetchedAt: Date.now(),
+  }, settings);
+  assert.equal(result.isNewlyListed, true);
+  assert.equal(result.daysSinceListing, 3);
+  assert.equal(result.blockReasons.some((reason) => reason.includes("당일 상승률")), false);
+  assert.equal(result.blockReasons.some((reason) => reason.includes("상한가")), false);
+  assert.ok(result.blockReasons.some((reason) => reason.includes("VWAP")));
+});
+
 function bar(time, open, high, low, close, volume) {
   return { time, open, high, low, close, volume };
 }
+
+// 2026-09-10 확인: 통합 시장구분으로 분봉을 조회하면 30행이 전부 0으로 돌아왔는데,
+// 평가 단계가 이를 "분봉 8개 미만"으로 뭉개 데이터 결함이 전략 판정처럼 보였다.
+test("분봉 응답이 전부 빈 값이면 데이터 결함으로 구분해 표시한다", () => {
+  const zeroBars = Array.from({ length: 30 }, (_, i) => ({
+    time: String(90000 + i), open: 0, high: 0, low: 0, close: 0, volume: 0,
+  }));
+  const result = evaluateRecommendationCandidate({
+    symbol: "036930",
+    currentPrice: 202500,
+    accumulatedTradingValue: 76_995_647_250,
+    executionStrength: 118,
+    tickSize: 500,
+    orderBook: { bestBid: 202000, bestAsk: 202500, tickSize: 500 },
+    minuteBars: zeroBars,
+  });
+  const joined = result.blockReasons.join(" | ");
+  assert.match(joined, /분봉 응답 30건이 모두 빈 값/);
+  assert.doesNotMatch(joined, /분봉 데이터 8개 미만/, "빈 응답을 개수 부족으로 뭉개면 안 된다");
+});
+
+test("분봉이 실제로 모자란 경우는 종전대로 개수 부족으로 표시한다", () => {
+  const fewBars = Array.from({ length: 3 }, (_, i) => ({
+    time: String(90000 + i), open: 100, high: 101, low: 99, close: 100, volume: 10,
+  }));
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930",
+    currentPrice: 100,
+    accumulatedTradingValue: 76_995_647_250,
+    executionStrength: 118,
+    tickSize: 1,
+    orderBook: { bestBid: 99, bestAsk: 100, tickSize: 1 },
+    minuteBars: fewBars,
+  });
+  const joined = result.blockReasons.join(" | ");
+  assert.match(joined, /분봉 데이터 8개 미만/);
+  assert.doesNotMatch(joined, /모두 빈 값/);
+});
+
+// REST 체결강도는 순위 API마다 필드가 달라 결측될 수 있다. 그러나 ENTRY_READY의
+// 체결강도 게이트는 실시간 체결이 판정하므로, REST 결측만으로 차단해서는 안 된다.
+test("REST 체결강도 결측은 차단하지 않고 dataCompleteness로만 드러낸다", () => {
+  const bars = Array.from({ length: 20 }, (_, i) => ({
+    time: String(90000 + i), open: 100, high: 101, low: 99, close: 100, volume: 10,
+  }));
+  const result = evaluateRecommendationCandidate({
+    symbol: "005930",
+    currentPrice: 100,
+    accumulatedTradingValue: 76_995_647_250,
+    executionStrength: null,
+    tickSize: 1,
+    orderBook: { bestBid: 99, bestAsk: 100, tickSize: 1 },
+    minuteBars: bars,
+  });
+  assert.equal(
+    result.blockReasons.some((reason) => reason.includes("체결강도")),
+    false,
+    "REST 체결강도 결측으로 차단하면 안 된다",
+  );
+  assert.equal(result.dataCompleteness.complete, 5);
+  assert.equal(result.dataCompleteness.total, 6);
+});

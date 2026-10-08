@@ -1,8 +1,16 @@
+// minimumExecutionStrength(체결강도) 100은 "매수 체결량이 매도 체결량과 같거나
+// 더 많아야 함"을 뜻한다 — 반전형(하락 후 반등 노리는) 후보는 반등이 막 시작된
+// 순간엔 매도세가 아직 다 안 꺼져 있어서 이 기준을 거의 못 넘는다(2026-09-23,
+// 호가 불균형은 여유 있게 통과하는데 체결강도만 93~99 근처에서 계속 못 넘어
+// 8분간 20여 회 평가 전부 적격 후보 0건이었다). 다른 하드 기준(호가 불균형
+// 5%, 스프레드 25bp)은 그대로 두고 이것만 80으로 낮춘다.
 const DEFAULTS = Object.freeze({
   staleAfterMs: 5_000,
   maxSpreadBps: 25,
-  minimumBookImbalance: 0.05,
-  minimumExecutionStrength: 100,
+  // 매수호가 우위일수록 이후 수익이 나빴다(스냅샷 11,792개 5분위: 우위 구간 30분 -14bp, 매도 우위
+  // 구간 +23bp, 2026-10-07). 게이트가 나쁜 쪽을 고르고 있어 끈다(-1 = 항상 통과).
+  minimumBookImbalance: -1,
+  minimumExecutionStrength: 80,
   maximumRealtimeChaseBps: 150,
 });
 

@@ -1,0 +1,79 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+
+const tabsSource = readFileSync(new URL("../../public/recommendationTabs.js", import.meta.url), "utf8");
+const indexSource = readFileSync(new URL("../../public/index.html", import.meta.url), "utf8");
+const appSource = readFileSync(new URL("../../public/app.js", import.meta.url), "utf8");
+const orderHistorySource = readFileSync(new URL("../../public/kisOrderHistory.js", import.meta.url), "utf8");
+
+test("recommendation workspace loads the tab adapter after the existing panel", () => {
+  const panelIndex = indexSource.indexOf('/recommendationPanel.js');
+  const tabsIndex = indexSource.indexOf('/recommendationTabs.js');
+  assert.ok(panelIndex >= 0);
+  assert.ok(tabsIndex > panelIndex);
+  assert.match(indexSource, /app\.js\?v=6/);
+  assert.match(indexSource, /kisOrderHistory\.js\?v=2/);
+  assert.match(indexSource, /recommendationTabs\.js\?v=11/);
+});
+
+test("recommendation workspace can be isolated without loading the tab adapter", () => {
+  assert.match(indexSource, /noRecommendationTabs/);
+  assert.match(indexSource, /await import\("\/recommendationTabs\.js\?v=11"\)/);
+});
+
+test("recommendation list is the default view with a one-way back button, not a two-way tab bar", () => {
+  assert.match(tabsSource, /pendingInitialView = VIEW_RECOMMENDATIONS/);
+  assert.match(tabsSource, /data-recommendation-back/);
+  assert.doesNotMatch(tabsSource, /data-recommendation-tab/);
+  assert.doesNotMatch(tabsSource, /ArrowLeft|ArrowRight/);
+  assert.match(tabsSource, /position:static!important/);
+  assert.match(tabsSource, /panel\.removeAttribute\("aria-modal"\)/);
+  assert.match(tabsSource, /openRecommendationPanel\(\)/);
+});
+
+test("workspace tabs live outside the snapshot-rendered app tree", () => {
+  assert.match(appSource, /app\.replaceChildren\(/);
+  assert.match(tabsSource, /tabsPortal\.className = "recommendation-tabs-portal"/);
+  assert.match(tabsSource, /document\.body\.append\(tabsPortal\)/);
+  assert.match(tabsSource, /tabsPortal\.querySelector\("\.recommendation-back-button"\)/);
+  assert.doesNotMatch(tabsSource, /topStatus\.insertBefore\(tabs/);
+  assert.match(tabsSource, /positionTabs\(topStatus\)/);
+});
+
+test("workspace observers cannot observe their own tab mutations", () => {
+  assert.match(
+    tabsSource,
+    /new MutationObserver\(scheduleEnsureTabs\)\.observe\(app, \{ childList: true \}\)/,
+  );
+  assert.doesNotMatch(
+    tabsSource,
+    /observe\(app, \{ childList: true, subtree: true \}\)/,
+  );
+  assert.match(tabsSource, /panelObserver\.observe\(panel, \{ childList: true \}\)/);
+});
+
+test("main dashboard uses KIS values and KIS paper order APIs", () => {
+  assert.match(appSource, /KIS PROD READ-ONLY/);
+  assert.match(appSource, /KIS PAPER ACCOUNT/);
+  assert.match(appSource, /\/api\/kis\/paper\/orders/);
+  assert.match(appSource, /\/api\/kis\/paper\/orders\/cancel/);
+  assert.match(appSource, /\/api\/kis\/main\/refresh/);
+  assert.match(appSource, /window\.confirm\(/);
+  assert.match(appSource, /ACCEPTED는 증권사 주문 접수/);
+  assert.doesNotMatch(appSource, /request\("\/api\/paper\/orders/);
+  assert.doesNotMatch(appSource, /data-action="auto"/);
+});
+
+test("main order list prioritizes KIS broker fill history with journal fallback", () => {
+  assert.match(orderHistorySource, /latestSnapshot\.account/);
+  assert.match(orderHistorySource, /orderHistoryFetchedAt/);
+  assert.match(orderHistorySource, /orderHistoryError/);
+  assert.match(orderHistorySource, /전량체결/);
+  assert.match(orderHistorySource, /부분체결/);
+  assert.match(orderHistorySource, /미체결/);
+  assert.match(orderHistorySource, /평균체결가/);
+  assert.match(orderHistorySource, /서버 실행 저널을 임시 표시/);
+  assert.match(orderHistorySource, /오늘 KIS 주문·체결내역이 없습니다/);
+  assert.match(orderHistorySource, /data-action="cancel-order"/);
+});

@@ -139,12 +139,52 @@ export function publicKisPaperConfiguration(config) {
   };
 }
 
+// 한도의 허용 범위. 화면에서 조절할 때도 같은 규칙을 쓴다.
+// 모의계좌 전용이다 — 실전(kisLiveConfig)의 한도는 런타임 변경을 허용하지 않는다.
+// 기본값(fallback)은 2026-10-08부터 실전 자동매매의 "소액 시험" 한도와 같다(종목당 20만원, 일 주문 30건,
+// 일 손실 5만원, 연속 손실 3회) — 모의가 실전과 같은 조건에서 돌아야 두 화면이 헷갈리지 않는다.
+// 예전 기본값은 100주/1,000,000원/200건/2,000,000원/연속 손실 해제였다.
+export const KIS_PAPER_LIMIT_BOUNDS = Object.freeze({
+  maxOrderQuantity: { fallback: 1_000, minimum: 1, maximum: 10_000 },
+  maxOrderValue: { fallback: 200_000, minimum: 1, maximum: 10_000_000_000 },
+  maxDailyOrders: { fallback: 30, minimum: 1, maximum: 10_000 },
+  maxDailyLoss: { fallback: 50_000, minimum: 0, maximum: 10_000_000_000 },
+  maxConsecutiveLosses: { fallback: 3, minimum: 0, maximum: 100 },
+});
+
+// 부분 입력을 받아 현재 한도 위에 덮어쓴다. 범위를 벗어나면 거부한다.
+export function normalizeKisPaperLimits(input = {}, current = null) {
+  if (input === null || typeof input !== "object") {
+    throw new KisPaperConfigurationError(
+      "모의투자 안전 한도는 객체여야 합니다.",
+      "KIS_PAPER_LIMIT_INVALID",
+    );
+  }
+  const unknown = Object.keys(input).filter((key) => !(key in KIS_PAPER_LIMIT_BOUNDS));
+  if (unknown.length > 0) {
+    throw new KisPaperConfigurationError(
+      `허용되지 않은 한도 항목입니다: ${unknown.join(", ")}`,
+      "KIS_PAPER_LIMIT_INVALID",
+    );
+  }
+  const next = {};
+  for (const [key, bound] of Object.entries(KIS_PAPER_LIMIT_BOUNDS)) {
+    const provided = input[key];
+    const base = current?.[key] ?? bound.fallback;
+    next[key] = provided === undefined || provided === null || String(provided).trim() === ""
+      ? base
+      : integerEnv(provided, base, bound.minimum, bound.maximum);
+  }
+  return Object.freeze(next);
+}
+
 function defaultLimits(env) {
-  return Object.freeze({
-    maxOrderQuantity: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_ORDER_QUANTITY, 10, 1, 10_000),
-    maxOrderValue: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_ORDER_VALUE, 1_000_000, 1, 10_000_000_000),
-    maxDailyOrders: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_DAILY_ORDERS, 20, 1, 10_000),
-    maxDailyLoss: integerEnv(env.PULSEHFT_KIS_PAPER_MAX_DAILY_LOSS, 100_000, 0, 10_000_000_000),
+  return normalizeKisPaperLimits({
+    maxOrderQuantity: env.PULSEHFT_KIS_PAPER_MAX_ORDER_QUANTITY,
+    maxOrderValue: env.PULSEHFT_KIS_PAPER_MAX_ORDER_VALUE,
+    maxDailyOrders: env.PULSEHFT_KIS_PAPER_MAX_DAILY_ORDERS,
+    maxDailyLoss: env.PULSEHFT_KIS_PAPER_MAX_DAILY_LOSS,
+    maxConsecutiveLosses: env.PULSEHFT_KIS_PAPER_MAX_CONSECUTIVE_LOSSES,
   });
 }
 

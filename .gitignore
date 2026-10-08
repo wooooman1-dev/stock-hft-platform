@@ -8,3 +8,6 @@ coverage/
 .vscode/
 .idea/
 .pulsehft/
+# 자격정보 백업본이 실수로 커밋되지 않도록 차단
+.env.bak*
+.env.*.bak

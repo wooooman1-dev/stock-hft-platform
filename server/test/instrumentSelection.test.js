@@ -76,6 +76,7 @@ test("runtime switches the main symbol and rebuilds simulation from the KIS quot
     persist: (selection) => { persisted = selection; },
   });
   assert.equal(result.changed, true);
+  assert.equal(result.refreshed, false);
   assert.equal(result.snapshot.symbol, "000660");
   assert.equal(result.snapshot.symbolName, "SK하이닉스");
   assert.equal(result.snapshot.previousClose, 1_322_000);
@@ -137,7 +138,34 @@ test("runtime blocks mixed order history until the internal paper account is res
   ));
 });
 
-test("selecting the already active symbol is idempotent and does not reset state", () => {
+test("selecting the active symbol refreshes the simulator from the latest KIS quote", () => {
+  const runtime = createRuntime();
+  let persisted = null;
+  const result = runtime.switchInstrument({
+    symbol: "005930",
+    symbolName: "삼성전자",
+    market: "KOSPI",
+    securityType: "주식",
+    initialPrice: 240_750,
+    previousClose: 239_000,
+    tickSize: 50,
+    priceSource: "KIS_PROD_READ_ONLY",
+    quoteFetchedAt: 1_785_585_800_000,
+  }, {
+    persist: (selection) => { persisted = selection; },
+  });
+  assert.equal(result.changed, false);
+  assert.equal(result.refreshed, true);
+  assert.equal(result.snapshot.symbol, "005930");
+  assert.equal(result.snapshot.previousClose, 239_000);
+  assert.equal(result.snapshot.tickSize, 50);
+  assert.equal(result.snapshot.instrument.priceSource, "KIS_PROD_READ_ONLY");
+  assert.equal(result.snapshot.instrument.quoteFetchedAt, 1_785_585_800_000);
+  assert.equal(result.snapshot.account.orders.length, 0);
+  assert.equal(persisted.initialPrice, 240_750);
+});
+
+test("same-symbol refresh cannot erase internal paper order history", () => {
   const runtime = createRuntime();
   runtime.submitOrder({
     side: "SELL",
@@ -146,15 +174,16 @@ test("selecting the already active symbol is idempotent and does not reset state
     clientOrderId: "same-symbol-history",
   });
   const before = runtime.snapshot();
-  const result = runtime.switchInstrument({
+  assert.throws(() => runtime.switchInstrument({
     symbol: "005930",
     symbolName: "삼성전자",
     initialPrice: before.lastPrice,
     previousClose: before.previousClose,
     tickSize: before.tickSize,
     priceSource: "KIS_PROD_READ_ONLY",
-  });
-  assert.equal(result.changed, false);
-  assert.equal(result.snapshot.account.orders.length, 1);
-  assert.equal(result.snapshot.symbol, "005930");
+  }), (error) => (
+    error instanceof InstrumentSwitchError
+    && error.code === "INSTRUMENT_SWITCH_ACCOUNT_NOT_RESET"
+  ));
+  assert.equal(runtime.snapshot().account.orders.length, 1);
 });
