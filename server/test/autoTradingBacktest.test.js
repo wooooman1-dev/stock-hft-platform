@@ -66,10 +66,10 @@ test("기록을 시간순으로 흘려 실제 자동매매로 진입하고, 호�
   assert.ok(trade.openedAt - START >= 30_000, "ENTRY_READY가 30초 이어진 뒤에 산다");
 });
 
-test("체결강도가 100 미만이면 새 규칙에서는 사지 않는다", async () => {
+test("체결강도가 기준(90) 미만이면 새 규칙에서는 사지 않는다", async () => {
   const events = [scannerRefresh(START, CANDIDATE)];
   for (let second = 0; second <= 60; second += 1) {
-    events.push(marketData(START + second * 1_000, { bid: 10_000, ask: 10_010, price: 10_000, strength: 92 }));
+    events.push(marketData(START + second * 1_000, { bid: 10_000, ask: 10_010, price: 10_000, strength: 85 }));
   }
   const result = await backtestAutoTrading(events, { settings: { forcedExitTime: null } });
   assert.equal(result.summary.tradeCount, 0);

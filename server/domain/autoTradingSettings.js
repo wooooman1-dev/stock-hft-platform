@@ -30,7 +30,8 @@ export const DEFAULT_AUTO_TRADING_SETTINGS = Object.freeze({
   // 036930(주성엔지니어링)을 당일 VWAP -193bp·체결강도 91.8(매도 우위, 하락 중)·점심시간에
   // 2~3틱 반등 점수만 보고 샀다가 손절됐다. 아래 조건은 전부 자동매매 진입에만 적용된다.
   // 체결강도가 이 값 이상(100=매수·매도 체결이 같음)일 때만 진입한다. null이면 보지 않는다.
-  entryMinimumExecutionStrength: 100,
+  // 2026-10-08 운영값(90)을 기본값에 맞췄다 — 설정 파일(.pulsehft)은 깃에 안 올라가서 다른 PC에서는 이 기본값이 곧 운영값이다.
+  entryMinimumExecutionStrength: 90,
   // 당일 VWAP 대비 괴리가 이 값보다 낮으면(하락 추세) 진입하지 않는다. null이면 보지 않는다.
   entryMinimumVwapExtensionBps: -50,
   // 같은 종목이 ENTRY_READY로 이 시간 이상 연속 유지돼야 진입한다(한 순간 신호는 거른다).
@@ -45,7 +46,8 @@ export const DEFAULT_AUTO_TRADING_SETTINGS = Object.freeze({
   minimumRewardRiskRatio: 1.5,
   // 오늘 실현손실(비용 차감 후) 매매가 이 횟수만큼 연속되면 그날 신규 진입을 멈춘다(0=끔).
   // 주문 서비스의 연속 손실 한도는 킬 스위치를 켜 보호 청산까지 막으므로 쓰지 않고 여기서 거른다.
-  maxConsecutiveLossesPerDay: 3,
+  // 2026-10-08 운영값(0=끔)을 기본값에 맞췄다.
+  maxConsecutiveLossesPerDay: 0,
   // 보호 청산. null이면 해당 청산을 쓰지 않는다.
   // 2026-10-07 신호 단위 측정(고가 근처 모멘텀, 같은 종목 10분 중복 제거 488건): 60분 보유 기준
   // 손절 100/150이면 평균이 오히려 낮았고(손절 150: +15.7bp) 손절 300은 +23.1bp로 손절 없음

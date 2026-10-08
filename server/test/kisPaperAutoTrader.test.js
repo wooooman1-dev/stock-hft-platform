@@ -803,12 +803,12 @@ function readyCandidate(metrics = {}, extra = {}) {
   });
 }
 
-test("체결강도가 기준(100) 미만이면 매도 우위라 진입하지 않는다", async () => {
-  const blocked = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: 99 })], balance: balance() });
+test("체결강도가 기준(90) 미만이면 매도 우위라 진입하지 않는다", async () => {
+  const blocked = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: 89 })], balance: balance() });
   assert.equal(blocked.evaluated[0].reason, "EXECUTION_STRENGTH_TOO_LOW");
   const missing = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: null })], balance: balance() });
   assert.equal(missing.evaluated[0].reason, "EXECUTION_STRENGTH_TOO_LOW", "체결강도를 모르면 사지 않는다");
-  const allowed = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: 100 })], balance: balance() });
+  const allowed = await trader().evaluate({ candidates: [readyCandidate({ executionStrength: 90 })], balance: balance() });
   assert.equal(allowed.action, "ORDER");
 });
 
@@ -912,13 +912,14 @@ test("오늘 비용 차감 후 손실이 3번 연속이면 그날 신규 진입�
   const losing = { netPnl: -1_000, closedAt: today };
   const service = fakeService();
   service.getPerformance = () => ({ available: true, trades: { recent: [losing, losing, losing] } });
-  const blocked = await trader({}, service).evaluate({ candidates: [readyCandidate()], balance: balance() });
+  // 기본값은 0(끔)이라 한도를 명시해서 켠다.
+  const blocked = await trader({ maxConsecutiveLossesPerDay: 3 }, service).evaluate({ candidates: [readyCandidate()], balance: balance() });
   assert.equal(blocked.reason, "CONSECUTIVE_LOSS_LIMIT");
   assert.equal(blocked.streak, 3);
 
   const yesterday = { netPnl: -1_000, closedAt: BASE - 86_400_000 };
   service.getPerformance = () => ({ available: true, trades: { recent: [yesterday, losing, losing] } });
-  const allowed = await trader({}, service).evaluate({ candidates: [readyCandidate()], balance: balance() });
+  const allowed = await trader({ maxConsecutiveLossesPerDay: 3 }, service).evaluate({ candidates: [readyCandidate()], balance: balance() });
   assert.equal(allowed.action, "ORDER", "어제 손실은 오늘 연속 손실에 넣지 않는다");
 });
 

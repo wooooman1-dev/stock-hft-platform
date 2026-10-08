@@ -58,13 +58,13 @@ test("설계 기본값을 그대로 사용한다", () => {
   assert.equal(settings.stopLossBps, 300);
   assert.equal(settings.takeProfitBps, 1_000);
   assert.equal(settings.stopConfirmMs, 2_000);
-  assert.equal(settings.entryMinimumExecutionStrength, 100);
+  assert.equal(settings.entryMinimumExecutionStrength, 90);
   assert.equal(settings.entryMinimumVwapExtensionBps, -50);
   assert.equal(settings.entryConfirmMs, 30_000);
   assert.deepEqual([...settings.noEntryWindows], ["09:00-09:10", "11:30-13:00", "14:15-15:30"]);
   assert.equal(settings.minimumStopTicks, 6);
   assert.equal(settings.minimumRewardRiskRatio, 1.5);
-  assert.equal(settings.maxConsecutiveLossesPerDay, 3);
+  assert.equal(settings.maxConsecutiveLossesPerDay, 0);
   assert.equal(settings.trailingStopBps, null);
   assert.equal(settings.maxHoldingMs, 3_600_000);
   assert.equal(settings.forcedExitTime, "15:15");
